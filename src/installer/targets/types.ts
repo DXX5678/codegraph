@@ -19,7 +19,7 @@ export type Location = 'global' | 'local';
  * lookup. New targets add a value here when they're added to the
  * registry. Keep these short and lowercase.
  */
-export type TargetId = 'claude' | 'cursor' | 'codex' | 'opencode' | 'hermes' | 'gemini' | 'antigravity' | 'kiro';
+export type TargetId = 'chrys' | 'claude' | 'cursor' | 'codex' | 'opencode' | 'hermes' | 'gemini' | 'antigravity' | 'kiro';
 
 /**
  * Result of `target.detect(location)`.
@@ -87,14 +87,14 @@ export interface AgentTarget {
    */
   supportsLocation(loc: Location): boolean;
   detect(loc: Location): DetectionResult;
-  install(loc: Location, opts: InstallOptions): WriteResult;
+  install(loc: Location, opts: InstallOptions): Promise<WriteResult> | WriteResult;
   /**
    * Inverse of install. Removes only what install would have written;
    * preserves sibling MCP servers, sibling permissions, and unrelated
    * markdown sections. Must be safe to call when nothing was ever
    * installed (returns `not-found` actions).
    */
-  uninstall(loc: Location): WriteResult;
+  uninstall(loc: Location): Promise<WriteResult> | WriteResult;
   /**
    * Print the MCP-server snippet a user would paste manually for this
    * target. Used by `codegraph install --print-config <id>` and by

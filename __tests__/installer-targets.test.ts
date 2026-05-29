@@ -90,16 +90,31 @@ describe('Installer targets — contract', () => {
 
   for (const target of ALL_TARGETS) {
     describe(target.id, () => {
+      beforeEach(() => {
+        // Chrys needs existing agent profiles to discover — its
+        // install/uninstall operates on user-created profiles, never
+        // creates them from scratch (Chrys ships with built-in agents).
+        if (target.id === 'chrys') {
+          const agentsDir = path.join(tmpHome, '.chrys', 'agents');
+          fs.mkdirSync(agentsDir, { recursive: true });
+          fs.writeFileSync(path.join(agentsDir, 'Test.yaml'), [
+            'name: Test',
+            'id: test-001',
+            'instructions: "You are a test agent."',
+            '',
+          ].join('\n'));
+        }
+      });
       const supportedLocations = (['global', 'local'] as const).filter((l) =>
         target.supportsLocation(l),
       );
 
       for (const location of supportedLocations) {
         describe(`location=${location}`, () => {
-          it('install writes files; detect.alreadyConfigured becomes true', () => {
+          it('install writes files; detect.alreadyConfigured becomes true', async () => {
             expect(target.detect(location).alreadyConfigured).toBe(false);
 
-            const result = target.install(location, { autoAllow: true });
+            const result = await target.install(location, { autoAllow: true });
             expect(result.files.length).toBeGreaterThan(0);
             for (const file of result.files) {
               if (file.action !== 'unchanged') {
@@ -110,15 +125,15 @@ describe('Installer targets — contract', () => {
             expect(target.detect(location).alreadyConfigured).toBe(true);
           });
 
-          it('re-running install is idempotent (no actions other than unchanged)', () => {
-            target.install(location, { autoAllow: true });
-            const second = target.install(location, { autoAllow: true });
+          it('re-running install is idempotent (no actions other than unchanged)', async () => {
+            await target.install(location, { autoAllow: true });
+            const second = await target.install(location, { autoAllow: true });
             for (const file of second.files) {
               expect(file.action).toBe('unchanged');
             }
           });
 
-          it('install preserves a pre-existing sibling MCP server (where applicable)', () => {
+          it('install preserves a pre-existing sibling MCP server (where applicable)', async () => {
             // Plant a sibling entry in the same JSON config, install,
             // and verify the sibling survives. Skip for Codex (TOML)
             // and any target with no JSON config — they get covered
@@ -138,7 +153,7 @@ describe('Installer targets — contract', () => {
             }
             fs.writeFileSync(jsonPath, JSON.stringify(seed, null, 2) + '\n');
 
-            target.install(location, { autoAllow: true });
+            await target.install(location, { autoAllow: true });
 
             const after = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
             if (target.id === 'opencode') {
@@ -150,11 +165,11 @@ describe('Installer targets — contract', () => {
             }
           });
 
-          it('uninstall reverses install (alreadyConfigured returns to false)', () => {
-            target.install(location, { autoAllow: true });
+          it('uninstall reverses install (alreadyConfigured returns to false)', async () => {
+            await target.install(location, { autoAllow: true });
             expect(target.detect(location).alreadyConfigured).toBe(true);
 
-            target.uninstall(location);
+            await target.uninstall(location);
             expect(target.detect(location).alreadyConfigured).toBe(false);
           });
 
@@ -1217,6 +1232,17 @@ describe('Installer — uninstallTargets sweep (codegraph uninstall)', () => {
     origCwd = process.cwd();
     process.chdir(tmpCwd);
     homeRestore = setHome(tmpHome);
+
+    // Seed a dummy profile so Chrys's install/uninstall has
+    // something to discover (Chrys only operates on user profiles).
+    const agentsDir = path.join(tmpHome, '.chrys', 'agents');
+    fs.mkdirSync(agentsDir, { recursive: true });
+    fs.writeFileSync(path.join(agentsDir, 'Test.yaml'), [
+      'name: Test',
+      'id: test-001',
+      'instructions: "You are a test agent."',
+      '',
+    ].join('\n'));
   });
 
   afterEach(() => {
@@ -1226,12 +1252,12 @@ describe('Installer — uninstallTargets sweep (codegraph uninstall)', () => {
     fs.rmSync(tmpCwd, { recursive: true, force: true });
   });
 
-  it('sweeps every agent it was installed on and reports removed for each (global)', () => {
+  it('sweeps every agent it was installed on and reports removed for each (global)', async () => {
     for (const t of ALL_TARGETS) {
-      if (t.supportsLocation('global')) t.install('global', { autoAllow: true });
+      if (t.supportsLocation('global')) await t.install('global', { autoAllow: true });
     }
 
-    const reports = uninstallTargets(ALL_TARGETS, 'global');
+    const reports = await uninstallTargets(ALL_TARGETS, 'global');
 
     for (const t of ALL_TARGETS) {
       const r = reports.find((x) => x.id === t.id)!;
@@ -1242,19 +1268,19 @@ describe('Installer — uninstallTargets sweep (codegraph uninstall)', () => {
     }
   });
 
-  it('is safe on a clean slate — every agent reports not-configured, nothing removed', () => {
-    const reports = uninstallTargets(ALL_TARGETS, 'global');
+  it('is safe on a clean slate — every agent reports not-configured, nothing removed', async () => {
+    const reports = await uninstallTargets(ALL_TARGETS, 'global');
     for (const r of reports) {
       expect(r.status).toBe('not-configured');
       expect(r.removedPaths).toEqual([]);
     }
   });
 
-  it('reports removed only for agents that were actually configured', () => {
+  it('reports removed only for agents that were actually configured', async () => {
     // Install on Claude only; the rest stay untouched.
-    getTarget('claude')!.install('global', { autoAllow: true });
+    await getTarget('claude')!.install('global', { autoAllow: true });
 
-    const reports = uninstallTargets(ALL_TARGETS, 'global');
+    const reports = await uninstallTargets(ALL_TARGETS, 'global');
 
     const claude = reports.find((r) => r.id === 'claude')!;
     expect(claude.status).toBe('removed');
@@ -1265,8 +1291,8 @@ describe('Installer — uninstallTargets sweep (codegraph uninstall)', () => {
     }
   });
 
-  it('marks global-only agents as unsupported for a local sweep (and never touches them)', () => {
-    const reports = uninstallTargets(ALL_TARGETS, 'local');
+  it('marks global-only agents as unsupported for a local sweep (and never touches them)', async () => {
+    const reports = await uninstallTargets(ALL_TARGETS, 'local');
     for (const t of ALL_TARGETS) {
       const r = reports.find((x) => x.id === t.id)!;
       if (t.supportsLocation('local')) {
@@ -1279,25 +1305,25 @@ describe('Installer — uninstallTargets sweep (codegraph uninstall)', () => {
     }
   });
 
-  it('is idempotent — a second sweep finds nothing left to remove', () => {
+  it('is idempotent — a second sweep finds nothing left to remove', async () => {
     for (const t of ALL_TARGETS) {
-      if (t.supportsLocation('global')) t.install('global', { autoAllow: true });
+      if (t.supportsLocation('global')) await t.install('global', { autoAllow: true });
     }
-    const first = uninstallTargets(ALL_TARGETS, 'global');
+    const first = await uninstallTargets(ALL_TARGETS, 'global');
     expect(first.some((r) => r.status === 'removed')).toBe(true);
 
-    const second = uninstallTargets(ALL_TARGETS, 'global');
+    const second = await uninstallTargets(ALL_TARGETS, 'global');
     for (const r of second) {
       expect(r.status).toBe('not-configured');
       expect(r.removedPaths).toEqual([]);
     }
   });
 
-  it('a --target subset removes only the chosen agents, leaving siblings configured', () => {
-    getTarget('claude')!.install('global', { autoAllow: true });
-    getTarget('cursor')!.install('global', { autoAllow: true });
+  it('a --target subset removes only the chosen agents, leaving siblings configured', async () => {
+    await getTarget('claude')!.install('global', { autoAllow: true });
+    await getTarget('cursor')!.install('global', { autoAllow: true });
 
-    const reports = uninstallTargets(resolveTargetFlag('claude', 'global'), 'global');
+    const reports = await uninstallTargets(resolveTargetFlag('claude', 'global'), 'global');
 
     expect(reports.map((r) => r.id)).toEqual(['claude']);
     expect(reports[0].status).toBe('removed');
