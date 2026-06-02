@@ -38,6 +38,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
   lua: 'tree-sitter-lua.wasm',
   luau: 'tree-sitter-luau.wasm',
   objc: 'tree-sitter-objc.wasm',
+  arkts: 'tree-sitter-arkts.wasm',
 };
 
 /**
@@ -46,6 +47,7 @@ const WASM_GRAMMAR_FILES: Record<GrammarLanguage, string> = {
 export const EXTENSION_MAP: Record<string, Language> = {
   '.ts': 'typescript',
   '.tsx': 'tsx',
+  '.ets': 'arkts',
   '.js': 'javascript',
   '.mjs': 'javascript',
   '.cjs': 'javascript',
@@ -179,7 +181,7 @@ export async function loadGrammarsForLanguages(languages: Language[]): Promise<v
       // ABI-13 build that corrupts the shared WASM heap under web-tree-sitter
       // 0.25 (drops nested calls/imports on every file after the first); we
       // vendor the upstream ABI-15 wasm instead.
-      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau')
+      const wasmPath = (lang === 'pascal' || lang === 'scala' || lang === 'lua' || lang === 'luau' || lang === 'arkts')
         ? path.join(__dirname, 'wasm', wasmFile)
         : require.resolve(`tree-sitter-wasms/out/${wasmFile}`);
       const language = await WasmLanguage.load(wasmPath);
@@ -378,6 +380,7 @@ export function getLanguageDisplayName(language: Language): string {
     lua: 'Lua',
     luau: 'Luau',
     objc: 'Objective-C',
+    arkts: 'ArkTS',
     yaml: 'YAML',
     twig: 'Twig',
     xml: 'XML',
