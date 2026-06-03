@@ -408,7 +408,9 @@ function childRange(
   for (let i = start + 1; i < parent.end; i++) {
     const line = lines[i] ?? '';
     if (line.trim() === '') continue;
-    if (/^  \S/.test(line)) {
+    // List items (e.g. "  - name: foo") belong to the child, not a
+    // sibling key. Only a same-indent mapping key terminates the range.
+    if (/^  [A-Za-z_]/.test(line)) {
       end = i;
       break;
     }
@@ -426,15 +428,15 @@ function childRange(
 function renderCodeGraphMcpEntry(): string[] {
   const mcp = getMcpServerConfig();
   const lines: string[] = [
-    '    - name: codegraph',
-    '      transport: stdio',
-    `      command: ${mcp.command}`,
-    '      args:',
+    '  - name: codegraph',
+    '    transport: stdio',
+    `    command: ${mcp.command}`,
+    '    args:',
   ];
   for (const arg of mcp.args) {
-    lines.push(`        - ${arg}`);
+    lines.push(`    - ${arg}`);
   }
-  lines.push('      enabled: true');
+  lines.push('    enabled: true');
   return lines;
 }
 
@@ -449,7 +451,7 @@ function hasCodeGraphMcp(content: string): boolean {
   const mcp = childRange(lines, tools, 'mcp');
   if (!mcp) return false;
   for (let i = mcp.start + 1; i < mcp.end; i++) {
-    if (/^    - name:\s*codegraph\b/.test(lines[i] ?? '')) return true;
+    if (/^ {2,4}- name:\s*codegraph\b/.test(lines[i] ?? '')) return true;
   }
   return false;
 }
@@ -525,7 +527,7 @@ function findCodeGraphEntryRange(
 ): LineRange | null {
   let entryStart = -1;
   for (let i = mcpRange.start + 1; i < mcpRange.end; i++) {
-    if (/^    - name:\s*codegraph\b/.test(lines[i] ?? '')) {
+    if (/^ {2,4}- name:\s*codegraph\b/.test(lines[i] ?? '')) {
       entryStart = i;
       break;
     }
@@ -534,7 +536,7 @@ function findCodeGraphEntryRange(
 
   let entryEnd = mcpRange.end;
   for (let i = entryStart + 1; i < mcpRange.end; i++) {
-    if (/^    - name:/.test(lines[i] ?? '')) {
+    if (/^ {2,4}- name:/.test(lines[i] ?? '')) {
       entryEnd = i;
       break;
     }
