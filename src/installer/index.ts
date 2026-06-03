@@ -12,7 +12,7 @@
  * `--print-config` CLI flags.
  */
 
-import { execSync } from 'child_process';
+// import { execSync } from 'child_process'; // PATH install step commented out
 import * as path from 'path';
 import * as fs from 'fs';
 import {
@@ -104,6 +104,9 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
 
   // Step 2: install the codegraph npm package on PATH (always offered;
   // matches existing behavior). Skipped when --yes (assume present).
+  // NOTE: PATH install step is commented out — the CLI is assumed to already
+  // be on PATH. Uncomment the block below to restore the interactive prompt.
+  /*
   if (!useDefaults) {
     const shouldInstallGlobally = await clack.confirm({
       message: 'Install the codegraph CLI on your PATH? (Required so agents can launch the MCP server)',
@@ -127,6 +130,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       clack.log.info('Skipped CLI install — agents will not be able to launch the MCP server without it');
     }
   }
+  */
 
   // Step 3: where the per-agent config files should land.
   let location: Location;
