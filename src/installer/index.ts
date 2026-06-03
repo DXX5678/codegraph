@@ -188,7 +188,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       );
       continue;
     }
-    const result = target.install(location, { autoAllow });
+    const result = await target.install(location, { autoAllow });
     for (const file of result.files) {
       const verb = file.action === 'unchanged'
         ? 'Unchanged'
@@ -259,11 +259,11 @@ export interface UninstallReport {
  * installed (it returns `not-found` actions), so this is safe to run
  * across every target unconditionally.
  */
-export function uninstallTargets(
+export async function uninstallTargets(
   targets: readonly AgentTarget[],
   location: Location,
-): UninstallReport[] {
-  return targets.map((target) => {
+): Promise<UninstallReport[]> {
+  const results = await Promise.all(targets.map(async (target) => {
     if (!target.supportsLocation(location)) {
       const only: Location = location === 'local' ? 'global' : 'local';
       return {
@@ -274,7 +274,7 @@ export function uninstallTargets(
         notes: [`no ${location} config — this agent is ${only}-only`],
       };
     }
-    const result = target.uninstall(location);
+    const result = await target.uninstall(location);
     const removedPaths = result.files
       .filter((f) => f.action === 'removed')
       .map((f) => f.path);
@@ -285,7 +285,8 @@ export function uninstallTargets(
       removedPaths,
       notes: result.notes ?? [],
     };
-  });
+  }));
+  return results;
 }
 
 /**
@@ -317,7 +318,7 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
     const sel = await clack.select({
       message: 'Remove CodeGraph from all your projects, or just this one?',
       options: [
-        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro' },
+        { value: 'global' as const, label: 'All projects (global)', hint: '~/.chrys, ~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro' },
         { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./opencode.jsonc, ./.gemini, ./.kiro' },
       ],
       initialValue: 'global' as const,
@@ -345,7 +346,7 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
   }
 
   // Step 3: sweep + per-agent feedback.
-  const reports = uninstallTargets(targets, location);
+  const reports = await uninstallTargets(targets, location);
   const removed = reports.filter((r) => r.status === 'removed');
 
   for (const r of reports) {
