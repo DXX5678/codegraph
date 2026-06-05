@@ -1262,6 +1262,32 @@ export class ToolHandler {
         registeredAt,
       };
     }
+    if (m?.synthesizedBy === 'arkui-state-chain') {
+      const via = m.via ? `\`${String(m.via)}\`` : 'sibling method';
+      return {
+        label: `ArkUI state chain — ${via} triggers build() re-render (dynamic dispatch)`,
+        compact: `dynamic: ArkUI state chain via ${via}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'arkui-state-dep') {
+      const decorator = m.decorator ? `\`${String(m.decorator)}\`` : '@State';
+      const prop = m.property ? String(m.property) : 'property';
+      return {
+        label: `ArkUI state dep — reads ${decorator} ${prop} (dynamic dispatch)`,
+        compact: `dynamic: ArkUI reads ${decorator} ${prop}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'arkui-event-chain') {
+      const ev = m.event ? `\`${String(m.event)}\`` : 'an event';
+      const handler = m.handler ? `\`${String(m.handler)}\`` : 'handler';
+      return {
+        label: `ArkUI event chain — .on${String(m.event || 'Event')}() → ${handler} (dynamic dispatch)`,
+        compact: `dynamic: ArkUI ${ev} → ${handler}${at}`,
+        registeredAt,
+      };
+    }
     return null;
   }
 

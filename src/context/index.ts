@@ -158,7 +158,7 @@ const DEFAULT_BUILD_OPTIONS: Required<BuildContextOptions> = {
  */
 const HIGH_VALUE_NODE_KINDS: NodeKind[] = [
   'function', 'method', 'class', 'interface', 'type_alias', 'struct', 'trait',
-  'component', 'route', 'variable', 'constant', 'enum', 'module', 'namespace',
+  'component', 'route', 'arkui_page', 'variable', 'constant', 'enum', 'module', 'namespace',
 ];
 
 /**
@@ -388,6 +388,12 @@ export class ContextBuilder {
         ? `renders <${String(m.via || 'child')}>`
         : m.synthesizedBy === 'vue-handler'
         ? `Vue @${String(m.event || 'event')} handler`
+        : m.synthesizedBy === 'arkui-state-chain'
+        ? `state chain via ${m.via ? `\`${String(m.via)}\`` : 'method'}${at}`
+        : m.synthesizedBy === 'arkui-state-dep'
+        ? `reads ${m.decorator ? `\`${String(m.decorator)}\`` : '@State'} ${String(m.property || 'prop')}`
+        : m.synthesizedBy === 'arkui-event-chain'
+        ? `event ${m.event ? `\`${String(m.event)}\`` : ''} → ${m.handler ? `\`${String(m.handler)}\`` : 'handler'}${at}`
         : `event ${m.event ? `\`${String(m.event)}\`` : ''}${at}`;
       synthByPair.set(`${e.source}>${e.target}`, label);
     }

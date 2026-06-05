@@ -1183,11 +1183,218 @@ function ginMiddlewareChainEdges(queries: QueryBuilder, ctx: ResolutionContext):
   return edges;
 }
 
+// =============================================================================
+// ArkUI (HarmonyOS) synthesis phases
+// =============================================================================
+// ArkUI structs are tree-sitter-parsed as `class` nodes in .ets files. Each
+// struct with a `build()` method is a component; inside it, `@State`/`@Prop`/
+// `@Link` properties drive re-renders, `@Builder` methods produce sub-trees,
+// and event bindings (`.onClick()`, `.onChange()`) invoke handlers.
+// Three phases close the static gap between these declaration-time concepts
+// and the runtime flow that tree-sitter can't see.
+
+/** ArkUI file extensions handled by these phases. */
+const ARKUI_EXT_RE = /\.ets$/;
+
+/** Regex for ArkUI reactive state decorators: @State / @Prop / @Link / @StorageLink / @Provide / @Consume. */
+const ARKUI_STATE_RE = /@(?:State|Prop|Link|StorageLink|StorageProp|Provide|Consume)\s*(?:\([^)]*\))?\s*(\w+)\s*[:=(]/g;
+
+/** Regex for ArkUI event bindings inside build(): .onClick(...), .onChange(...), etc. */
+const ARKUI_HANDLER_RE = /\.on(?:Click|Change|Appear|DisAppear|Touch|Gesture|DragStart|DragEnd|DragMove|Drop|DragEnter|DragLeave)\s*\([\s\S]*?this\.(\w+)/g;
+
+// --- Phase A: ArkUI state-chain edges ------------------------------------------
+
+/**
+ * Phase A: ArkUI state-chain edges.
+ *
+ * In ArkUI, `@State`/`@Prop` mutation triggers a re-render of `build()`.
+ * The framework-internal re-render hop is invisible to static analysis, so
+ * a flow like "onClick → this.count++ → rebuilt UI" dead-ends at the state
+ * mutation. Bridge it: for each ArkUI struct (class in .ets) with a `build()`
+ * method, link every sibling method → `build()`.
+ */
+export function arkuiStateChainEdges(queries: QueryBuilder, _ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  // ArkUI structs are tree-sitter kind 'struct'; TypeScript classes in .ets
+  // files (libraries, helpers) are kind 'class'. Query both.
+  for (const kind of ['class', 'struct'] as const) {
+  for (const cls of queries.getNodesByKind(kind)) {
+    if (!ARKUI_EXT_RE.test(cls.filePath)) continue;
+    const children = queries.getOutgoingEdges(cls.id, ['contains'])
+      .map((e) => queries.getNodeById(e.target))
+      .filter((n): n is Node => !!n && n.kind === 'method');
+    const build = children.find((n) => n.name === 'build');
+    if (!build) continue;
+    let added = 0;
+    for (const m of children) {
+      if (added >= MAX_CALLBACKS_PER_CHANNEL) break;
+      if (m.id === build.id) continue;
+      const key = `${m.id}>${build.id}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({
+        source: m.id, target: build.id, kind: 'calls', line: m.startLine,
+        provenance: 'heuristic',
+        metadata: { synthesizedBy: 'arkui-state-chain', via: m.name, registeredAt: `${build.filePath}:${build.startLine}` },
+      });
+      added++;
+    }
+  }
+  }
+  return edges;
+}
+
+// --- Phase B: ArkUI state-dependency edges ------------------------------------
+
+/**
+ * Phase B: ArkUI state-dependency edges.
+ *
+ * `@State`/`@Prop`/`@Link`/`@StorageLink`/`@Provide`/`@Consume` properties
+ * are the reactive primitives that drive ArkUI re-renders. When a `@Builder`
+ * method or regular method reads `this.<stateProp>`, link the method → the
+ * state property so data-flow traces show which state each method depends on.
+ */
+export function arkuiStateDepEdges(queries: QueryBuilder, ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  // Build a map: structId/classId → methods for quick lookup.
+  const classMethods = new Map<string, { methods: Node[] }>();
+  // ArkUI structs are tree-sitter kind 'struct'; TypeScript classes in .ets
+  // files (libraries, helpers) are kind 'class'. Query both.
+  for (const kind of ['class', 'struct'] as const) {
+  for (const cls of queries.getNodesByKind(kind)) {
+    if (!ARKUI_EXT_RE.test(cls.filePath)) continue;
+    const children = queries.getOutgoingEdges(cls.id, ['contains'])
+      .map((e) => queries.getNodeById(e.target))
+      .filter((n): n is Node => !!n && n.kind === 'method');
+    if (children.length > 0) classMethods.set(cls.id, { methods: children });
+  }
+  }
+  if (classMethods.size === 0) return edges;
+
+  for (const file of ctx.getAllFiles()) {
+    if (!ARKUI_EXT_RE.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (!content) continue;
+
+    const classScopes = ctx.getNodesInFile(file)
+      .filter((n) => (n.kind === 'class' || n.kind === 'struct') && classMethods.has(n.id))
+      .map((c) => ({ id: c.id, start: c.startLine, end: c.endLine }));
+
+    const safe = stripCommentsForRegex(content, 'typescript');
+    ARKUI_STATE_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = ARKUI_STATE_RE.exec(safe))) {
+      const propName = m[1]!;
+      const line = safe.slice(0, m.index).split('\n').length;
+
+      // Find which class scope this property belongs to.
+      let classId: string | null = null;
+      for (const scope of classScopes) {
+        if (line >= scope.start && line <= scope.end) {
+          classId = scope.id;
+          break;
+        }
+      }
+      if (!classId) continue;
+
+      // Find the property node for this @State/@Prop/@Link property.
+      const propNode = ctx.getNodesInFile(file).find(
+        (n) => n.kind === 'property' && n.name === propName &&
+          n.startLine >= line && n.startLine <= line + 2
+      );
+      if (!propNode) continue;
+
+      const cm = classMethods.get(classId);
+      if (!cm) continue;
+
+      // For each method in this struct, check if it reads this.<propName>.
+      const refRe = new RegExp(
+        `this\\.${propName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`
+      );
+      for (const method of cm.methods) {
+        const methodSrc = sliceLines(content, method.startLine, method.endLine);
+        if (!methodSrc || !refRe.test(methodSrc)) continue;
+
+        const key = `${method.id}>${propNode.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: method.id, target: propNode.id, kind: 'calls', line: method.startLine,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'arkui-state-dep', decorator: m[0]!.split(/\s+/)[0]!, property: propName },
+        });
+      }
+    }
+  }
+  return edges;
+}
+
+// --- Phase C: ArkUI event-chain edges -----------------------------------------
+
+/**
+ * Phase C: ArkUI event-chain edges.
+ *
+ * ArkUI `build()` bodies declare event bindings like
+ * `Button('OK').onClick(() => { this.handleOK() })`. The `handleOK` method
+ * is reachable only at runtime through the framework event system — no static
+ * call edge exists. Bridge it: for each `.ets` file, scan the body of every
+ * `build()` method for `.onXxx(this.handler)` patterns and link
+ * `build() → handlerMethod`.
+ */
+export function arkuiEventChainEdges(ctx: ResolutionContext): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+
+  for (const file of ctx.getAllFiles()) {
+    if (!ARKUI_EXT_RE.test(file)) continue;
+    const content = ctx.readFile(file);
+    if (!content || !/\.on(?:Click|Change|Appear|DisAppear|Touch|Gesture|DragStart|DragEnd|DragMove|Drop|DragEnter|DragLeave)\s*\(/.test(content)) continue;
+
+    const nodes = ctx.getNodesInFile(file);
+    const buildMethods = nodes.filter(
+      (n) => n.kind === 'method' && n.name === 'build' && ARKUI_EXT_RE.test(n.filePath)
+    );
+    if (buildMethods.length === 0) continue;
+
+    for (const build of buildMethods) {
+      const src = sliceLines(content, build.startLine, build.endLine);
+      if (!src) continue;
+
+      ARKUI_HANDLER_RE.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = ARKUI_HANDLER_RE.exec(src))) {
+        const handlerName = m[1]!;
+        if (handlerName === 'build') continue;
+
+        // Resolve handler to a method in the same file.
+        const handler = nodes.find(
+          (n) => n.kind === 'method' && n.name === handlerName
+        );
+        if (!handler || handler.id === build.id) continue;
+
+        const key = `${build.id}>${handler.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        edges.push({
+          source: build.id, target: handler.id, kind: 'calls', line: build.startLine,
+          provenance: 'heuristic',
+          metadata: { synthesizedBy: 'arkui-event-chain', event: m[0]!.match(/\.on(\w+)/)?.[1] ?? '', handler: handlerName },
+        });
+      }
+    }
+  }
+  return edges;
+}
+
 /**
  * Synthesize dispatcher→callback edges (field observers + EventEmitters +
- * React re-render + JSX children + Vue templates + RN event channel +
- * Fabric native-impl + MyBatis Java↔XML + Gin middleware chain). Returns the
- * count added. Never throws into indexing — callers wrap in try/catch.
+ * React re-render + JSX children + Vue templates + ArkUI phases + RN event
+ * channel + Fabric native-impl + MyBatis Java↔XML + Gin middleware chain).
+ * Returns the count added. Never throws into indexing — callers wrap in
+ * try/catch.
  */
 export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionContext): number {
   const fieldEdges = fieldChannelEdges(queries, ctx);
@@ -1204,6 +1411,9 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const fabricNativeEdges = fabricNativeImplEdges(ctx);
   const mybatisEdges = mybatisJavaXmlEdges(queries);
   const ginEdges = ginMiddlewareChainEdges(queries, ctx);
+  const arkuiStateChainE = arkuiStateChainEdges(queries, ctx);
+  const arkuiStateE = arkuiStateDepEdges(queries, ctx);
+  const arkuiEventChainE = arkuiEventChainEdges(ctx);
 
   const merged: Edge[] = [];
   const seen = new Set<string>();
@@ -1222,6 +1432,9 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...fabricNativeEdges,
     ...mybatisEdges,
     ...ginEdges,
+    ...arkuiStateChainE,
+    ...arkuiStateE,
+    ...arkuiEventChainE,
   ]) {
     const key = `${e.source}>${e.target}`;
     if (seen.has(key)) continue;
