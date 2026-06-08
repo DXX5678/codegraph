@@ -76,6 +76,7 @@ export const LANGUAGES = [
   'c',
   'cpp',
   'csharp',
+  'razor',
   'php',
   'ruby',
   'swift',
