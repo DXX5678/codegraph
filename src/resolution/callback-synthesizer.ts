@@ -2256,7 +2256,7 @@ export function arkuiAstEdges(ctx: ResolutionContext): Edge[] {
           const handlerMethod = methods.get(handlerName);
           if (!handlerMethod) continue;
           addEdge(
-            buildGraphNode.id, handlerMethod.graphNode.id,
+            structGraphNode.id, handlerMethod.graphNode.id,
             { synthesizedBy: 'arkui-event-chain', event: eventName, handler: handlerName },
             buildGraphNode.startLine
           );
@@ -2299,7 +2299,7 @@ export function arkuiAstEdges(ctx: ResolutionContext): Edge[] {
           const builder = builderMethods.get(calledMethod);
           if (!builder) continue;
           addEdge(
-            buildGraphNode.id, builder.id,
+            structGraphNode.id, builder.id,
             { synthesizedBy: 'arkui-builder', builder: calledMethod },
             buildGraphNode.startLine
           );

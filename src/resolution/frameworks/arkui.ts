@@ -19,6 +19,47 @@ import {
 } from '../types';
 import { stripCommentsForRegex } from '../strip-comments';
 
+// ---------------------------------------------------------------------------
+// Module-level route-constants cache — built lazily on first navigation
+// resolution.  Many HarmonyOS projects centralise page routes in a single
+// file (commonly ScreenRoutes.ets) using `static readonly X: string =
+// 'pages/Y'`.  When `router.pushUrl({ url: ScreenRoutes.AI_DETAIL })` uses
+// a constant rather than a string literal, we need to resolve the constant
+// to its actual page path before matching against `arkui_page` nodes.
+// ---------------------------------------------------------------------------
+let _routeConstantsCache: Map<string, string> | null = null;
+
+function ensureRouteConstants(context: ResolutionContext): Map<string, string> {
+  if (_routeConstantsCache) return _routeConstantsCache;
+  _routeConstantsCache = new Map();
+
+  const re =
+    /static\s+readonly\s+(\w+)\s*:\s*string\s*=\s*['"]([^'"]+)['"]/g;
+
+  for (const file of context.getAllFiles()) {
+    if (!file.endsWith('.ets') && !file.endsWith('.ts')) continue;
+    const content = context.readFile(file);
+    if (!content) continue;
+
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(content)) !== null) {
+      const constName = m[1]!;
+      const constValue = m[2]!;
+      // Only store constants whose values look like page routes
+      if (constValue.startsWith('pages/')) {
+        _routeConstantsCache.set(constName, constValue);
+      }
+    }
+  }
+
+  return _routeConstantsCache;
+}
+
+/** Reset the module-level route-constants cache (for tests). */
+export function _resetRouteConstantsCache(): void {
+  _routeConstantsCache = null;
+}
+
 export const arkuiResolver: FrameworkResolver = {
   name: 'arkui',
   languages: ['arkts'],
@@ -44,8 +85,22 @@ export const arkuiResolver: FrameworkResolver = {
   // ------------------------------------------------------------------
   resolve(ref: UnresolvedRef, context: ResolutionContext): ResolvedRef | null {
     // Only handle navigation references whose referenceName is a page URL
-    // (e.g. "pages/Detail", "entry/src/main/ets/pages/Detail").
-    const routePath = ref.referenceName;
+    // (e.g. "pages/Detail", "entry/src/main/ets/pages/Detail") or a
+    // route-constant reference (e.g. "ScreenRoutes.AI_DETAIL").
+    let routePath = ref.referenceName;
+
+    // Resolve route constants (ClassName.CONSTANT) → actual page path.
+    // HarmonyOS projects often centralise routes in a constants file:
+    //   static readonly AI_DETAIL: string = 'pages/AiDetailScreen'
+    //   ...
+    //   router.pushUrl({ url: ScreenRoutes.AI_DETAIL })
+    if (routePath.includes('.')) {
+      const cache = ensureRouteConstants(context);
+      // Try exact match first, then fall back to trailing-name match
+      const constName = routePath.split('.').pop()!;
+      routePath = cache.get(routePath) ?? cache.get(constName) ?? routePath;
+    }
+
     if (
       !routePath.startsWith('pages/') &&
       !routePath.startsWith('entry/src/main/ets/')
@@ -73,6 +128,7 @@ export const arkuiResolver: FrameworkResolver = {
           targetNodeId: node.id,
           confidence: 0.9,
           resolvedBy: 'framework',
+          synthesizedBy: 'arkui-route',
         };
       }
 
@@ -102,6 +158,7 @@ export const arkuiResolver: FrameworkResolver = {
         targetNodeId: best.id,
         confidence: bestScore,
         resolvedBy: 'framework',
+        synthesizedBy: 'arkui-route',
       };
     }
 
@@ -165,7 +222,7 @@ export const arkuiResolver: FrameworkResolver = {
       });
     }
 
-    // ── Pass 2: router.pushUrl / router.replaceUrl → references ────
+    // ── Pass 2a: router.pushUrl / router.replaceUrl (string literal) ──
     //
     // Pattern: router.pushUrl({ ..., url: 'pages/X', ... })
     // Uses [\s\S]*? to span multiple lines inside the object literal.
@@ -191,6 +248,43 @@ export const arkuiResolver: FrameworkResolver = {
       references.push({
         fromNodeId,
         referenceName: url,
+        referenceKind: 'references',
+        line: callLine,
+        column: 0,
+        filePath,
+        language: 'arkts',
+      });
+    }
+
+    // ── Pass 2b: router.pushUrl / router.replaceUrl (route constant) ──
+    //
+    // Pattern: router.pushUrl({ ..., url: ScreenRoutes.AI_DETAIL, ... })
+    // Many HarmonyOS projects centralise page routes as class constants.
+    // The referenceName is emitted as "ScreenRoutes.AI_DETAIL" and later
+    // resolved by scanning the project for `static readonly X: string =
+    // 'pages/Y'` declarations in resolve().
+    const constUrlRe =
+      /router\.(pushUrl|replaceUrl)\s*\(\s*\{[\s\S]*?url\s*:\s*(\w+)\.(\w+)/g;
+    constUrlRe.lastIndex = 0;
+
+    while ((match = constUrlRe.exec(safe)) !== null) {
+      const className = match[2]!;
+      const constName = match[3]!;
+      const refName = `${className}.${constName}`;
+      const callLine = safe.slice(0, match.index).split('\n').length;
+
+      let fromNodeId = `file:${filePath}`;
+      for (let i = entryPositions.length - 1; i >= 0; i--) {
+        const entry = entryPositions[i]!;
+        if (entry.line < callLine) {
+          fromNodeId = entry.node.id;
+          break;
+        }
+      }
+
+      references.push({
+        fromNodeId,
+        referenceName: refName,
         referenceKind: 'references',
         line: callLine,
         column: 0,

@@ -2,7 +2,7 @@
  * ArkUI Framework Resolver Tests
  */
 import { beforeAll, describe, it, expect } from 'vitest';
-import { arkuiResolver } from '../src/resolution/frameworks/arkui';
+import { arkuiResolver, _resetRouteConstantsCache } from '../src/resolution/frameworks/arkui';
 import { initGrammars, loadAllGrammars } from '../src/extraction/grammars';
 
 describe('arkuiResolver.extract', () => {
@@ -153,6 +153,61 @@ router.pushUrl({ url: 'pages/Standalone' })
     const navRef = references.find((r) => r.referenceName === 'pages/Standalone');
     expect(navRef).toBeDefined();
     expect(navRef!.fromNodeId).toMatch(/^file:/);
+  });
+
+  it('extracts router.pushUrl with ScreenRoutes constant', () => {
+    const src = `
+@Entry
+struct HomePage {
+  build() {
+    Button('Go')
+      .onClick(() => {
+        router.pushUrl({ url: ScreenRoutes.DETAIL })
+      })
+  }
+}
+`;
+    const { nodes, references } = arkuiResolver.extract!('pages/Home.ets', src);
+    expect(nodes).toHaveLength(1);
+    const navRefs = references.filter(
+      (r) => r.referenceKind === 'references' && r.referenceName !== 'HomePage'
+    );
+    expect(navRefs).toHaveLength(1);
+    expect(navRefs[0].referenceName).toBe('ScreenRoutes.DETAIL');
+    expect(navRefs[0].fromNodeId).toBe(nodes[0].id);
+  });
+
+  it('extracts router.replaceUrl with route constant', () => {
+    const src = `
+@Entry
+struct LoginPage {
+  build() {
+    router.replaceUrl({ url: AppRoutes.HOME })
+  }
+}
+`;
+    const { references } = arkuiResolver.extract!('pages/Login.ets', src);
+    const navRefs = references.filter(
+      (r) => r.referenceKind === 'references' && r.referenceName !== 'LoginPage'
+    );
+    expect(navRefs).toHaveLength(1);
+    expect(navRefs[0].referenceName).toBe('AppRoutes.HOME');
+  });
+
+  it('captures both string-literal and constant router URLs in one file', () => {
+    const src = `
+@Entry
+struct MixedPage {
+  build() {
+    router.pushUrl({ url: 'pages/StringLiteral' })
+    router.pushUrl({ url: ScreenRoutes.CONSTANT_PAGE })
+  }
+}
+`;
+    const { references } = arkuiResolver.extract!('pages/Mixed.ets', src);
+    const navRefs = references.filter((r) => r.referenceName !== 'MixedPage');
+    const names = navRefs.map((r) => r.referenceName).sort();
+    expect(names).toEqual(['ScreenRoutes.CONSTANT_PAGE', 'pages/StringLiteral']);
   });
 
   it('returns empty for non-.ets files', () => {
@@ -358,6 +413,10 @@ describe('arkuiResolver.postExtract', () => {
 });
 
 describe('arkuiResolver.resolve', () => {
+  beforeEach(() => {
+    _resetRouteConstantsCache();
+  });
+
   it('resolves pages/Detail to matching arkui_page by filePath', () => {
     const context = {
       getNodesByKind: (_kind: string) => [
@@ -449,6 +508,86 @@ describe('arkuiResolver.resolve', () => {
     const ref = {
       fromNodeId: 'caller5',
       referenceName: 'pages/NotFound',
+      referenceKind: 'references' as const,
+      line: 10,
+      column: 0,
+    };
+    const result = arkuiResolver.resolve!(ref as any, context as any);
+    expect(result).toBeNull();
+  });
+
+  it('resolves ScreenRoutes constant to page by scanning project files', () => {
+    const context = {
+      getNodesByKind: (_kind: string) => [
+        {
+          id: 'page-detail',
+          filePath: 'entry/src/main/ets/pages/Detail.ets',
+          qualifiedName: 'entry/src/main/ets/pages/Detail.ets::Detail',
+          name: 'Detail',
+        },
+      ],
+      getAllFiles: () => ['entry/src/main/ets/common/ScreenRoutes.ets'],
+      readFile: (path: string) => {
+        if (path === 'entry/src/main/ets/common/ScreenRoutes.ets') {
+          return 'export class ScreenRoutes { static readonly DETAIL: string = \'pages/Detail\' }';
+        }
+        return null;
+      },
+    };
+    const ref = {
+      fromNodeId: 'caller6',
+      referenceName: 'ScreenRoutes.DETAIL',
+      referenceKind: 'references' as const,
+      line: 10,
+      column: 0,
+    };
+    const result = arkuiResolver.resolve!(ref as any, context as any);
+    expect(result).not.toBeNull();
+    expect(result!.targetNodeId).toBe('page-detail');
+    expect(result!.confidence).toBe(0.9);
+    expect(result!.synthesizedBy).toBe('arkui-route');
+  });
+
+  it('falls back to trailing constant name lookup', () => {
+    const context = {
+      getNodesByKind: (_kind: string) => [
+        {
+          id: 'page-settings',
+          filePath: 'entry/src/main/ets/pages/Settings.ets',
+          qualifiedName: 'entry/src/main/ets/pages/Settings.ets::Settings',
+          name: 'Settings',
+        },
+      ],
+      getAllFiles: () => ['entry/src/main/ets/common/Routes.ets'],
+      readFile: (path: string) => {
+        if (path === 'entry/src/main/ets/common/Routes.ets') {
+          return 'export class Routes { static readonly SETTINGS: string = \'pages/Settings\' }';
+        }
+        return null;
+      },
+    };
+    // referenceName uses a different class name than what's in the constant file
+    const ref = {
+      fromNodeId: 'caller7',
+      referenceName: 'OtherRoutes.SETTINGS',  // class name differs
+      referenceKind: 'references' as const,
+      line: 10,
+      column: 0,
+    };
+    const result = arkuiResolver.resolve!(ref as any, context as any);
+    expect(result).not.toBeNull();
+    expect(result!.targetNodeId).toBe('page-settings');
+  });
+
+  it('returns null for unresolved route constant', () => {
+    const context = {
+      getNodesByKind: (_kind: string) => [],
+      getAllFiles: () => [],
+      readFile: (_path: string) => null,
+    };
+    const ref = {
+      fromNodeId: 'caller8',
+      referenceName: 'MissingRoutes.NOT_FOUND',
       referenceKind: 'references' as const,
       line: 10,
       column: 0,
@@ -1020,7 +1159,7 @@ struct Page {
     const edges = runEdges(src, nodes);
     const evtEdges = edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-event-chain');
     expect(evtEdges).toHaveLength(1);
-    expect(evtEdges[0].source).toBe('pg-build');
+    expect(evtEdges[0].source).toBe('pg');
     expect(evtEdges[0].target).toBe('handler');
     expect(evtEdges[0].metadata?.event).toBe('Click');
     expect(evtEdges[0].metadata?.handler).toBe('handleClick');
@@ -1045,7 +1184,7 @@ struct Page {
     const edges = runEdges(src, nodes);
     const evtEdges = edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-event-chain');
     expect(evtEdges).toHaveLength(1);
-    expect(evtEdges[0].source).toBe('pg-build');
+    expect(evtEdges[0].source).toBe('pg');
     expect(evtEdges[0].target).toBe('handler');
     expect(evtEdges[0].metadata?.handler).toBe('handleClick');
   });
@@ -1271,7 +1410,7 @@ struct Page {
     const edges = runEdges(src, nodes);
     const builderEdges = edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-builder');
     expect(builderEdges).toHaveLength(1);
-    expect(builderEdges[0].source).toBe('pg-build');
+    expect(builderEdges[0].source).toBe('pg');
     expect(builderEdges[0].target).toBe('footer');
     expect(builderEdges[0].metadata?.builder).toBe('myFooter');
   });
@@ -1390,7 +1529,7 @@ struct WidgetB {
     // WidgetB.build → handleClick (event-chain)
     const evtEdges = edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-event-chain');
     expect(evtEdges).toHaveLength(1);
-    expect(evtEdges[0].source).toBe('wb-build');
+    expect(evtEdges[0].source).toBe('wb');
     expect(evtEdges[0].target).toBe('handler');
   });
 

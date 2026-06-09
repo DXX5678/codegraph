@@ -779,6 +779,7 @@ export class ReferenceResolver {
         metadata: {
           confidence: ref.confidence,
           resolvedBy: ref.resolvedBy,
+          ...(ref.synthesizedBy ? { synthesizedBy: ref.synthesizedBy } : {}),
         },
       };
     });

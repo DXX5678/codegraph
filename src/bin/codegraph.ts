@@ -41,8 +41,9 @@ import type { Edge } from '../types';
  * Returns null for non-heuristic edges (tree-sitter direct calls).
  */
 function synthEdgeCompact(edge: Edge): string | null {
-  if (edge.provenance !== 'heuristic') return null;
   const m = edge.metadata as Record<string, unknown> | undefined;
+  if (m?.synthesizedBy === 'arkui-route') return 'ArkUI Router';
+  if (edge.provenance !== 'heuristic') return null;
   const at = typeof m?.registeredAt === 'string' ? ` @${m.registeredAt}` : '';
   const s = m?.synthesizedBy;
   if (s === 'arkui-render') {
