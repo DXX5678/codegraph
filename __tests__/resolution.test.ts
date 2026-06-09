@@ -2195,4 +2195,343 @@ void wrong() { WidgetFactory::create().onlyOther(); }
       expect(callerNamesOf('Other::onlyOther')).toEqual([]);
     });
   });
+
+  describe('Java chained static-factory call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves Foo.getInstance().bar() via the factory return type, never a same-named decoy', async () => {
+      // Aaa sorts first and has a same-named bar() — it must never win the chain.
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.java'),
+        `class Aaa { void bar() {} }
+class Foo {
+    static Foo getInstance() { return new Foo(); }
+    void bar() {}
+}
+class Caller {
+    void run() { Foo.getInstance().bar(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::bar')).toEqual(['run']);
+      expect(callerNamesOf('Aaa::bar')).toEqual([]);
+    });
+
+    it('resolves a factory chain that passes arguments — Foo.create(cfg).build()', async () => {
+      // The factory call carries an argument; the extractor must normalize the
+      // receiver to empty parens (`Foo.create().build`) so the chain still splits.
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.java'),
+        `class Config {}
+class Foo {
+    static Foo create(Config c) { return new Foo(); }
+    void build() {}
+}
+class Caller {
+    void run() { Foo.create(new Config()).build(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::build')).toEqual(['run']);
+    });
+
+    it('creates NO edge when the factory return type lacks the method (silent miss, not a wrong edge)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.java'),
+        `class Foo {
+    static Foo getInstance() { return new Foo(); }
+}
+class Other { void onlyOther() {} }
+class Caller {
+    void run() { Foo.getInstance().onlyOther(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Foo has no onlyOther() — must not mis-attach to the same-named Other::onlyOther.
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+  });
+
+  describe('Kotlin chained companion-factory call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves Foo.getInstance().bar() via the companion return type, never a same-named decoy', async () => {
+      // Aaa sorts first and has a same-named bar() — without the chain fix Kotlin
+      // dropped the receiver to a bare `bar` and attached to Aaa (a wrong edge).
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.kt'),
+        `class Aaa { fun bar() {} }
+class Foo {
+    companion object {
+        fun getInstance(): Foo = Foo()
+    }
+    fun bar() {}
+}
+class Caller {
+    fun run() { Foo.getInstance().bar() }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::bar')).toEqual(['run']);
+      expect(callerNamesOf('Aaa::bar')).toEqual([]);
+    });
+
+    it('resolves a companion factory chain that passes arguments — Foo.create(cfg).build()', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.kt'),
+        `class Config
+class Foo {
+    companion object {
+        fun create(c: Config): Foo = Foo()
+    }
+    fun build() {}
+}
+class Caller {
+    fun run() { Foo.create(Config()).build() }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::build')).toEqual(['run']);
+    });
+
+    it('creates NO edge when the companion return type lacks the method (silent miss, not a wrong edge)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.kt'),
+        `class Foo {
+    companion object {
+        fun getInstance(): Foo = Foo()
+    }
+}
+class Other { fun onlyOther() {} }
+class Caller {
+    fun run() { Foo.getInstance().onlyOther() }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Foo has no onlyOther() — must not mis-attach to the same-named Other::onlyOther.
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+  });
+
+  describe('C# chained static-factory call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves Foo.Create().Bar() via the factory return type, never a same-named decoy', async () => {
+      // Aaa sorts first and has a same-named Bar() — it must never win the chain.
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.cs'),
+        `class Aaa { void Bar() {} }
+class Foo {
+    static Foo Create() { return new Foo(); }
+    void Bar() {}
+}
+class Caller {
+    void Run() { Foo.Create().Bar(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::Bar')).toEqual(['Run']);
+      expect(callerNamesOf('Aaa::Bar')).toEqual([]);
+    });
+
+    it('resolves a factory chain that passes arguments — Foo.Make(cfg).Build()', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.cs'),
+        `class Config {}
+class Foo {
+    static Foo Make(Config c) { return new Foo(); }
+    void Build() {}
+}
+class Caller {
+    void Run() { Foo.Make(new Config()).Build(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::Build')).toEqual(['Run']);
+    });
+
+    it('creates NO edge when the factory return type lacks the method (silent miss, not a wrong edge)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.cs'),
+        `class Foo {
+    static Foo Create() { return new Foo(); }
+}
+class Other { void OnlyOther() {} }
+class Caller {
+    void Run() { Foo.Create().OnlyOther(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Foo has no OnlyOther() — must not mis-attach to the same-named Other::OnlyOther.
+      expect(callerNamesOf('Other::OnlyOther')).toEqual([]);
+    });
+  });
+
+  describe('Swift chained static-factory call resolution (#645/#608 mechanism)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves Foo.make().draw() via the factory return type, never a same-named decoy', async () => {
+      // Aaa sorts first and has a same-named draw() — without the fix Swift dropped
+      // the receiver to a bare `draw` and attached to Aaa (a wrong edge).
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.swift'),
+        `class Aaa { func draw() {} }
+class Foo {
+    static func make() -> Foo { return Foo() }
+    func draw() {}
+}
+func runCaller() { Foo.make().draw() }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::draw')).toEqual(['runCaller']);
+      expect(callerNamesOf('Aaa::draw')).toEqual([]);
+    });
+
+    it('resolves a constructor chain Foo().draw() and an args factory chain Foo.build(c).render()', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.swift'),
+        `class Config {}
+class Foo {
+    static func build(_ c: Config) -> Foo { return Foo() }
+    func draw() {}
+    func render() {}
+}
+func runCaller() {
+    Foo().draw()
+    Foo.build(Config()).render()
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Foo::draw')).toEqual(['runCaller']);
+      expect(callerNamesOf('Foo::render')).toEqual(['runCaller']);
+    });
+
+    it('creates NO edge when the factory return type lacks the method (silent miss, not a wrong edge)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.swift'),
+        `class Foo {
+    static func make() -> Foo { return Foo() }
+}
+class Other { func onlyOther() {} }
+func runCaller() { Foo.make().onlyOther() }
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Foo has no onlyOther() — must not mis-attach to the same-named Other::onlyOther.
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+  });
+
+  describe('Chained call resolves a method on a supertype (conformance, #750)', () => {
+    function callerNamesOf(qualifiedName: string): string[] {
+      const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
+      if (!target) return [];
+      const names = cg
+        .getIncomingEdges(target.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)?.name)
+        .filter((n): n is string => !!n);
+      return [...new Set(names)].sort();
+    }
+
+    it('resolves a chained method defined only on a SUPERCLASS the return type extends', async () => {
+      // draw() lives on Base; Widget (the factory's return type) has no draw() of
+      // its own. Decoy.draw must never win. Needs the conformance second pass.
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.java'),
+        `class Base { void draw() {} }
+class Widget extends Base {}
+class Decoy { void draw() {} }
+class Factory { static Widget create() { return new Widget(); } }
+class Caller {
+    void run() { Factory.create().draw(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Base::draw')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::draw')).toEqual([]);
+    });
+
+    it('resolves a chained method defined on an INTERFACE the return type implements (default method)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.java'),
+        `interface Drawable { default void draw() {} }
+class Widget implements Drawable {}
+class Decoy { void draw() {} }
+class Factory { static Widget create() { return new Widget(); } }
+class Caller {
+    void run() { Factory.create().draw(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      expect(callerNamesOf('Drawable::draw')).toEqual(['run']);
+      expect(callerNamesOf('Decoy::draw')).toEqual([]);
+    });
+
+    it('still creates NO edge when no supertype has the method (safety preserved)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'Main.java'),
+        `class Base {}
+class Widget extends Base {}
+class Other { void onlyOther() {} }
+class Factory { static Widget create() { return new Widget(); } }
+class Caller {
+    void run() { Factory.create().onlyOther(); }
+}
+`
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      // Neither Widget nor Base has onlyOther() — must not attach to Other::onlyOther.
+      expect(callerNamesOf('Other::onlyOther')).toEqual([]);
+    });
+  });
 });
