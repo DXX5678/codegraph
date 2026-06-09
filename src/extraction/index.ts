@@ -745,10 +745,14 @@ export class ExtractionOrchestrator {
     if (useWorker) {
       const { Worker } = await import('worker_threads');
       WorkerClass = Worker;
-    } else {
-      // In-process fallback: load grammars locally
-      await loadGrammarsForLanguages(neededLanguages);
     }
+
+    // Load grammars in the main thread so post-extraction synthesis
+    // (e.g. ArkUI AST edge synthesis in callback-synthesizer.ts) can
+    // call getParser() successfully. When workers are used, the worker
+    // loads its own copy independently. loadGrammarsForLanguages is
+    // idempotent — already-loaded languages skip the WASM fetch.
+    await loadGrammarsForLanguages(neededLanguages);
 
     // --- Worker lifecycle management ---
     // The worker can crash (OOM in WASM) or hang on pathological files.

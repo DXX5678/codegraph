@@ -267,6 +267,8 @@ function resolveMethodOnType(
    * signal Java imports carry but the call site doesn't (#314).
    */
   preferredFqn?: string,
+  /** Recursion guard for the supertype/conformance walk. */
+  depth = 0,
 ): ResolvedRef | null {
   // Look up methods by name and match by qualifiedName ending in
   // `<typeName>::<methodName>`. This works whether the method is defined
@@ -284,7 +286,24 @@ function resolveMethodOnType(
       matches.push(m);
     }
   }
-  if (matches.length === 0) return null;
+  if (matches.length === 0) {
+    // Conformance fallback: the method may be defined on a supertype `typeName`
+    // extends, or on a protocol / trait it conforms to (e.g. a Swift protocol-
+    // extension method, a C# default-interface or extension method, a Kotlin
+    // extension on a supertype). Walk supertypes transitively (depth-capped) via
+    // the resolved implements/extends edges — empty in the first resolution pass,
+    // populated in the conformance pass. Still VALIDATED (the method must exist on
+    // a supertype), so a wrong inference produces no edge.
+    if (depth < 4 && context.getSupertypes) {
+      for (const supertype of context.getSupertypes(typeName, ref.language)) {
+        const via = resolveMethodOnType(
+          supertype, methodName, ref, context, confidence, resolvedBy, preferredFqn, depth + 1,
+        );
+        if (via) return via;
+      }
+    }
+    return null;
+  }
 
   if (matches.length > 1 && preferredFqn) {
     const ext = ref.language === 'kotlin' ? '.kt' : '.java';
@@ -551,15 +570,17 @@ export function matchCppCallChain(
 }
 
 /**
- * Resolve a PHP fluent static-factory chain whose receiver is a static call —
- * `Cls::for($x)->method()`, encoded by the extractor as `Cls::for().method`
- * (#608, the per-credential Laravel client idiom). The receiver's type is what
- * `Cls::for` returns: a `: self` / `: static` resolves to `Cls` itself, a
- * concrete `: Type` to that type. The outer method is then resolved and
- * VALIDATED on it (resolveMethodOnType requires the method to exist), so a
- * wrong inference yields no edge rather than a wrong one.
+ * Resolve a `::`-scoped factory chain whose receiver is a scoped/static call —
+ * PHP `Cls::for($x)->method()` (#608, the per-credential Laravel client idiom) or
+ * Rust `Foo::new().bar()` (an associated-function call) — both encoded by the
+ * extractor as `Cls::factory().method`. The receiver's type is what `Cls::factory`
+ * returns: a `self` marker (PHP `: self`/`: static`, Rust `-> Self`) resolves to
+ * the factory's own type, a concrete return type to that type. The outer method is
+ * then resolved and VALIDATED on it (resolveMethodOnType requires the method to
+ * exist on the type or a supertype it conforms to), so a wrong inference yields no
+ * edge rather than a wrong one. Shared by the `::`-receiver languages (PHP, Rust).
  */
-export function matchPhpCallChain(
+export function matchScopedCallChain(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): ResolvedRef | null {
@@ -574,6 +595,69 @@ export function matchPhpCallChain(
   // `self` (the extractor's marker for self/static/$this) → the factory's class.
   const resolvedClass = ret === 'self' ? factoryClass : ret;
   return resolveMethodOnType(resolvedClass, method, ref, context, 0.85, 'instance-method');
+}
+
+/**
+ * Languages where an unprefixed capitalized call `Foo(args)` constructs the
+ * class (so a `Foo(args).method()` receiver's type is `Foo`). Java/C# need `new`,
+ * so a bare `Foo()` there is a method call, not construction — excluded.
+ */
+const CONSTRUCTS_VIA_BARE_CALL = new Set(['kotlin', 'swift']);
+
+/**
+ * Resolve a dotted chained call whose receiver is a static factory / fluent call —
+ * `Foo.getInstance().bar()`, encoded by the extractor as `Foo.getInstance().bar`
+ * (#645/#608 mechanism). The receiver's type is what `Foo.getInstance` returns
+ * (its declared return type); the outer method is then resolved and VALIDATED on
+ * it (resolveMethodOnType requires `Type::method` to exist), so a wrong inference
+ * yields no edge rather than a wrong one (e.g. a same-named `bar()` on an
+ * unrelated class is never matched). Shared by the dot-notation languages
+ * (Java, Kotlin, C#, Swift) — same receiver shape, same `Class::method` qualified names.
+ */
+export function matchDottedCallChain(
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): ResolvedRef | null {
+  const m = ref.referenceName.match(/^(.+)\(\)\.(\w+)$/);
+  if (!m || !m[1] || !m[2]) return null;
+  const inner = m[1]; // `Foo.getInstance`
+  const method = m[2]; // `bar`
+  const lastDot = inner.lastIndexOf('.');
+
+  // Constructor receiver `Foo(args).method()` (encoded `Foo().method`): a bare,
+  // capitalized inner is a class construction, so the receiver's type is the
+  // class itself — resolve the method on it. Only in languages where an
+  // unprefixed capitalized call constructs the class (Kotlin, Swift); in Java/C#
+  // a bare `Foo()` is a method call (constructors need `new`), so we must not
+  // assume construction. A lowercase bare inner is a top-level `factory().method()`
+  // whose type we can't recover — bail.
+  if (lastDot <= 0) {
+    if (!CONSTRUCTS_VIA_BARE_CALL.has(ref.language) || !/^[A-Z]/.test(inner)) return null;
+    return resolveMethodOnType(inner, method, ref, context, 0.85, 'instance-method', importedFqnOf(inner, ref, context));
+  }
+
+  // Factory/fluent receiver `Receiver.factory(args).method()`: the receiver's
+  // type is what `Receiver.factory` returns (its declared return type).
+  const factoryClass = inner.slice(0, lastDot).split('.').pop(); // simple class name
+  const factoryMethod = inner.slice(lastDot + 1);
+  if (!factoryClass || !factoryMethod) return null;
+  const ret = lookupCalleeReturnType(`${factoryClass}::${factoryMethod}`, ref, context);
+  if (!ret) return null;
+  return resolveMethodOnType(ret, method, ref, context, 0.85, 'instance-method', importedFqnOf(ret, ref, context));
+}
+
+/**
+ * When several classes share a simple type name, the caller file's import of
+ * that type is the only signal that names WHICH one (#314). Returns the imported
+ * FQN for `typeName` in the ref's file, or undefined.
+ */
+function importedFqnOf(
+  typeName: string,
+  ref: UnresolvedRef,
+  context: ResolutionContext,
+): string | undefined {
+  const imports = context.getImportMappings(ref.filePath, ref.language);
+  return imports.find((i) => i.localName === typeName)?.source;
 }
 
 /**
@@ -998,11 +1082,26 @@ export function matchReference(
     if (result) return result;
   }
 
-  // 1c. PHP fluent static-factory chain — `Cls::for($x)->method()` encoded as
-  // `Cls::for().method` (#608). Same idea as 1b: the receiver's type is the
-  // factory's `: self` / `: Type` return.
-  if (ref.language === 'php') {
-    result = matchPhpCallChain(ref, context);
+  // 1c. `::`-scoped factory chain — PHP `Cls::for($x)->method()` (#608) or Rust
+  // `Foo::new().bar()`, both encoded as `Cls::factory().method`. The receiver's
+  // type is the factory's `self` (PHP `: self`/`: static`, Rust `-> Self`) or
+  // concrete return type.
+  if (ref.language === 'php' || ref.language === 'rust') {
+    result = matchScopedCallChain(ref, context);
+    if (result) return result;
+  }
+
+  // 1d. Dotted chained static-factory / fluent call (Java / Kotlin / C# / Swift) —
+  // `Foo.getInstance().bar()` encoded as `Foo.getInstance().bar` (#645/#608
+  // mechanism). Resolve bar's class from getInstance's declared return type, then
+  // validate the method on it.
+  if (
+    ref.language === 'java' ||
+    ref.language === 'kotlin' ||
+    ref.language === 'csharp' ||
+    ref.language === 'swift'
+  ) {
+    result = matchDottedCallChain(ref, context);
     if (result) return result;
   }
 

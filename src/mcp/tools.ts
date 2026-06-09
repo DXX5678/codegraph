@@ -1252,6 +1252,13 @@ export class ToolHandler {
         registeredAt,
       };
     }
+    if (m?.synthesizedBy === 'arkui-route') {
+      return {
+        label: 'ArkUI Router — navigates to page',
+        compact: 'dynamic: ArkUI Router',
+        registeredAt,
+      };
+    }
     if (m?.synthesizedBy === 'vue-handler') {
       const ev = m.event ? `@${String(m.event)}` : 'a template event';
       return {

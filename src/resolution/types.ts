@@ -40,6 +40,8 @@ export interface ResolvedRef {
   confidence: number;
   /** How it was resolved */
   resolvedBy: 'exact-match' | 'import' | 'qualified-name' | 'framework' | 'fuzzy' | 'instance-method' | 'file-path';
+  /** Synthesized-by label for rendering (e.g. 'arkui-route', 'callback') */
+  synthesizedBy?: string;
 }
 
 /**
@@ -81,6 +83,16 @@ export interface ResolutionContext {
   getAllFiles(): string[];
   /** Get nodes by lowercase name (O(1) lookup for fuzzy matching) */
   getNodesByLowerName(lowerName: string): Node[];
+  /**
+   * Direct supertypes of the type named `typeName` (same language): the classes
+   * it extends and the interfaces / protocols / traits it implements/conforms to,
+   * by simple name. Backed by the resolved `implements`/`extends` edges, so it is
+   * EMPTY during the first resolution pass (edges aren't built yet) and populated
+   * afterward — the conformance pass uses it to resolve a chained method defined
+   * on a supertype the receiver type conforms to (e.g. a protocol-extension
+   * method). Optional so external/test contexts compile without it.
+   */
+  getSupertypes?(typeName: string, language: Language): string[];
   /** Get cached import mappings for a file */
   getImportMappings(filePath: string, language: Language): ImportMapping[];
   /**

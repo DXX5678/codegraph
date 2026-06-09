@@ -2380,6 +2380,33 @@ export class TreeSitterExtractor {
         return;
       }
 
+      // Java static-factory / fluent chain: `Foo.getInstance().bar()` — the
+      // receiver is itself a method call, so resolution must infer bar's class
+      // from what `Foo.getInstance` RETURNS (its declared return type), the
+      // #645/#608 mechanism. Encode `<inner-receiver>.<inner-method>().<method>`;
+      // the `().` marker lets the Java chain resolver split it, and normalizing to
+      // empty parens drops any factory args (`Foo.create(cfg).bar()`) that would
+      // otherwise leave a `(cfg)` in the receiver text and break the split.
+      if (
+        methodName &&
+        this.language === 'java' &&
+        objectField.type === 'method_invocation'
+      ) {
+        const innerObj = getChildByField(objectField, 'object');
+        const innerName = getChildByField(objectField, 'name');
+        if (innerObj && innerName) {
+          calleeName = `${getNodeText(innerObj, this.source)}.${getNodeText(innerName, this.source)}().${methodName}`;
+          this.unresolvedReferences.push({
+            fromNodeId: callerId,
+            referenceName: calleeName,
+            referenceKind: 'calls',
+            line: node.startPosition.row + 1,
+            column: node.startPosition.column,
+          });
+          return;
+        }
+      }
+
       let receiverName: string;
       if (objectField.type === 'field_access') {
         const inner = getChildByField(objectField, 'object');
@@ -2502,22 +2529,52 @@ export class TreeSitterExtractor {
                 calleeName = methodName;
               }
             } else if (
-              (this.language === 'cpp' || this.language === 'c') &&
+              (this.language === 'cpp' ||
+                this.language === 'c' ||
+                this.language === 'kotlin' ||
+                this.language === 'swift' ||
+                this.language === 'rust') &&
               receiver &&
               receiver.type === 'call_expression'
             ) {
-              // C/C++ receiver that is itself a call — `Foo::instance().bar()`,
-              // `openSession()->run()`, `mgr.view().render()`. Keep the inner
-              // call so resolution can infer bar()'s class from what the inner
-              // call RETURNS (#645). Encode as `<innerCallee>().<method>`; the
-              // `().` marker never appears in an ordinary ref, so the C++
-              // resolver can detect and split it. Other languages keep the
-              // bare-name behavior (dropping the receiver) below.
-              const innerFn = getChildByField(receiver, 'function');
-              const innerCallee = innerFn
-                ? getNodeText(innerFn, this.source).replace(/->/g, '.').replace(/\s+/g, '')
-                : '';
-              calleeName = innerCallee ? `${innerCallee}().${methodName}` : methodName;
+              // Receiver that is itself a call — `Foo::instance().bar()`,
+              // `openSession()->run()`, `mgr.view().render()` (C/C++),
+              // `Foo.getInstance().bar()` (Kotlin) / `Foo.make().draw()` (Swift), or
+              // `Foo::new().bar()` (Rust). Keep the inner call so resolution can
+              // infer bar()'s class from what the inner call RETURNS (#645/#608).
+              // Encode as `<innerCallee>().<method>`; the `().` marker never appears
+              // in an ordinary ref, so the resolver can detect and split it. Other
+              // languages keep the bare-name behavior (dropping the receiver) below.
+              let innerCallee: string;
+              let reencode: boolean;
+              if (this.language === 'kotlin' || this.language === 'swift') {
+                // tree-sitter-kotlin/swift expose the inner callee as the
+                // call_expression's first named child (a navigation_expression
+                // `Foo.getInstance`, or a bare identifier for a free/constructor call).
+                const innerNav = receiver.namedChild(0);
+                innerCallee = innerNav ? getNodeText(innerNav, this.source).replace(/\s+/g, '') : '';
+                // Only re-encode a CLASS / companion-factory / constructor chain,
+                // whose receiver chain starts with a capitalized type
+                // (`Foo.getInstance().bar()`, `Foo().bar()`). An instance chain
+                // (`list.filter{}.map{}`) has a lowercase receiver whose type we
+                // can't recover here — re-encoding it would only drop the edge (no
+                // chain resolution, no bare-name fallback), regressing recall in
+                // fluent codebases. Leave those to the bare-name path.
+                reencode = /^[A-Z]/.test(innerCallee);
+              } else {
+                const innerFn = getChildByField(receiver, 'function');
+                innerCallee = innerFn
+                  ? getNodeText(innerFn, this.source).replace(/->/g, '.').replace(/\s+/g, '')
+                  : '';
+                // Rust: only re-encode an associated-function chain
+                // (`Foo::new().bar()`), whose inner callee is a path/`scoped_identifier`.
+                // An instance chain (`x.foo().bar()`, inner callee a field_expression)
+                // keeps bare-name — the `::` resolver can't recover a variable's type,
+                // so re-encoding would only drop the edge. C/C++ re-encode any inner.
+                reencode =
+                  this.language === 'rust' ? innerFn?.type === 'scoped_identifier' : !!innerCallee;
+              }
+              calleeName = reencode ? `${innerCallee}().${methodName}` : methodName;
             } else {
               calleeName = methodName;
             }
@@ -2525,6 +2582,22 @@ export class TreeSitterExtractor {
         } else if (func.type === 'scoped_identifier' || func.type === 'scoped_call_expression') {
           // Scoped call: Module::function()
           calleeName = getNodeText(func, this.source);
+        } else if (this.language === 'csharp' && func.type === 'member_access_expression') {
+          // C# member call `recv.Method(...)`. When the receiver is itself a call
+          // — a chained factory `Foo.Create(args).Bar()` — encode `inner().Bar`
+          // with normalized empty parens so resolution can infer Bar's class from
+          // what `Foo.Create` RETURNS (#645/#608). A non-call receiver keeps the
+          // full member-access text (the existing `recv.Method` behavior).
+          const recv = getChildByField(func, 'expression');
+          const nameNode = getChildByField(func, 'name');
+          const methodName = nameNode ? getNodeText(nameNode, this.source) : '';
+          if (recv && recv.type === 'invocation_expression' && methodName) {
+            const innerFunc = getChildByField(recv, 'function');
+            const innerCallee = innerFunc ? getNodeText(innerFunc, this.source).replace(/\s+/g, '') : '';
+            calleeName = innerCallee ? `${innerCallee}().${methodName}` : methodName;
+          } else {
+            calleeName = getNodeText(func, this.source);
+          }
         } else {
           calleeName = getNodeText(func, this.source);
         }
