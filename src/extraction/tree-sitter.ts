@@ -1503,13 +1503,14 @@ export class TreeSitterExtractor {
 
       for (const spec of specs) {
         const nameNode = spec.namedChild(0);
+        let varNode: Node | null = null;
         if (nameNode && nameNode.type === 'identifier') {
           const name = getNodeText(nameNode, this.source);
           const valueNode = spec.namedChildCount > 1 ? spec.namedChild(spec.namedChildCount - 1) : null;
           const initValue = valueNode ? getNodeText(valueNode, this.source).slice(0, 100) : undefined;
           const initSignature = initValue ? `= ${initValue}${initValue.length >= 100 ? '...' : ''}` : undefined;
 
-          this.createNode(node.type === 'const_declaration' ? 'constant' : 'variable', name, spec, {
+          varNode = this.createNode(node.type === 'const_declaration' ? 'constant' : 'variable', name, spec, {
             docstring,
             signature: initSignature,
           });
@@ -1519,8 +1520,16 @@ export class TreeSitterExtractor {
         // implementations) or `var c = pkg.New()` are extracted as
         // instantiates/calls dependencies — the body walker only covers
         // initializers inside functions, not these top-level declarations.
+        // Scope the walk to the declared symbol so a call inside an anonymous
+        // func_literal initializer — a cobra `RunE: func(){…}` handler, a
+        // goroutine or callback closure — attributes to the var instead of
+        // leaking to the file node (which reads as "no caller"), issue #693.
         const valueField = getChildByField(spec, 'value');
-        if (valueField) this.visitFunctionBody(valueField, '');
+        if (valueField) {
+          if (varNode) this.nodeStack.push(varNode.id);
+          this.visitFunctionBody(valueField, varNode?.id ?? '');
+          if (varNode) this.nodeStack.pop();
+        }
       }
 
       // Handle short_var_declaration (:=)
@@ -2344,6 +2353,33 @@ export class TreeSitterExtractor {
       // single-dot receiver regex fails. Pull out the immediate field after `this.`
       // so the receiver is the field name (`userbo`), which the resolver can then
       // look up in the enclosing class's field declarations.
+      // PHP static-factory fluent chain: `Cls::for($x)->method()` — the receiver
+      // is itself a static call, so resolution must infer the method's class
+      // from what `Cls::for` RETURNS (its `: self` / `: static` / `: Type`),
+      // #608 (mirrors the C++ chain fix in #645). Encode `<Cls::factory>().<method>`;
+      // the `().` marker lets the PHP resolver split it. The receiver text
+      // (`Cls::for('x')`) carries the args, so without this it degrades to an
+      // unresolvable string and the call edge is dropped.
+      if (methodName && this.language === 'php' && objectField.type === 'scoped_call_expression') {
+        const innerScope = getChildByField(objectField, 'scope');
+        const innerName = getChildByField(objectField, 'name');
+        if (innerScope && innerName) {
+          calleeName = `${getNodeText(innerScope, this.source)}::${getNodeText(innerName, this.source)}().${methodName}`;
+        } else {
+          calleeName = methodName;
+        }
+        if (calleeName) {
+          this.unresolvedReferences.push({
+            fromNodeId: callerId,
+            referenceName: calleeName,
+            referenceKind: 'calls',
+            line: node.startPosition.row + 1,
+            column: node.startPosition.column,
+          });
+        }
+        return;
+      }
+
       let receiverName: string;
       if (objectField.type === 'field_access') {
         const inner = getChildByField(objectField, 'object');
