@@ -394,6 +394,12 @@ export class ContextBuilder {
         ? `reads ${m.decorator ? `\`${String(m.decorator)}\`` : '@State'} ${String(m.property || 'prop')}`
         : m.synthesizedBy === 'arkui-event-chain'
         ? `event ${m.event ? `\`${String(m.event)}\`` : ''} → ${m.handler ? `\`${String(m.handler)}\`` : 'handler'}${at}`
+        : m.synthesizedBy === 'arkui-render'
+        ? `renders <${String(m.widget || 'widget')}>` +
+          (m.forEach ? ' (in list)' : '') +
+          (m.conditional ? ' (conditional)' : '')
+        : m.synthesizedBy === 'arkui-builder'
+        ? `@Builder ${m.builder ? `\`${String(m.builder)}\`` : 'method'}`
         : `event ${m.event ? `\`${String(m.event)}\`` : ''}${at}`;
       synthByPair.set(`${e.source}>${e.target}`, label);
     }
@@ -561,7 +567,7 @@ export class ContextBuilder {
           : ['file', 'module', 'class', 'struct', 'interface', 'trait', 'protocol',
              'function', 'method', 'property', 'field', 'variable', 'constant',
              'enum', 'enum_member', 'type_alias', 'namespace', 'export',
-             'route', 'component'] as NodeKind[];
+             'route', 'component', 'arkui_page'] as NodeKind[];
         for (const term of searchTerms) {
           const termResults = this.queries.searchNodes(term, {
             limit: opts.searchLimit * 2,

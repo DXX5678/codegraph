@@ -389,7 +389,7 @@ export const tools: ToolDefinition[] = [
         kind: {
           type: 'string',
           description: 'Filter by node kind',
-          enum: ['function', 'method', 'class', 'interface', 'type', 'variable', 'route', 'component'],
+          enum: ['function', 'method', 'class', 'struct', 'interface', 'type', 'variable', 'route', 'component', 'arkui_page'],
         },
         limit: {
           type: 'number',
@@ -1285,6 +1285,23 @@ export class ToolHandler {
       return {
         label: `ArkUI event chain — .on${String(m.event || 'Event')}() → ${handler} (dynamic dispatch)`,
         compact: `dynamic: ArkUI ${ev} → ${handler}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'arkui-render') {
+      const widget = m.widget ? `<${String(m.widget)}>` : 'child widget';
+      const extra = (m.forEach ? ' in list' : '') + (m.conditional ? ' conditional' : '');
+      return {
+        label: `ArkUI render — renders ${widget}${extra} (dynamic dispatch)`,
+        compact: `dynamic: ArkUI renders ${widget}${extra}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'arkui-builder') {
+      const builder = m.builder ? `\`${String(m.builder)}\`` : 'method';
+      return {
+        label: `ArkUI builder — @Builder ${builder} (dynamic dispatch)`,
+        compact: `dynamic: ArkUI @Builder ${builder}${at}`,
         registeredAt,
       };
     }

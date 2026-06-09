@@ -1,8 +1,9 @@
 /**
  * ArkUI Framework Resolver Tests
  */
-import { describe, it, expect } from 'vitest';
+import { beforeAll, describe, it, expect } from 'vitest';
 import { arkuiResolver } from '../src/resolution/frameworks/arkui';
+import { initGrammars, loadAllGrammars } from '../src/extraction/grammars';
 
 describe('arkuiResolver.extract', () => {
   it('extracts @Entry-decorated struct as arkui_page node', () => {
@@ -461,7 +462,7 @@ describe('arkuiResolver.resolve', () => {
 // Callback-synthesizer phase tests
 // ---------------------------------------------------------------------------
 import type { Node, Edge } from '../src/types';
-import { arkuiStateChainEdges, arkuiStateDepEdges, arkuiEventChainEdges } from '../src/resolution/callback-synthesizer';
+import { arkuiStateChainEdges, arkuiStateDepEdges, arkuiEventChainEdges, arkuiAstEdges } from '../src/resolution/callback-synthesizer';
 
 /** Create a minimal QueryBuilder mock. */
 function mockQueries(overrides: {
@@ -743,5 +744,746 @@ struct Page {
 
     const result = arkuiEventChainEdges(ctx as any);
     expect(result).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AST-based ArkUI edge synthesis tests (Phase C/D/E/F)
+// ---------------------------------------------------------------------------
+describe('arkuiAstEdges', () => {
+  beforeAll(async () => {
+    await initGrammars();
+    await loadAllGrammars();
+  });
+
+  // ── helpers ──
+
+  function makeNode(kind: string, name: string, id: string, startLine: number, endLine?: number): Node {
+    return {
+      id, kind, name,
+      filePath: 'test.ets',
+      startLine,
+      endLine: endLine ?? startLine,
+      qualifiedName: `test.ets::Test::${name}`,
+      language: 'arkts',
+      startColumn: 0,
+      endColumn: 0,
+      updatedAt: Date.now(),
+    };
+  }
+
+  /** Helper: create a struct/class node with explicit endLine (required for scoping). */
+  function makeStruct(name: string, id: string, startLine: number, endLine: number): Node {
+    return makeNode('struct', name, id, startLine, endLine);
+  }
+
+  /** Helper: create a method node. */
+  function makeMethod(name: string, id: string, startLine: number, endLine?: number): Node {
+    return makeNode('method', name, id, startLine, endLine ?? startLine);
+  }
+
+  /** Helper: create a property node. */
+  function makeProp(name: string, id: string, startLine: number): Node {
+    return makeNode('property', name, id, startLine);
+  }
+
+  /** Helper: create a component node. */
+  function makeComponent(name: string, id: string, startLine: number, endLine: number): Node {
+    return makeNode('component', name, id, startLine, endLine);
+  }
+
+  function runEdges(src: string, nodes: Node[]): Edge[] {
+    const fileContents = new Map<string, string>();
+    fileContents.set('test.ets', src);
+    const fileNodes = new Map<string, Node[]>();
+    fileNodes.set('test.ets', nodes);
+    const ctx = mockCtx({
+      files: ['test.ets'],
+      fileContents,
+      fileNodes,
+    });
+    return arkuiAstEdges(ctx as any);
+  }
+
+  // ── Phase D: UI tree edges (arkui-render) ──
+
+  it('emits arkui-render edge for custom component used in build()', () => {
+    const src = `
+@Component
+struct MyButton {
+  build() { Button('click'); }
+}
+
+@Entry
+@Component
+struct HomePage {
+  build() {
+    Column() {
+      MyButton()
+    }
+  }
+}
+`;
+    const nodes = [
+      makeComponent('MyButton', 'mybtn', 3, 5),
+      makeStruct('HomePage', 'home-struct', 9, 15),
+      makeMethod('build', 'home-build', 10, 14),
+    ];
+    const edges = runEdges(src, nodes);
+    const renderEdges = edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-render');
+    expect(renderEdges).toHaveLength(1);
+    expect(renderEdges[0].source).toBe('home-struct');
+    expect(renderEdges[0].target).toBe('mybtn');
+    expect(renderEdges[0].metadata?.widget).toBe('MyButton');
+  });
+
+  it('emits arkui-render edge for nested custom components', () => {
+    const src = `
+@Component
+struct InnerLabel {
+  build() { Text('inner'); }
+}
+
+@Component
+struct OuterBox {
+  build() {
+    Column() {
+      InnerLabel()
+    }
+  }
+}
+
+@Entry
+@Component
+struct Page {
+  build() {
+    OuterBox()
+  }
+}
+`;
+    const nodes = [
+      makeComponent('InnerLabel', 'inner', 3, 5),
+      makeMethod('build', 'inner-build', 4),
+      makeStruct('OuterBox', 'outer', 8, 14),
+      makeStruct('Page', 'page-struct', 18, 22),
+      makeMethod('build', 'outer-build', 9, 13),
+      makeMethod('build', 'page-build', 19, 21),
+    ];
+    const edges = runEdges(src, nodes);
+    // Page → OuterBox
+    const p2o = edges.find((e) => e.source === 'page-struct' && e.target === 'outer');
+    expect(p2o).toBeDefined();
+    expect(p2o!.metadata?.synthesizedBy).toBe('arkui-render');
+    // OuterBox → InnerLabel
+    const o2i = edges.find((e) => e.source === 'outer' && e.target === 'inner');
+    expect(o2i).toBeDefined();
+    expect(o2i!.metadata?.synthesizedBy).toBe('arkui-render');
+  });
+
+  it('walks ForEach body with forEach metadata on child edges', () => {
+    const src = `
+@Entry
+@Component
+struct Page {
+  build() {
+    ForEach([1,2,3], (item: number) => {
+      Text(item.toString())
+    })
+  }
+}
+`;
+    const nodes = [
+      makeStruct('Page', 'pg', 4, 8),
+      makeMethod('build', 'pg-build', 5, 8),
+    ];
+    const edges = runEdges(src, nodes);
+    // ForEach itself should NOT create an edge; Text is built-in → no edge
+    // But we can verify ForEach doesn't crash
+    expect(edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-render')).toEqual([]);
+  });
+
+  it('walks ForEach body and finds custom components inside', () => {
+    const src = `
+@Component
+struct Card {
+  build() { Text('card'); }
+}
+
+@Entry
+@Component
+struct Page {
+  build() {
+    ForEach([1,2,3], (item: number) => {
+      Card()
+    })
+  }
+}
+`;
+    const nodes = [
+      makeComponent('Card', 'card', 3, 5),
+      makeStruct('Page', 'pg', 9, 15),
+      makeMethod('build', 'pg-build', 10, 14),
+    ];
+    const edges = runEdges(src, nodes);
+    const renderEdges = edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-render');
+    expect(renderEdges).toHaveLength(1);
+    expect(renderEdges[0].source).toBe('pg');
+    expect(renderEdges[0].target).toBe('card');
+    expect(renderEdges[0].metadata?.forEach).toBe(true);
+    expect(renderEdges[0].metadata?.widget).toBe('Card');
+  });
+
+  it('walks if/else branches with conditional metadata', () => {
+    const src = `
+@Component
+struct TrueWidget {
+  build() { Text('true'); }
+}
+
+@Component
+struct FalseWidget {
+  build() { Text('false'); }
+}
+
+@Entry
+@Component
+struct Page {
+  @State flag: boolean = true;
+  build() {
+    if (this.flag) {
+      TrueWidget()
+    } else {
+      FalseWidget()
+    }
+  }
+}
+`;
+    const nodes = [
+      makeComponent('TrueWidget', 'tw', 3, 5),
+      makeComponent('FalseWidget', 'fw', 8, 10),
+      makeStruct('Page', 'pg', 14, 23),
+      makeMethod('build', 'pg-build', 16, 22),
+    ];
+    const edges = runEdges(src, nodes);
+    const renderEdges = edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-render');
+    expect(renderEdges).toHaveLength(2);
+    // Both branches should be walked
+    const twEdge = renderEdges.find((e) => e.metadata?.widget === 'TrueWidget');
+    expect(twEdge).toBeDefined();
+    expect(twEdge!.metadata?.conditional).toBe(true);
+    const fwEdge = renderEdges.find((e) => e.metadata?.widget === 'FalseWidget');
+    expect(fwEdge).toBeDefined();
+    expect(fwEdge!.metadata?.conditional).toBe(true);
+  });
+
+  it('does not emit render edge for built-in widgets without graph nodes', () => {
+    const src = `
+@Entry
+@Component
+struct Page {
+  build() {
+    Column() {
+      Row() {
+        Text('hello')
+        Button('click')
+      }
+    }
+  }
+}
+`;
+    const nodes = [
+      makeStruct('Page', 'pg', 4, 11),
+      makeMethod('build', 'pg-build', 5, 11),
+    ];
+    const edges = runEdges(src, nodes);
+    expect(edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-render')).toEqual([]);
+  });
+
+  // ── Phase C: Event chain edges (arkui-event-chain) ──
+
+  it('emits arkui-event-chain for .onClick(this.handler)', () => {
+    const src = `
+@Entry
+@Component
+struct Page {
+  handleClick() { console.log('clicked'); }
+  build() {
+    Button('OK').onClick(this.handleClick)
+  }
+}
+`;
+    const nodes = [
+      makeStruct('Page', 'pg', 4, 8),
+      makeMethod('handleClick', 'handler', 5),
+      makeMethod('build', 'pg-build', 6, 8),
+    ];
+    const edges = runEdges(src, nodes);
+    const evtEdges = edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-event-chain');
+    expect(evtEdges).toHaveLength(1);
+    expect(evtEdges[0].source).toBe('pg-build');
+    expect(evtEdges[0].target).toBe('handler');
+    expect(evtEdges[0].metadata?.event).toBe('Click');
+    expect(evtEdges[0].metadata?.handler).toBe('handleClick');
+  });
+
+  it('emits arkui-event-chain for .onClick(() => { this.handler() })', () => {
+    const src = `
+@Entry
+@Component
+struct Page {
+  handleClick() { console.log('clicked'); }
+  build() {
+    Button('OK').onClick(() => { this.handleClick(); })
+  }
+}
+`;
+    const nodes = [
+      makeStruct('Page', 'pg', 4, 8),
+      makeMethod('handleClick', 'handler', 5),
+      makeMethod('build', 'pg-build', 6, 8),
+    ];
+    const edges = runEdges(src, nodes);
+    const evtEdges = edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-event-chain');
+    expect(evtEdges).toHaveLength(1);
+    expect(evtEdges[0].source).toBe('pg-build');
+    expect(evtEdges[0].target).toBe('handler');
+    expect(evtEdges[0].metadata?.handler).toBe('handleClick');
+  });
+
+  it('emits arkui-event-chain for .onChange(this.onTextChange)', () => {
+    const src = `
+@Entry
+@Component
+struct Page {
+  onTextChange(v: string) { console.log(v); }
+  build() {
+    TextInput().onChange(this.onTextChange)
+  }
+}
+`;
+    const nodes = [
+      makeStruct('Page', 'pg', 4, 8),
+      makeMethod('onTextChange', 'handler', 5),
+      makeMethod('build', 'pg-build', 6, 8),
+    ];
+    const edges = runEdges(src, nodes);
+    const evtEdges = edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-event-chain');
+    expect(evtEdges).toHaveLength(1);
+    expect(evtEdges[0].metadata?.event).toBe('Change');
+    expect(evtEdges[0].metadata?.handler).toBe('onTextChange');
+  });
+
+  it('skips event chain when handler name is build', () => {
+    const src = `
+@Entry
+@Component
+struct Page {
+  build() {
+    Column() { this.build(); }
+  }
+}
+`;
+    const nodes = [
+      makeStruct('Page', 'pg', 4, 7),
+      makeMethod('build', 'pg-build', 5, 7),
+    ];
+    const edges = runEdges(src, nodes);
+    expect(edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-event-chain')).toEqual([]);
+  });
+
+  it('does not emit event chain for non-event method calls', () => {
+    const src = `
+@Entry
+@Component
+struct Page {
+  helper() { return 42; }
+  build() {
+    Column().width(100)
+  }
+}
+`;
+    const nodes = [
+      makeStruct('Page', 'pg', 4, 8),
+      makeMethod('helper', 'helper', 5),
+      makeMethod('build', 'pg-build', 6, 8),
+    ];
+    const edges = runEdges(src, nodes);
+    expect(edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-event-chain')).toEqual([]);
+  });
+
+  // ── Phase E: State dependency edges (arkui-state-dep) ──
+
+  it('emits arkui-state-dep for method reading @State property via this.<prop>', () => {
+    const src = `
+@Entry
+@Component
+struct Page {
+  @State count: number = 0;
+  increment() { this.count++; }
+  build() { Text(this.count.toString()); }
+}
+`;
+    const nodes = [
+      makeStruct('Page', 'pg', 4, 8),
+      makeProp('count', 'prop-count', 5),
+      makeMethod('increment', 'inc', 6),
+      makeMethod('build', 'pg-build', 7, 8),
+    ];
+    const edges = runEdges(src, nodes);
+    const depEdges = edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-state-dep');
+    expect(depEdges).toHaveLength(1);
+    expect(depEdges[0].source).toBe('inc');
+    expect(depEdges[0].target).toBe('prop-count');
+    expect(depEdges[0].metadata?.decorator).toBe('@State');
+    expect(depEdges[0].metadata?.property).toBe('count');
+  });
+
+  it('skips build() method for state dependency edges', () => {
+    const src = `
+@Entry
+@Component
+struct Page {
+  @State count: number = 0;
+  build() { Text(this.count.toString()); }
+}
+`;
+    const nodes = [
+      makeStruct('Page', 'pg', 4, 7),
+      makeProp('count', 'prop-count', 5),
+      makeMethod('build', 'pg-build', 6, 7),
+    ];
+    const edges = runEdges(src, nodes);
+    // build() reads this.count but Phase E skips build()
+    expect(edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-state-dep')).toEqual([]);
+  });
+
+  it('detects @Prop and @Link decorators for state-dep edges', () => {
+    const src = `
+@Component
+struct Child {
+  @Prop title: string = '';
+  @Link active: boolean;
+  toggle() { this.active = !this.active; }
+  build() { Text(this.title); }
+}
+`;
+    const nodes = [
+      makeStruct('Child', 'child', 3, 8),
+      makeProp('title', 'prop-title', 4),
+      makeProp('active', 'prop-active', 5),
+      makeMethod('toggle', 'toggle', 6),
+      makeMethod('build', 'child-build', 7, 8),
+    ];
+    const edges = runEdges(src, nodes);
+    const depEdges = edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-state-dep');
+    expect(depEdges).toHaveLength(1);
+    // toggle reads this.active → @Link
+    expect(depEdges[0].source).toBe('toggle');
+    expect(depEdges[0].target).toBe('prop-active');
+    expect(depEdges[0].metadata?.decorator).toBe('@Link');
+  });
+
+  it('detects @StorageLink and @StorageProp decorators', () => {
+    const src = `
+@Entry
+@Component
+struct Page {
+  @StorageLink('theme') theme: string = 'light';
+  updateTheme() { this.theme = 'dark'; }
+  build() { Text(this.theme); }
+}
+`;
+    const nodes = [
+      makeStruct('Page', 'pg', 4, 8),
+      makeProp('theme', 'prop-theme', 5),
+      makeMethod('updateTheme', 'update', 6),
+      makeMethod('build', 'pg-build', 7, 8),
+    ];
+    const edges = runEdges(src, nodes);
+    const depEdges = edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-state-dep');
+    expect(depEdges).toHaveLength(1);
+    expect(depEdges[0].source).toBe('update');
+    expect(depEdges[0].target).toBe('prop-theme');
+    expect(depEdges[0].metadata?.decorator).toBe('@StorageLink');
+  });
+
+  it('does not emit state-dep for non-state property access', () => {
+    const src = `
+@Entry
+@Component
+struct Page {
+  regularField: string = 'hello';
+  helper() { this.regularField = 'world'; }
+  build() { Text('hi'); }
+}
+`;
+    const nodes = [
+      makeStruct('Page', 'pg', 4, 8),
+      makeProp('regularField', 'prop-reg', 5),
+      makeMethod('helper', 'helper', 6),
+      makeMethod('build', 'pg-build', 7, 8),
+    ];
+    const edges = runEdges(src, nodes);
+    expect(edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-state-dep')).toEqual([]);
+  });
+
+  it('does not emit state-dep for method that does not access state', () => {
+    const src = `
+@Entry
+@Component
+struct Page {
+  @State count: number = 0;
+  helper() { return 42; }
+  build() { Text('hello'); }
+}
+`;
+    const nodes = [
+      makeStruct('Page', 'pg', 4, 8),
+      makeProp('count', 'prop-count', 5),
+      makeMethod('helper', 'helper', 6),
+      makeMethod('build', 'pg-build', 7, 8),
+    ];
+    const edges = runEdges(src, nodes);
+    // helper doesn't read this.count
+    expect(edges.filter((e) => e.source === 'helper')).toEqual([]);
+  });
+
+  // ── Phase F: Builder edges (arkui-builder) ──
+
+  it('emits arkui-builder for @Builder method called via this.xxx() in build()', () => {
+    const src = `
+@Entry
+@Component
+struct Page {
+  @Builder myFooter() { Text('footer'); }
+  build() {
+    Column() {
+      this.myFooter()
+    }
+  }
+}
+`;
+    const nodes = [
+      makeStruct('Page', 'pg', 4, 11),
+      makeMethod('myFooter', 'footer', 5),
+      makeMethod('build', 'pg-build', 6, 10),
+    ];
+    const edges = runEdges(src, nodes);
+    const builderEdges = edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-builder');
+    expect(builderEdges).toHaveLength(1);
+    expect(builderEdges[0].source).toBe('pg-build');
+    expect(builderEdges[0].target).toBe('footer');
+    expect(builderEdges[0].metadata?.builder).toBe('myFooter');
+  });
+
+  it('does not emit builder edge for non-@Builder method called in build()', () => {
+    const src = `
+@Entry
+@Component
+struct Page {
+  helper() { return Text('help'); }
+  build() {
+    Column() {
+      this.helper()
+    }
+  }
+}
+`;
+    const nodes = [
+      makeStruct('Page', 'pg', 4, 11),
+      makeMethod('helper', 'helper', 5),
+      makeMethod('build', 'pg-build', 6, 10),
+    ];
+    const edges = runEdges(src, nodes);
+    expect(edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-builder')).toEqual([]);
+  });
+
+  it('handles multiple @Builder methods', () => {
+    const src = `
+@Entry
+@Component
+struct Page {
+  @Builder header() { Text('header'); }
+  @Builder footer() { Text('footer'); }
+  build() {
+    Column() {
+      this.header()
+      this.footer()
+    }
+  }
+}
+`;
+    const nodes = [
+      makeStruct('Page', 'pg', 4, 13),
+      makeMethod('header', 'hdr', 5),
+      makeMethod('footer', 'ftr', 6),
+      makeMethod('build', 'pg-build', 7, 12),
+    ];
+    const edges = runEdges(src, nodes);
+    const builderEdges = edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-builder');
+    expect(builderEdges).toHaveLength(2);
+    const names = builderEdges.map((e) => e.metadata?.builder).sort();
+    expect(names).toEqual(['footer', 'header']);
+  });
+
+  // ── Edge cases ──
+
+  it('skips files without build() method', () => {
+    const src = `
+@Component
+struct EmptyStruct {
+  helper() { return 42; }
+}
+`;
+    const nodes = [
+      makeStruct('EmptyStruct', 'es', 3, 5),
+      makeMethod('helper', 'helper', 4),
+    ];
+    const edges = runEdges(src, nodes);
+    expect(edges).toEqual([]);
+  });
+
+  it('skips non-.ets files', () => {
+    const fileContents = new Map<string, string>();
+    fileContents.set('test.ts', 'export function foo() {}');
+    const fileNodes = new Map<string, Node[]>();
+    fileNodes.set('test.ts', []);
+    const ctx = mockCtx({
+      files: ['test.ts'],
+      fileContents,
+      fileNodes,
+    });
+    const edges = arkuiAstEdges(ctx as any);
+    expect(edges).toEqual([]);
+  });
+
+  it('processes multiple structs independently in one file', () => {
+    const src = `
+@Component
+struct WidgetA {
+  build() { Text('A'); }
+}
+
+@Entry
+@Component
+struct WidgetB {
+  handleClick() { console.log('B clicked'); }
+  build() {
+    WidgetA()
+    Button('B').onClick(this.handleClick)
+  }
+}
+`;
+    const nodes = [
+      makeComponent('WidgetA', 'wa', 3, 5),
+      makeMethod('build', 'wa-build', 4, 5),
+      makeStruct('WidgetB', 'wb', 9, 15),
+      makeMethod('handleClick', 'handler', 10),
+      makeMethod('build', 'wb-build', 11, 14),
+    ];
+    const edges = runEdges(src, nodes);
+    // WidgetB → WidgetA (ui-render)
+    const renderEdges = edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-render');
+    expect(renderEdges).toHaveLength(1);
+    expect(renderEdges[0].source).toBe('wb');
+    expect(renderEdges[0].target).toBe('wa');
+    // WidgetB.build → handleClick (event-chain)
+    const evtEdges = edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-event-chain');
+    expect(evtEdges).toHaveLength(1);
+    expect(evtEdges[0].source).toBe('wb-build');
+    expect(evtEdges[0].target).toBe('handler');
+  });
+
+  it('deduplicates edges by source>target key', () => {
+    const src = `
+@Entry
+@Component
+struct Page {
+  handleClick() { console.log('clicked'); }
+  build() {
+    Button('A').onClick(this.handleClick)
+    Button('B').onClick(this.handleClick)
+  }
+}
+`;
+    const nodes = [
+      makeStruct('Page', 'pg', 4, 9),
+      makeMethod('handleClick', 'handler', 5),
+      makeMethod('build', 'pg-build', 6, 9),
+    ];
+    const edges = runEdges(src, nodes);
+    // Two .onClick(this.handleClick) but same source>target → deduplicated
+    const evtEdges = edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-event-chain');
+    expect(evtEdges).toHaveLength(1);
+  });
+
+  it('sets provenance to heuristic and kind to calls', () => {
+    const src = `
+@Entry
+@Component
+struct Page {
+  handleClick() { console.log('clicked'); }
+  build() {
+    Button('OK').onClick(this.handleClick)
+  }
+}
+`;
+    const nodes = [
+      makeStruct('Page', 'pg', 4, 8),
+      makeMethod('handleClick', 'handler', 5),
+      makeMethod('build', 'pg-build', 6, 8),
+    ];
+    const edges = runEdges(src, nodes);
+    for (const e of edges) {
+      expect(e.provenance).toBe('heuristic');
+      expect(e.kind).toBe('calls');
+    }
+  });
+
+  it('skips files without recognizable UI patterns via quick-skip regex', () => {
+    const src = `
+@Component
+struct Helper {
+  add(a: number, b: number): number { return a + b; }
+}
+`;
+    const fileContents = new Map<string, string>();
+    fileContents.set('test.ets', src);
+    const fileNodes = new Map<string, Node[]>();
+    fileNodes.set('test.ets', [
+      makeStruct('Helper', 'h', 3, 5),
+      makeMethod('add', 'add', 4),
+    ]);
+    // Note: 'build' is NOT in the source, and no UI patterns
+    const ctx = mockCtx({
+      files: ['test.ets'],
+      fileContents,
+      fileNodes,
+    });
+    const edges = arkuiAstEdges(ctx as any);
+    // Quick-skip: no 'build', no Column/Row/Text/Button/etc.
+    expect(edges).toEqual([]);
+  });
+
+  it('handles @State with watch parameter', () => {
+    const src = `
+@Entry
+@Component
+struct Page {
+  @State({ watch: 'onCountChange' }) count: number = 0;
+  onCountChange() { console.log('changed'); }
+  build() { Text(this.count.toString()); }
+}
+`;
+    const nodes = [
+      makeStruct('Page', 'pg', 4, 8),
+      makeProp('count', 'prop-count', 5),
+      makeMethod('onCountChange', 'occ', 6),
+      makeMethod('build', 'pg-build', 7, 8),
+    ];
+    const edges = runEdges(src, nodes);
+    // onCountChange doesn't access this.count → no state-dep edge
+    // But we verify the @State is recognized (no crash)
+    expect(edges.filter((e) => e.metadata?.synthesizedBy === 'arkui-state-dep')).toEqual([]);
   });
 });
