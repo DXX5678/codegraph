@@ -20,4 +20,15 @@ export const arktsExtractor: LanguageExtractor = {
   // ArkTS uses `struct` keyword for component definitions.
   // tree-sitter-arkts grammar parses these as `struct_declaration` nodes.
   structTypes: ['struct_declaration'],
+
+  // Override methodTypes: exclude public_field_definition — ArkUI state
+  // properties (@State count: number = 0) are field declarations, not
+  // methods.  Pure arrow-function class fields are uncommon in ArkTS;
+  // the ArkUI convention defines event handlers as proper methods.
+  methodTypes: ['method_definition'],
+
+  // Extract ArkUI state properties as 'property' nodes so the state-dep
+  // edge synthesis (Phase B + Phase E) can find and link them to handler
+  // methods that read this.<prop>.
+  propertyTypes: ['public_field_definition'],
 };

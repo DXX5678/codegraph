@@ -1046,6 +1046,10 @@ export class TreeSitterExtractor {
     // `record struct M(decimal Amount)` which the grammar nests here).
     this.extractCsharpPrimaryCtorParamRefs(node, structNode.id);
 
+    // Extract decorators on the struct (e.g. ArkUI @Entry, @Component).
+    // Mirrors extractClass (line ~870) which already does this for classes.
+    this.extractDecoratorsFor(node, structNode.id);
+
     // Push to stack for field extraction
     this.nodeStack.push(structNode.id);
     for (let i = 0; i < body.namedChildCount; i++) {
