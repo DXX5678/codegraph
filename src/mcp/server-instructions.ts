@@ -45,7 +45,7 @@ typically one to a few calls; a grep/read exploration is dozens.
 ## Tool selection by intent
 
 - **Almost any question — "how does X work", architecture, a bug, "what/where is X", or surveying an area** → \`codegraph_explore\` (PRIMARY — call FIRST; ONE capped call returns the verbatim source of the relevant symbols grouped by file; most often the ONLY call you need)
-- **"How does X reach/become Y? / the flow / the path from X to Y"** → \`codegraph_explore\`, naming the symbols that span the flow (e.g. \`mutateElement renderScene\`) — it surfaces the call path among them, including dynamic-dispatch hops (callbacks, React re-render, JSX children) grep can't follow
+- **"How does X reach/become Y? / the flow / the path from X to Y"** → \`codegraph_explore\`, naming the symbols that span the flow (e.g. \`mutateElement renderScene\`) — it surfaces the call path among them, including dynamic-dispatch hops (callbacks, React re-render, JSX children, ArkUI render/event/builder/state chains) grep can't follow
 - **"What is the symbol named X?" (just its location)** → \`codegraph_search\`
 - **"What calls this?" / "What does this call?" / "What would changing this break?"** → \`codegraph_callers\` / \`codegraph_callees\` / \`codegraph_impact\`
 - **Reading a source FILE (any time you'd use the \`Read\` tool)** → \`codegraph_node\` with a \`file\` path and no \`symbol\`. It returns the file's **current source with line numbers — the same \`<n>\\t<line>\` shape \`Read\` gives you, safe to \`Edit\` from** — narrowable with \`offset\`/\`limit\` exactly like \`Read\`, PLUS a one-line note of which files depend on it. Same bytes as \`Read\`, faster (served from the index), with the blast radius attached. Use it **instead of \`Read\`** for indexed source files; fall back to \`Read\` only for what codegraph doesn't index (configs, docs). Pass \`symbolsOnly: true\` for just the file's structure.
@@ -59,6 +59,27 @@ typically one to a few calls; a grep/read exploration is dozens.
 - **Onboarding / understanding any area**: ONE \`codegraph_explore\` is usually the whole answer. Only follow up — \`codegraph_node\` for a specific symbol — if something is still unclear.
 - **Refactor planning**: \`codegraph_search\` → \`codegraph_callers\` → \`codegraph_impact\`. The blast-radius answer comes from impact, not from walking callers manually.
 - **Debugging a regression**: \`codegraph_callers\` of the suspected symbol; widen with \`codegraph_impact\` if an unexpected call appears.
+
+## ArkUI / HarmonyOS
+
+Codegraph synthesizes ArkUI component relationships that static analysis alone
+misses. These edges carry \`[ArkUI …]\` labels in CLI output and flow through
+\`codegraph_explore\`, \`codegraph_callers\`, \`codegraph_callees\`, and
+\`codegraph_impact\` just like direct calls:
+
+- **Component tree**: \`build()\` renders child components → \`[ArkUI render <Widget>]\`
+- **Event binding**: \`.onClick(this.handler)\` creates an edge from \`build()\` → handler
+- **State dependency**: a handler reading \`this.count\` links to the \`@State count\` property
+- **State chain**: any sibling method in the struct links to \`build()\` (potential re-render)
+- **@Builder**: \`this.myBuilder()\` in \`build()\` links to the \`@Builder\` method
+
+### ArkUI project guidance
+
+- **"What components does this struct render?"** → \`codegraph_callees\` on the struct — the \`[ArkUI render]\` edges show the component tree. One \`codegraph_explore\` with the struct + child names shows the full UI path.
+- **"What happens when a user clicks this button?"** → \`codegraph_callers\` on the handler — the \`[ArkUI Click]\` edge traces back to \`build()\`'s \`.onClick()\`.
+- **"What state drives this UI?"** → \`codegraph_callees\` on the handler → \`[ArkUI @State]\` edges show which reactive properties it reads.
+- **"What would changing this @State property break?"** → \`codegraph_impact\` on the property — it follows the state-dep edges to handlers and the state-chain to \`build()\`.
+- \`.ets\` files are indexed with the \`arkts\` grammar; structs, methods, and state properties are all first-class nodes.
 
 ## Anti-patterns
 
