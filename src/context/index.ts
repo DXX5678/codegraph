@@ -24,7 +24,7 @@ import { QueryBuilder } from '../db/queries';
 import { GraphTraverser } from '../graph';
 import { formatContextAsMarkdown, formatContextAsJson } from './formatter';
 import { logDebug } from '../errors';
-import { validatePathWithinRoot } from '../utils';
+import { validatePathWithinRoot, isConfigLeafNode } from '../utils';
 import { isTestFile, extractSearchTerms, scorePathRelevance, getStemVariants, isDistinctiveIdentifier } from '../search/query-utils';
 import { LOW_CONFIDENCE_MARKER } from './markers';
 
@@ -394,6 +394,12 @@ export class ContextBuilder {
         ? `reads ${m.decorator ? `\`${String(m.decorator)}\`` : '@State'} ${String(m.property || 'prop')}`
         : m.synthesizedBy === 'arkui-event-chain'
         ? `event ${m.event ? `\`${String(m.event)}\`` : ''} → ${m.handler ? `\`${String(m.handler)}\`` : 'handler'}${at}`
+        : m.synthesizedBy === 'arkui-render'
+        ? `renders <${String(m.widget || 'widget')}>` +
+          (m.forEach ? ' (in list)' : '') +
+          (m.conditional ? ' (conditional)' : '')
+        : m.synthesizedBy === 'arkui-builder'
+        ? `@Builder ${m.builder ? `\`${String(m.builder)}\`` : 'method'}`
         : `event ${m.event ? `\`${String(m.event)}\`` : ''}${at}`;
       synthByPair.set(`${e.source}>${e.target}`, label);
     }
@@ -561,7 +567,7 @@ export class ContextBuilder {
           : ['file', 'module', 'class', 'struct', 'interface', 'trait', 'protocol',
              'function', 'method', 'property', 'field', 'variable', 'constant',
              'enum', 'enum_member', 'type_alias', 'namespace', 'export',
-             'route', 'component'] as NodeKind[];
+             'route', 'component', 'arkui_page'] as NodeKind[];
         for (const term of searchTerms) {
           const termResults = this.queries.searchNodes(term, {
             limit: opts.searchLimit * 2,
@@ -1167,6 +1173,14 @@ export class ContextBuilder {
    * Extract code from a node's source file
    */
   private async extractNodeCode(node: Node): Promise<string | null> {
+    // SECURITY (#383): a config-leaf node's on-disk line is `key = <secret>`.
+    // Return the KEY only — never read the value off disk. This closes the
+    // includeCode / buildContext code-block path, mirroring the explore source
+    // renderer; an agent that genuinely needs a value can read the file itself.
+    if (isConfigLeafNode(node)) {
+      return node.signature || node.qualifiedName || node.name;
+    }
+
     const filePath = validatePathWithinRoot(this.projectRoot, node.filePath);
 
     if (!filePath || !fs.existsSync(filePath)) {
