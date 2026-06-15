@@ -220,7 +220,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       );
       continue;
     }
-    const result = target.install(location, { autoAllow });
+    const result = await target.install(location, { autoAllow });
     installedIds.push(target.id);
     for (const file of result.files) {
       if (file.action === 'created') sawCreated = true;
