@@ -184,6 +184,89 @@ export class PaymentService {
     expect(chargeMethod).toBeDefined();
   });
 
+  it('captures docstrings for export- and const-wrapped declarations (#780)', () => {
+    const code = `
+// plain class control
+class Ledger {}
+
+// exported class
+export class Invoice {}
+
+// export default
+export default function settle() { return true; }
+
+// exported arrow const
+export const refund = (amount: number) => amount;
+
+// non-export arrow const
+const audit = (amount: number) => amount;
+`;
+    const byName = new Map(extractFromSource('doc.ts', code).nodes.map((n) => [n.name, n]));
+    expect(byName.get('Ledger')?.docstring).toBe('plain class control'); // control still works
+    expect(byName.get('Invoice')?.docstring).toBe('exported class');
+    expect(byName.get('settle')?.docstring).toBe('export default');
+    expect(byName.get('refund')?.docstring).toBe('exported arrow const');
+    expect(byName.get('audit')?.docstring).toBe('non-export arrow const');
+  });
+
+  it('does not mis-attribute a class comment to an uncommented member (#780)', () => {
+    const code = `
+// Comment for Box
+export class Box {
+  noComment() {}
+  // own comment
+  withComment() {}
+}
+`;
+    const byName = new Map(extractFromSource('box.ts', code).nodes.map((n) => [n.name, n]));
+    expect(byName.get('Box')?.docstring).toBe('Comment for Box');
+    expect(byName.get('noComment')?.docstring ?? null).toBeNull(); // no over-walk
+    expect(byName.get('withComment')?.docstring).toBe('own comment');
+  });
+
+  it('captures docstrings for decorated Python declarations, stripping `#` (#780)', () => {
+    const code = [
+      '# decorated function',
+      '@app.route("/x")',
+      'def py_handler():',
+      '    return 1',
+      '',
+      '',
+      '# plain function control',
+      'def py_plain():',
+      '    return 1',
+      '',
+      '',
+      '# decorated class',
+      '@dataclass',
+      'class PyModel:',
+      '    pass',
+      '',
+    ].join('\n');
+    const byName = new Map(extractFromSource('mod.py', code).nodes.map((n) => [n.name, n]));
+    expect(byName.get('py_handler')?.docstring).toBe('decorated function');
+    expect(byName.get('py_plain')?.docstring).toBe('plain function control'); // `#` stripped
+    expect(byName.get('PyModel')?.docstring).toBe('decorated class');
+  });
+
+  it('cleans comment markers across language styles (#780)', () => {
+    const doc = (file: string, code: string, name: string) =>
+      new Map(extractFromSource(file, code).nodes.map((n) => [n.name, n])).get(name)?.docstring;
+
+    // Rust doc lines (`///`, `//!`) — the trailing slash used to leak through.
+    expect(doc('m.rs', '/// rust doc line\nfn rs_fn() {}', 'rs_fn')).toBe('rust doc line');
+    // Lua line + long-bracket comments.
+    expect(doc('m.lua', '-- lua line\nfunction lua_fn() end', 'lua_fn')).toBe('lua line');
+    expect(doc('b.lua', '--[[ lua block ]]\nfunction lua_b() end', 'lua_b')).toBe('lua block');
+    // Pascal brace and paren-star comments.
+    const pasUnit = (c: string) =>
+      `unit U;\ninterface\n${c}\nprocedure P;\nimplementation\nprocedure P;\nbegin\nend;\nend.\n`;
+    expect(doc('a.pas', pasUnit('{ pascal brace }'), 'P')).toBe('pascal brace');
+    expect(doc('c.pas', pasUnit('(* pascal paren *)'), 'P')).toBe('pascal paren');
+    // C block comment still clean (no regression).
+    expect(doc('m.c', '/* c block */\nvoid c_fn(void) {}', 'c_fn')).toBe('c block');
+  });
+
   it('should extract interfaces', () => {
     const code = `
 export interface User {
@@ -1065,6 +1148,40 @@ public class OrderService
     expect(classNode).toBeDefined();
     expect(classNode?.name).toBe('OrderService');
     expect(classNode?.visibility).toBe('public');
+  });
+
+  it('indexes every record form with the right kind (#831)', () => {
+    // The grammar parses ALL record forms as record_declaration — there is no
+    // record_struct_declaration node — so the value-type forms are told apart
+    // by their `struct` keyword child. Positional one-liners have no body
+    // block and must still index (the no-body gate is for C/C++ forward
+    // declarations, not records).
+    const code = `
+namespace Fixture;
+
+public record SimplePositional(int A);
+public record WithBody(int A) { public int DoubleIt() => A * 2; }
+public record class ExplicitClassRec(string Name);
+public record struct ValueRec(int X);
+public readonly record struct ReadonlyRec(int X, int Y);
+public record DerivedRec(int A, string B) : SimplePositional(A);
+public record GenericRec<T>(T Value);
+public partial record PartialRec(int A);
+`;
+    const result = extractFromSource('Records.cs', code);
+    const kindOf = (name: string) => result.nodes.find((n) => n.name === name)?.kind;
+
+    expect(kindOf('SimplePositional')).toBe('class');
+    expect(kindOf('WithBody')).toBe('class');
+    expect(kindOf('ExplicitClassRec')).toBe('class');
+    expect(kindOf('DerivedRec')).toBe('class');
+    expect(kindOf('GenericRec')).toBe('class');
+    expect(kindOf('PartialRec')).toBe('class');
+    // Value-type records are structs, not classes.
+    expect(kindOf('ValueRec')).toBe('struct');
+    expect(kindOf('ReadonlyRec')).toBe('struct');
+    // Members of a bodied record still extract.
+    expect(kindOf('DoubleIt')).toBe('method');
   });
 
   it('indexes primary-constructor classes, including keyed-DI attribute params (#237)', () => {
@@ -5812,6 +5929,218 @@ const value = 42;
   });
 });
 
+describe('Astro Extraction', () => {
+  it('should detect Astro files', () => {
+    expect(detectLanguage('src/pages/index.astro')).toBe('astro');
+    expect(detectLanguage('Layout.astro')).toBe('astro');
+    expect(isLanguageSupported('astro')).toBe(true);
+  });
+
+  it('should extract component node from an .astro file', () => {
+    const code = `---
+const title = 'Hello';
+---
+<h1>{title}</h1>
+`;
+    const result = extractFromSource('Card.astro', code);
+
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+    expect(componentNode?.name).toBe('Card');
+    expect(componentNode?.language).toBe('astro');
+    expect(componentNode?.isExported).toBe(true);
+  });
+
+  it('should extract frontmatter symbols with correct line numbers (#768)', () => {
+    const code = `---
+import { formatDate } from '../utils/format';
+
+function getIconNode(name: string): string {
+  return name;
+}
+
+const { title } = Astro.props;
+---
+<span>{title}</span>
+`;
+    const result = extractFromSource('navs.astro', code);
+
+    // The #768 repro: a function defined in frontmatter must be found
+    const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'getIconNode');
+    expect(fn).toBeDefined();
+    expect(fn?.language).toBe('astro');
+    expect(fn?.startLine).toBe(4);
+
+    const imp = result.nodes.find((n) => n.kind === 'import');
+    expect(imp).toBeDefined();
+    expect(imp?.startLine).toBe(2);
+  });
+
+  it('should extract exported getStaticPaths from frontmatter', () => {
+    const code = `---
+export async function getStaticPaths() {
+  return [];
+}
+const { slug } = Astro.params;
+---
+<p>{slug}</p>
+`;
+    const result = extractFromSource('[slug].astro', code);
+
+    const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'getStaticPaths');
+    expect(fn).toBeDefined();
+    expect(fn?.isExported).toBe(true);
+  });
+
+  it('should extract calls from template expressions', () => {
+    const code = `---
+import { formatDate } from '../utils/format';
+const date = new Date();
+---
+<time>{formatDate(date)}</time>
+`;
+    const result = extractFromSource('Stamp.astro', code);
+
+    const call = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'formatDate' && ref.line === 5
+    );
+    expect(call).toBeDefined();
+  });
+
+  it('should extract calls from a multiline expression opening line', () => {
+    const code = `---
+const posts = [];
+---
+<ul>
+  {posts.map((post) => (
+    <li>{render(post)}</li>
+  ))}
+</ul>
+`;
+    const result = extractFromSource('List.astro', code);
+
+    const mapCall = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'posts.map'
+    );
+    expect(mapCall).toBeDefined();
+    const innerCall = result.unresolvedReferences.find(
+      (ref) => ref.referenceKind === 'calls' && ref.referenceName === 'render'
+    );
+    expect(innerCall).toBeDefined();
+  });
+
+  it('should extract PascalCase component usages from the template', () => {
+    const code = `---
+import Layout from '../layouts/Layout.astro';
+import PostCard from '../components/PostCard.astro';
+---
+<Layout title="Home">
+  <PostCard />
+  <Fragment slot="head" />
+  <div class="plain-html" />
+</Layout>
+`;
+    const result = extractFromSource('index.astro', code);
+
+    const refs = result.unresolvedReferences.filter((r) => r.referenceKind === 'references');
+    const names = refs.map((r) => r.referenceName);
+    expect(names).toContain('Layout');
+    expect(names).toContain('PostCard');
+    // Astro built-ins and lowercase HTML are not component references
+    expect(names).not.toContain('Fragment');
+    expect(names).not.toContain('div');
+  });
+
+  it('should not extract template patterns from frontmatter, script, or style content', () => {
+    const code = `---
+// <FakeComponent /> inside frontmatter comment
+const x = { y: maybeCall(1) };
+---
+<div>real</div>
+<script>
+  const z = { w: scriptCall(2) };
+</script>
+<style>
+  .a { color: red; }
+</style>
+`;
+    const result = extractFromSource('Guard.astro', code);
+
+    const templateRefs = result.unresolvedReferences.filter(
+      (r) => r.referenceKind === 'references' && r.referenceName === 'FakeComponent'
+    );
+    expect(templateRefs).toHaveLength(0);
+
+    // maybeCall/scriptCall come from the delegated TS extraction (once),
+    // not double-counted by the template scanner
+    const maybeCalls = result.unresolvedReferences.filter(
+      (r) => r.referenceName === 'maybeCall' && r.referenceKind === 'calls'
+    );
+    expect(maybeCalls.length).toBeLessThanOrEqual(1);
+  });
+
+  it('should extract <script> block symbols with correct line numbers', () => {
+    const code = `---
+const a = 1;
+---
+<div>hi</div>
+<script>
+function trackView(page: string) {
+  console.log(page);
+}
+</script>
+`;
+    const result = extractFromSource('Tracker.astro', code);
+
+    const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'trackView');
+    expect(fn).toBeDefined();
+    expect(fn?.startLine).toBe(6);
+    expect(fn?.language).toBe('astro');
+  });
+
+  it('should create component node for a frontmatter-less template-only file', () => {
+    const code = `<div>Static content</div>
+`;
+    const result = extractFromSource('Static.astro', code);
+
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+    expect(componentNode?.name).toBe('Static');
+    expect(componentNode?.language).toBe('astro');
+  });
+
+  it('should treat an unclosed frontmatter fence as no frontmatter', () => {
+    const code = `---
+const broken = true;
+<div>never closed</div>
+`;
+    const result = extractFromSource('Broken.astro', code);
+
+    // No TS delegation happened (the fence never closes), but the component
+    // node still exists and nothing throws.
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+    expect(result.nodes.find((n) => n.name === 'broken')).toBeUndefined();
+  });
+
+  it('should create containment edges from component to frontmatter nodes', () => {
+    const code = `---
+const value = 42;
+---
+<div>{value}</div>
+`;
+    const result = extractFromSource('Contained.astro', code);
+
+    const componentNode = result.nodes.find((n) => n.kind === 'component');
+    expect(componentNode).toBeDefined();
+
+    const containEdges = result.edges.filter(
+      (e) => e.source === componentNode!.id && e.kind === 'contains'
+    );
+    expect(containEdges.length).toBeGreaterThan(0);
+  });
+});
+
 describe('Instantiates + Decorates edge extraction', () => {
   it('emits an instantiates ref for `new Foo()`', () => {
     const code = `
@@ -6679,5 +7008,156 @@ describe('Swift property wrappers / attributes (blast-radius recall)', () => {
       expect(cg.getFileDependents('Sources/M/Wrap.swift')).toContain('Sources/M/Cmd.swift');
       cg.destroy();
     } finally { cleanupTempDir(dir); }
+  });
+});
+
+describe('R Extraction', () => {
+  describe('Language detection', () => {
+    it('should detect R files (both extension cases)', () => {
+      expect(detectLanguage('analysis.R')).toBe('r');
+      expect(detectLanguage('scripts/clean.r')).toBe('r');
+    });
+
+    it('should report R as supported', () => {
+      expect(isLanguageSupported('r')).toBe(true);
+      expect(getSupportedLanguages()).toContain('r');
+    });
+  });
+
+  describe('Function extraction', () => {
+    it('extracts every assignment form, lambdas, and nested functions', () => {
+      const code = `
+clean_data <- function(df, threshold = 0.5) {
+  helper <- function(d) scale(d)
+  helper(df)
+}
+normalize = function(v) (v - mean(v)) / sd(v)
+double_it <- \\(x) x * 2
+`;
+      const result = extractFromSource('analysis.R', code);
+      const funcs = result.nodes.filter((n) => n.kind === 'function').map((n) => n.name);
+      expect(funcs).toContain('clean_data');
+      expect(funcs).toContain('normalize');
+      expect(funcs).toContain('double_it');
+      expect(funcs).toContain('helper'); // nested, inside clean_data's scope
+      const cleanData = result.nodes.find((n) => n.name === 'clean_data');
+      expect(cleanData?.language).toBe('r');
+      expect(cleanData?.signature).toBe('(df, threshold = 0.5)');
+    });
+
+    it('attributes body calls to the enclosing function', () => {
+      const code = `
+prep <- function(d) scale(d)
+fit_model <- function(data) {
+  lm(y ~ x, data = prep(data))
+}
+`;
+      const result = extractFromSource('models.R', code);
+      const prepCall = result.unresolvedReferences.find(
+        (r) => r.referenceName === 'prep' && r.referenceKind === 'calls'
+      );
+      expect(prepCall).toBeDefined();
+      const fitModel = result.nodes.find((n) => n.name === 'fit_model');
+      expect(prepCall?.fromNodeId).toBe(fitModel?.id);
+    });
+  });
+
+  describe('Imports', () => {
+    it('extracts library/require/source as imports, not calls', () => {
+      const code = `
+library(dplyr)
+require(stats)
+requireNamespace("jsonlite")
+source("helpers.R")
+`;
+      const result = extractFromSource('main.R', code);
+      const imports = result.nodes.filter((n) => n.kind === 'import').map((n) => n.name);
+      expect(imports).toContain('dplyr');
+      expect(imports).toContain('stats');
+      expect(imports).toContain('jsonlite');
+      expect(imports).toContain('helpers.R');
+      // Claimed by the hook — no call references to the import machinery.
+      const libCalls = result.unresolvedReferences.filter(
+        (r) => r.referenceKind === 'calls' && (r.referenceName === 'library' || r.referenceName === 'source')
+      );
+      expect(libCalls).toHaveLength(0);
+    });
+  });
+
+  describe('Variables and constants', () => {
+    it('extracts top-level assignments; ALL_CAPS as constants; right-assign too', () => {
+      const code = `
+ALPHA <- 0.05
+max_iter = 100
+compute_stats(df) -> stats_result
+inner <- function() {
+  local_var <- 1
+}
+`;
+      const result = extractFromSource('config.R', code);
+      const constant = result.nodes.find((n) => n.name === 'ALPHA');
+      expect(constant?.kind).toBe('constant');
+      const variable = result.nodes.find((n) => n.name === 'max_iter');
+      expect(variable?.kind).toBe('variable');
+      const rightAssigned = result.nodes.find((n) => n.name === 'stats_result');
+      expect(rightAssigned?.kind).toBe('variable');
+      // Locals inside functions are deliberately NOT extracted.
+      expect(result.nodes.find((n) => n.name === 'local_var')).toBeUndefined();
+    });
+  });
+
+  describe('Classes', () => {
+    it('extracts S4/R5/R6 class calls as classes with their list methods', () => {
+      const code = `
+setClass("Patient", representation(id = "character"))
+Account <- setRefClass("Account",
+  fields = list(balance = "numeric"),
+  methods = list(deposit = function(x) { balance <<- balance + x })
+)
+Stack <- R6Class("Stack",
+  public = list(push = function(v) invisible(v))
+)
+setGeneric("describe", function(obj) standardGeneric("describe"))
+setMethod("describe", "Patient", function(obj) paste(obj@id))
+`;
+      const result = extractFromSource('classes.R', code);
+      const classes = result.nodes.filter((n) => n.kind === 'class').map((n) => n.name);
+      expect(classes).toContain('Patient');
+      expect(classes).toContain('Account');
+      expect(classes).toContain('Stack');
+      const methods = result.nodes.filter((n) => n.kind === 'method').map((n) => n.name);
+      expect(methods).toContain('deposit');
+      expect(methods).toContain('push');
+      // setGeneric/setMethod produce functions named by their string argument.
+      const describes = result.nodes.filter((n) => n.name === 'describe' && n.kind === 'function');
+      expect(describes.length).toBeGreaterThanOrEqual(2);
+      // The class-assignment idiom must not ALSO produce a variable node.
+      expect(result.nodes.find((n) => n.name === 'Account' && n.kind === 'variable')).toBeUndefined();
+    });
+
+    it('extracts ggproto classes with direct-arg methods and the parent as extends', () => {
+      // ggplot2's OO system — every Geom/Stat/Scale in the ecosystem uses it.
+      const code = `
+GeomPoint <- ggproto("GeomPoint", Geom,
+  required_aes = c("x", "y"),
+  draw_panel = function(data, panel_params, coord) {
+    coords <- coord$transform(data, panel_params)
+    grid::pointsGrob(coords$x, coords$y)
+  },
+  draw_key = draw_key_point
+)
+`;
+      const result = extractFromSource('geom-point.R', code);
+      const cls = result.nodes.find((n) => n.name === 'GeomPoint' && n.kind === 'class');
+      expect(cls).toBeDefined();
+      const method = result.nodes.find((n) => n.name === 'draw_panel' && n.kind === 'method');
+      expect(method).toBeDefined();
+      const ext = result.unresolvedReferences.find(
+        (r) => r.referenceKind === 'extends' && r.referenceName === 'Geom'
+      );
+      expect(ext?.fromNodeId).toBe(cls?.id);
+      // No twin variable for the assignment.
+      expect(result.nodes.find((n) => n.name === 'GeomPoint' && n.kind === 'variable')).toBeUndefined();
+    });
   });
 });
