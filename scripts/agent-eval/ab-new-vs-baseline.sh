@@ -75,7 +75,7 @@ run_arm() { # label, target-copy
   echo "############## ARM [$label] ##############"
   ( cd "$tgt" && claude -p "$TASK" \
       --output-format stream-json --verbose --permission-mode bypassPermissions \
-      --model opus --max-budget-usd 4 --strict-mcp-config --mcp-config "$c" \
+      --model "${MODEL:-sonnet}" --effort "${EFFORT:-high}" --max-budget-usd 4 --strict-mcp-config --mcp-config "$c" \
       </dev/null > "$OUT/run-$label.jsonl" 2>"$OUT/run-$label.err" )
   node "$PARSE" "$OUT/run-$label.jsonl" 2>&1 | grep -E "by type|Result" || echo "  (parse failed — see $OUT/run-$label.jsonl)"
   pkill -9 -f "serve --mcp --path $tgt" 2>/dev/null
@@ -88,7 +88,12 @@ node "$BIN" init "$OUT/t-new" >/dev/null 2>&1 && echo "  indexed t-new"
 run_arm new "$OUT/t-new"
 
 echo "== BASELINE build ($BASE_REF) =="
-git -C "$ENGINE" checkout "$BASE_REF" -- $CHANGED
+# Per-file: a file ADDED since baseline has no pathspec on the ref — and a
+# single multi-file checkout with one bad pathspec checks out NOTHING, which
+# silently ran the NEW build in the baseline arm. Absent-on-baseline → remove.
+for f in $CHANGED; do
+  git -C "$ENGINE" checkout "$BASE_REF" -- "$f" 2>/dev/null || rm -f "$ENGINE/$f"
+done
 ( cd "$ENGINE" && npm run build >/dev/null 2>&1 ) && echo "  built"
 node "$BIN" init "$OUT/t-base" >/dev/null 2>&1 && echo "  indexed t-base"
 run_arm baseline "$OUT/t-base"

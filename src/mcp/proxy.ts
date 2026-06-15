@@ -23,10 +23,12 @@ import * as net from 'net';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
 import { DaemonClientHello, DaemonHello, MAX_HELLO_LINE_BYTES } from './daemon';
 import { supervisionLostReason } from './ppid-watchdog';
+import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { CodeGraphPackageVersion } from './version';
 import { SERVER_INFO, PROTOCOL_VERSION } from './session';
 import { SERVER_INSTRUCTIONS } from './server-instructions';
 import { getStaticTools } from './tools';
+import { getTelemetry, ClientInfo } from '../telemetry';
 import type { MCPEngine } from './engine';
 
 /** Default poll cadence for the PPID watchdog (same as the direct server). */
@@ -203,6 +205,10 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
   let daemonStatus: 'connecting' | 'ready' | 'failed' = 'connecting';
   let daemonSocket: net.Socket | null = null;
   let clientInitId: unknown = undefined;   // suppress the daemon's reply to the forwarded initialize
+  // Telemetry attribution for the in-process fallback only — calls routed to
+  // the daemon are counted by the daemon's own session (which receives the
+  // forwarded initialize, clientInfo included), never double-counted here.
+  let telemetryClient: ClientInfo | undefined;
   const pending: string[] = [];            // client lines buffered until the daemon resolves
   let engine: MCPEngine | null = null;
   let engineReady: Promise<void> | null = null;
@@ -245,6 +251,7 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
         const params = (msg.params || {}) as { name: string; arguments?: Record<string, unknown> };
         const result = await engine!.getToolHandler().execute(params.name, params.arguments || {});
         writeClient({ jsonrpc: '2.0', id, result });
+        getTelemetry().recordUsage('mcp_tool', params.name, !result.isError, telemetryClient);
       } catch (err) {
         writeClient({ jsonrpc: '2.0', id, error: { code: -32603, message: err instanceof Error ? err.message : String(err) } });
       }
@@ -281,6 +288,13 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       let msg: JsonRpc; try { msg = JSON.parse(line) as JsonRpc; } catch { routeToDaemon(line); continue; }
       if (msg.method === 'initialize') {
         clientInitId = msg.id;
+        const initParams = (msg.params ?? {}) as { clientInfo?: { name?: unknown; version?: unknown } };
+        if (initParams.clientInfo) {
+          telemetryClient = {
+            name: typeof initParams.clientInfo.name === 'string' ? initParams.clientInfo.name : undefined,
+            version: typeof initParams.clientInfo.version === 'string' ? initParams.clientInfo.version : undefined,
+          };
+        }
         writeClient({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: SERVER_INFO, instructions: SERVER_INSTRUCTIONS } });
         routeToDaemon(line); // prime the daemon so it resolves the project (its reply is suppressed below)
       } else if (msg.method === 'tools/list') {
@@ -298,8 +312,11 @@ export async function runLocalHandshakeProxy(deps: LocalHandshakeDeps): Promise<
       }
     }
   });
-  process.stdin.on('end', shutdown);
-  process.stdin.on('close', shutdown);
+  // Shut down when stdin ends/closes — and also on a stdin `'error'`, which a
+  // socket-backed stdin (the VS Code stdio shape) can emit on client death
+  // instead of a clean close; destroying the stream stops a hung fd from
+  // busy-spinning the event loop (#799).
+  treatStdinFailureAsShutdown(shutdown);
   startPpidWatchdogNoSocket(shutdown);
 
   // ---- daemon connection (background) ----
@@ -459,10 +476,16 @@ function pipeUntilClose(socket: net.Socket): Promise<void> {
       try { socket.end(); } catch { /* ignore */ }
       done();
     });
-    process.stdin.on('close', () => {
+    // 'close' and 'error' both tear down: a socket-backed stdin can fail with
+    // an 'error' (ECONNRESET/hangup) rather than a clean close; destroying it
+    // stops a hung fd from busy-spinning the event loop (#799).
+    const teardown = () => {
+      try { process.stdin.destroy(); } catch { /* ignore */ }
       try { socket.destroy(); } catch { /* ignore */ }
       done();
-    });
+    };
+    process.stdin.on('close', teardown);
+    process.stdin.on('error', teardown);
 
     socket.on('data', (chunk) => {
       try { process.stdout.write(chunk); } catch { /* ignore */ }
