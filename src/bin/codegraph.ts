@@ -26,14 +26,16 @@
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized } from '../directory';
+import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot } from '../directory';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
 
 import { buildNode25BlockBanner, buildNodeTooOldBanner, MIN_NODE_MAJOR } from './node-version-check';
+import { installFatalHandlers } from './fatal-handler';
 import { relaunchWithWasmRuntimeFlagsIfNeeded } from '../extraction/wasm-runtime-flags';
 import { EXTRACTION_VERSION } from '../extraction/extraction-version';
+import { getTelemetry, TELEMETRY_DOCS, recordIndexEvent } from '../telemetry';
 
 // Lazy-load heavy modules (CodeGraph, runInstaller) to keep CLI startup fast.
 async function loadCodeGraph(): Promise<typeof import('../index')> {
@@ -89,6 +91,13 @@ if (nodeMajor < MIN_NODE_MAJOR) {
 // inherits this process's flags) is compiled. See ../extraction/wasm-runtime-flags.
 relaunchWithWasmRuntimeFlagsIfNeeded(__filename);
 
+// Last-resort fatal handlers: log a bounded line and exit non-zero. A fault
+// that reaches here escaped every boundary, so the process is in an undefined
+// state — keeping it alive is what let the detached MCP daemon orphan and pin a
+// CPU core with no recovery (#799, #850). Installed before the command branch
+// so it also covers a synchronous throw during startup. See ./fatal-handler.
+installFatalHandlers();
+
 // Check if running with no arguments - run installer
 if (process.argv.length === 2) {
   import('../installer').then(({ runInstaller }) =>
@@ -102,14 +111,6 @@ if (process.argv.length === 2) {
   main();
 }
 
-process.on('uncaughtException', (error) => {
-  console.error('[CodeGraph] Uncaught exception:', error);
-});
-
-process.on('unhandledRejection', (reason) => {
-  console.error('[CodeGraph] Unhandled rejection:', reason);
-});
-
 function main() {
 
 const program = new Command();
@@ -118,6 +119,18 @@ const program = new Command();
 const packageJson = JSON.parse(
   fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf-8')
 );
+
+// Make the version trivial to reach. commander's `.version()` (below) wires up
+// `--version` and `-V`; intercept the spellings it can't — lowercase `-v` and
+// single-dash `-version` — before any parsing. (commander's version short flag
+// is the capital `-V`, and its parser rejects a multi-character single-dash
+// flag.) The bare `codegraph version` subcommand is registered further down so
+// the affordance also shows up in `codegraph --help`.
+const firstArg = process.argv[2];
+if (firstArg === '-v' || firstArg === '-version') {
+  console.log(packageJson.version);
+  return;
+}
 
 // =============================================================================
 // ANSI Color Helpers (avoid chalk ESM issues)
@@ -152,6 +165,27 @@ program
   .name('codegraph')
   .description('Code intelligence and knowledge graph for any codebase')
   .version(packageJson.version);
+
+// Anonymous usage telemetry (see TELEMETRY.md): record the invoked subcommand
+// NAME only — never arguments or paths. Counts buffer locally; network sends
+// piggyback on commands that run long anyway (quick commands only append to
+// the local buffer at exit, costing nothing).
+// install/uninstall are absent on purpose: the installer flushes at its own
+// end, AFTER its consent prompt — a flush here would fire the first-run
+// notice before the user ever sees the toggle.
+const TELEMETRY_FLUSH_COMMANDS = new Set(['init', 'uninit', 'index', 'sync', 'upgrade']);
+program.hook('preAction', (_thisCommand, actionCommand) => {
+  try {
+    // The detached daemon re-invokes `serve --mcp` internally — not a user action.
+    if (process.env.CODEGRAPH_DAEMON_INTERNAL) return;
+    const name = actionCommand.name();
+    if (name === 'telemetry') return; // managing telemetry is not usage
+    getTelemetry().recordUsage('cli_command', name, true);
+    if (TELEMETRY_FLUSH_COMMANDS.has(name)) getTelemetry().maybeFlush();
+  } catch {
+    /* telemetry must never break the CLI */
+  }
+});
 
 // =============================================================================
 // Helper Functions
@@ -409,6 +443,19 @@ function writeErrorLog(projectPath: string, errors: Array<{ message: string; fil
   fs.writeFileSync(logPath, lines.join('\n') + '\n');
 }
 
+/**
+ * Telemetry for a completed full index (see TELEMETRY.md). The bounded flush
+ * keeps init/index responsive (these commands just ran for seconds anyway)
+ * while delivering the event promptly.
+ */
+async function recordIndexTelemetry(
+  cg: { getStats(): { filesByLanguage: Record<string, number> }; getBackend(): string },
+  result: IndexResult,
+): Promise<void> {
+  recordIndexEvent(cg, result);
+  await getTelemetry().flushNow();
+}
+
 // =============================================================================
 // Commands
 // =============================================================================
@@ -420,14 +467,27 @@ program
   .command('init [path]')
   .description('Initialize CodeGraph in a project directory and build the initial index')
   .option('-i, --index', 'Deprecated: indexing now runs by default; flag accepted for backward compatibility')
+  .option('-f, --force', 'Initialize even if the path looks like your home directory or a filesystem root')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { index?: boolean; verbose?: boolean }) => {
+  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean }) => {
     const projectPath = path.resolve(pathArg || process.cwd());
     const clack = await importESM('@clack/prompts');
 
     clack.intro('Initializing CodeGraph');
 
     try {
+      // Refuse to index your home directory / a filesystem root — it pulls in
+      // caches, other projects, and your whole tree (a multi-GB index + watcher
+      // churn, and on pre-1.0 macOS a machine-crashing fd blowup, #845).
+      const unsafe = unsafeIndexRootReason(projectPath);
+      if (unsafe && !options.force) {
+        clack.log.error(`Refusing to initialize in ${projectPath} — it looks like ${unsafe}.`);
+        clack.log.info('Run this inside a specific project directory, or pass --force if you really mean to index everything under it.');
+        clack.outro('');
+        process.exitCode = 1;
+        return;
+      }
+
       if (isInitialized(projectPath)) {
         clack.log.warn(`Already initialized in ${projectPath}`);
         clack.log.info('Use "codegraph index" to re-index or "codegraph sync" to update');
@@ -461,6 +521,7 @@ program
         await progress.stop();
       }
       printIndexResult(clack, result, projectPath);
+      await recordIndexTelemetry(cg, result);
 
       try {
         const { offerWatchFallback } = await import('../installer');
@@ -523,6 +584,13 @@ program
       } catch { /* non-fatal */ }
 
       success(`Removed CodeGraph from ${projectPath}`);
+
+      // Churn signal — and flush now, since after an uninit there may be no
+      // "next run" to deliver it.
+      try {
+        getTelemetry().recordLifecycle('uninstall', {});
+        await getTelemetry().flushNow();
+      } catch { /* non-fatal */ }
     } catch (err) {
       error(`Failed to uninitialize: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
@@ -542,6 +610,14 @@ program
     const projectPath = resolveProjectPath(pathArg);
 
     try {
+      // Don't (re)index your home directory / a filesystem root (#845). --force
+      // (already "force full re-index") doubles as the override.
+      const unsafe = unsafeIndexRootReason(projectPath);
+      if (unsafe && !options.force) {
+        error(`Refusing to index ${projectPath} — it looks like ${unsafe}. Pass --force to override.`);
+        process.exit(1);
+      }
+
       if (!isInitialized(projectPath)) {
         error(`CodeGraph not initialized in ${projectPath}`);
         info('Run "codegraph init" first');
@@ -585,6 +661,7 @@ program
       }
 
       printIndexResult(clack, result, projectPath);
+      await recordIndexTelemetry(cg, result);
 
       if (!result.success) {
         process.exit(1);
@@ -897,6 +974,106 @@ program
   });
 
 /**
+ * codegraph explore <query...>
+ *
+ * The CLI face of the MCP codegraph_explore tool — same handler, same
+ * output (source of the relevant symbols grouped by file + the call path
+ * among them). Exists so agents WITHOUT the MCP tools — Task-tool
+ * subagents (which don't inherit MCP tools, #704) and non-MCP harnesses —
+ * can reach the graph through a plain shell command.
+ */
+program
+  .command('explore <query...>')
+  .description('Explore an area: relevant symbols\' source + call paths in one shot (same output as the codegraph_explore MCP tool)')
+  .option('-p, --path <path>', 'Project path')
+  .option('--max-files <number>', 'Maximum number of files to include source from')
+  .action(async (queryParts: string[], options: { path?: string; maxFiles?: string }) => {
+    const projectPath = resolveProjectPath(options.path);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph isn't available here — no .codegraph/ index exists in ${projectPath}. If you are an AI agent: continue with your usual tools; indexing is the user's decision, do not run it yourself. (The project owner can enable CodeGraph with 'codegraph init'.)`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const { ToolHandler } = await import('../mcp/tools');
+      const handler = new ToolHandler(cg);
+
+      const args: Record<string, unknown> = { query: queryParts.join(' ') };
+      if (options.maxFiles) args.maxFiles = parseInt(options.maxFiles, 10);
+      const result = await handler.execute('codegraph_explore', args);
+
+      console.log(result.content[0]?.text ?? '');
+      cg.destroy();
+      if (result.isError) process.exit(1);
+    } catch (err) {
+      error(`Explore failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
+ * codegraph node <name>
+ *
+ * The CLI face of the MCP codegraph_node tool: one symbol's source +
+ * caller/callee trail, or a whole file with line numbers + dependents
+ * (Read-parity). Same subagent/non-MCP rationale as `explore`.
+ */
+program
+  .command('node <name>')
+  .description('One symbol\'s source + caller/callee trail, or read a file with line numbers + dependents (same output as the codegraph_node MCP tool)')
+  .option('-p, --path <path>', 'Project path')
+  .option('-f, --file <file>', 'Treat as file mode (or disambiguate a symbol to this file)')
+  .option('--offset <number>', 'File mode: 1-based start line')
+  .option('--limit <number>', 'File mode: maximum lines')
+  .option('--symbols-only', 'File mode: just the symbol map + dependents')
+  .action(async (name: string, options: { path?: string; file?: string; offset?: string; limit?: string; symbolsOnly?: boolean }) => {
+    const projectPath = resolveProjectPath(options.path);
+
+    try {
+      if (!isInitialized(projectPath)) {
+        error(`CodeGraph isn't available here — no .codegraph/ index exists in ${projectPath}. If you are an AI agent: continue with your usual tools; indexing is the user's decision, do not run it yourself. (The project owner can enable CodeGraph with 'codegraph init'.)`);
+        process.exit(1);
+      }
+
+      const { default: CodeGraph } = await loadCodeGraph();
+      const cg = await CodeGraph.open(projectPath);
+      const { ToolHandler } = await import('../mcp/tools');
+      const handler = new ToolHandler(cg);
+
+      // A name with a path separator is a file read; otherwise a symbol
+      // (use --file for basename-only file reads or to pin an overload).
+      // Both separators: Windows users type src\auth\session.ts. Symbols
+      // never contain either ('/' isn't an identifier char anywhere we
+      // index; C++ scope is '::', JS members '.').
+      const args: Record<string, unknown> = {};
+      if (options.file) {
+        args.file = options.file;
+        if (name && name !== options.file) args.symbol = name;
+      } else if (name.includes('/') || name.includes('\\')) {
+        args.file = name.replace(/\\/g, '/');
+      } else {
+        args.symbol = name;
+        args.includeCode = true;
+      }
+      if (options.offset) args.offset = parseInt(options.offset, 10);
+      if (options.limit) args.limit = parseInt(options.limit, 10);
+      if (options.symbolsOnly) args.symbolsOnly = true;
+
+      const result = await handler.execute('codegraph_node', args);
+
+      console.log(result.content[0]?.text ?? '');
+      cg.destroy();
+      if (result.isError) process.exit(1);
+    } catch (err) {
+      error(`Node lookup failed: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
+  });
+
+/**
  * codegraph files [path]
  */
 program
@@ -1022,6 +1199,23 @@ program
   });
 
 /**
+ * Normalize a user-supplied file path to the project-relative, forward-slash
+ * form CodeGraph stores in the index. Accepts an absolute path, a `./`-prefixed
+ * path, or Windows back-slashes; an empty string when the input is blank. Used
+ * by `codegraph affected` so `./src/x.ts`, `/abs/repo/src/x.ts`, and
+ * `src/x.ts` all match the same indexed file. (#825)
+ */
+function normalizeIndexPath(filePath: string, projectPath: string): string {
+  let f = filePath.trim();
+  if (!f) return '';
+  if (path.isAbsolute(f)) f = path.relative(projectPath, f);
+  // Collapse `.`/`..` segments, then force forward slashes and drop a leading
+  // `./` (path.normalize already strips it on POSIX; explicit for Windows).
+  f = path.normalize(f).replace(/\\/g, '/').replace(/^\.\//, '');
+  return f;
+}
+
+/**
  * Convert glob pattern to regex
  */
 function globToRegex(pattern: string): RegExp {
@@ -1104,10 +1298,63 @@ function printFileTree(
 }
 
 /**
+ * codegraph daemon — interactive manager for the background daemons. Arrow keys
+ * to pick one (the current project's daemon floats to the top, auto-selected),
+ * enter to stop it. Falls back to a plain list when output isn't a TTY.
+ */
+program
+  .command('daemon')
+  .aliases(['daemons'])
+  .description('Manage running CodeGraph background daemons — pick one and press enter to stop it')
+  .action(async () => {
+    const { listDaemons, stopDaemonAt, stopAllDaemons } = await import('../mcp/daemon-registry');
+    const { runDaemonPicker } = await import('../mcp/daemon-manager');
+
+    const daemons = listDaemons();
+    if (daemons.length === 0) {
+      info('No CodeGraph daemons running.');
+      return;
+    }
+
+    // No TTY (piped / CI / non-interactive) — can't do arrow-key selection, so
+    // just print what's running instead of crashing on a prompt with no input.
+    if (!process.stdout.isTTY || !process.stdin.isTTY) {
+      for (const d of daemons) {
+        console.log(`pid ${d.pid}  v${d.version}  up ${formatDuration(Date.now() - d.startedAt)}  ${d.root}`);
+      }
+      return;
+    }
+
+    // The current project's daemon floats to the top and is pre-selected.
+    let cwdRoot: string | null = null;
+    const found = findNearestCodeGraphRoot(process.cwd());
+    if (found) { try { cwdRoot = fs.realpathSync(found); } catch { cwdRoot = found; } }
+
+    const clack = await importESM('@clack/prompts');
+    clack.intro('CodeGraph daemons');
+    await runDaemonPicker({
+      list: listDaemons,
+      stop: stopDaemonAt,
+      stopAll: stopAllDaemons,
+      cwdRoot,
+      now: () => Date.now(),
+      select: (opts) => clack.select(opts),
+      isCancel: (v) => clack.isCancel(v),
+      note: (m) => clack.log.success(m),
+      done: (m) => clack.outro(m),
+    });
+  });
+
+/**
  * codegraph serve
  */
 program
-  .command('serve')
+  // Hidden from `--help`: this is the stdio entry point an AI agent launches
+  // for itself (the installer wires `args: ['serve','--mcp']` into every
+  // agent's MCP config), not a command a human runs. It still works when
+  // invoked — hiding only removes it from the listing. See the interactive-TTY
+  // guard below, which explains this to anyone who runs it by hand.
+  .command('serve', { hidden: true })
   .description('Start CodeGraph as an MCP server for AI assistants')
   .option('-p, --path <path>', 'Project path (optional for MCP mode, uses rootUri from client)')
   .option('--mcp', 'Run as MCP server (stdio transport)')
@@ -1123,6 +1370,22 @@ program
 
     try {
       if (options.mcp) {
+        // `serve --mcp` is the stdio MCP server an AI agent launches for itself,
+        // not a command to run by hand. A human in a terminal would otherwise
+        // see it hang waiting for JSON-RPC on stdin, which reads as broken. If
+        // stdin is an interactive TTY, explain instead of hanging. The agent's
+        // pipe and the detached daemon both have a non-TTY stdin, so this only
+        // ever fires for a person who typed it.
+        if (process.stdin.isTTY && !process.env.CODEGRAPH_DAEMON_INTERNAL) {
+          console.error(chalk.bold('\nCodeGraph MCP server\n'));
+          console.error("This is the MCP server your AI agent (Claude Code, Cursor, Codex, opencode, …)");
+          console.error("starts automatically — you don't run it yourself.");
+          console.error(`\nIt's already wired up by ${chalk.cyan('codegraph install')}. To check on things:`);
+          console.error(`  ${chalk.cyan('codegraph status')}   ${chalk.dim('— is this project indexed and healthy?')}`);
+          console.error(`  ${chalk.cyan('codegraph daemon')}   ${chalk.dim('— list or stop background MCP servers')}`);
+          console.error(chalk.dim('\n(Running it directly only does something when an MCP client drives it over stdin.)'));
+          return;
+        }
         // Start MCP server - it handles initialization lazily based on rootUri from client
         const { MCPServer } = await import('../mcp/index');
         const server = new MCPServer(projectPath);
@@ -1485,6 +1748,14 @@ program
         changedFiles.push(...stdinFiles);
       }
 
+      // Normalize inputs to the project-relative, forward-slash form the index
+      // stores. Without this, `affected ./src/x.ts`, an absolute path (what a
+      // wrapping script often passes), or a Windows back-slash path silently
+      // matches nothing and reports 0 affected tests. (#825)
+      changedFiles = changedFiles
+        .map((f) => normalizeIndexPath(f, projectPath))
+        .filter(Boolean);
+
       if (changedFiles.length === 0) {
         if (!options.quiet) info('No files provided. Use file arguments or --stdin.');
         process.exit(0);
@@ -1685,6 +1956,50 @@ program
   });
 
 /**
+ * codegraph telemetry [on|off|status]
+ */
+program
+  .command('telemetry [action]')
+  .description('Show or change anonymous usage telemetry (status, on, off)')
+  .action((action?: string) => {
+    const t = getTelemetry();
+
+    if (action === 'on' || action === 'off') {
+      t.setEnabled(action === 'on', 'cli');
+      if (action === 'on') {
+        success('Telemetry enabled — anonymous usage stats only (no code, paths, or names).');
+      } else {
+        success('Telemetry disabled. Buffered, unsent data was deleted.');
+      }
+      const effective = t.getStatus();
+      if (effective.decidedBy === 'DO_NOT_TRACK' || effective.decidedBy === 'CODEGRAPH_TELEMETRY') {
+        warn(
+          `The ${effective.decidedBy} environment variable overrides this choice — ` +
+          `effective state right now: ${effective.enabled ? 'enabled' : 'disabled'}.`
+        );
+      }
+      return;
+    }
+
+    if (action !== undefined && action !== 'status') {
+      error(`Unknown action: ${action} (expected status, on, or off)`);
+      process.exit(1);
+    }
+
+    const s = t.getStatus();
+    const decidedBy: Record<typeof s.decidedBy, string> = {
+      DO_NOT_TRACK: 'DO_NOT_TRACK environment variable',
+      CODEGRAPH_TELEMETRY: 'CODEGRAPH_TELEMETRY environment variable',
+      config: 'your saved choice',
+      default: 'default',
+    };
+    console.log(`\nTelemetry: ${s.enabled ? chalk.green('enabled') : chalk.yellow('disabled')} ${chalk.dim(`(${decidedBy[s.decidedBy]})`)}`);
+    console.log(`Machine ID: ${s.machineId ?? chalk.dim('(random UUID, created on first use)')}`);
+    console.log(`Config:     ${s.configPath}`);
+    console.log(chalk.dim(`\nExactly what is collected (and never collected): ${TELEMETRY_DOCS}\n`));
+  });
+
+/**
  * codegraph upgrade [version]
  *
  * Self-update, however CodeGraph was installed (bundle via install.sh/.ps1,
@@ -1719,6 +2034,21 @@ program
       }
     );
     process.exit(code);
+  });
+
+/**
+ * codegraph version
+ *
+ * The bare-noun form of `--version`. commander already provides `--version`
+ * and `-V`, and the `-v` / `-version` spellings are intercepted before parse
+ * (see top of main). This subcommand makes `codegraph version` work and lists
+ * the version affordance in `codegraph --help`.
+ */
+program
+  .command('version')
+  .description('Print the installed CodeGraph version (also: -v, --version)')
+  .action(() => {
+    console.log(packageJson.version);
   });
 
 // Parse and run
