@@ -131,6 +131,42 @@ describe('multi-repo workspaces (#514)', () => {
     expect(files).toContain('vendored/lib.ts');
   });
 
+  it('skips a submodule worktree instead of indexing it as a duplicate (#945)', () => {
+    // A worktree OF A SUBMODULE points its `.git` into
+    // `.git/modules/<module>/worktrees/<name>` — not the top-level repo's
+    // `.git/worktrees/`. The detector used to miss that extra `modules/<name>`
+    // segment, so the worktree fell through to "embedded" and every symbol it
+    // shared with the real submodule checkout got indexed twice. The submodule's
+    // own checkout (`.git/modules/<module>`, no `worktrees/`) is distinct code
+    // and must stay indexed (#514).
+    const upstream = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-945-up-'));
+    try {
+      // The repo that becomes the submodule's origin.
+      write(path.join(upstream, 'lib.ts'), 'export function libFn() { return 1; }\n');
+      makeRepo(upstream);
+
+      write(path.join(ws, 'src/app.ts'), 'export function app() { return 1; }\n');
+      write(path.join(ws, '.gitignore'), '.worktrees/\n');
+      git(ws, 'init', '-q');
+      // protocol.file.allow=always: modern git refuses a local-path submodule otherwise.
+      git(ws, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', upstream, 'common');
+      git(ws, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'add submodule');
+
+      // A worktree of the submodule, under the gitignored .worktrees/ — its `.git`
+      // points into `.git/modules/common/worktrees/<name>`.
+      git(path.join(ws, 'common'), 'worktree', 'add', '-q', '../.worktrees/common-feature', '-b', 'feature');
+
+      const files = scanDirectory(ws);
+      expect(files).toContain('src/app.ts');
+      // The real submodule checkout is distinct code — still indexed (#514).
+      expect(files).toContain('common/lib.ts');
+      // The submodule worktree is a duplicate working view — never indexed (#945).
+      expect(files.some((f) => f.includes('.worktrees'))).toBe(false);
+    } finally {
+      fs.rmSync(upstream, { recursive: true, force: true });
+    }
+  });
+
   it('non-git workspace: walks children and respects each child own .gitignore', () => {
     write(path.join(ws, 'proj-a/src/auth.ts'), 'export function login() {}\n');
     write(path.join(ws, 'proj-a/build/out.ts'), 'export function generated() {}\n');
@@ -201,6 +237,27 @@ describe('multi-repo workspaces (#514)', () => {
     // Ordinary paths: unchanged semantics.
     expect(scope.ignores('node_modules/dep/index.ts')).toBe(true);
     expect(scope.ignores('src/app.ts')).toBe(false);
+  });
+
+  it('buildScopeIgnore: indexed root is itself a gitignored subdir of an enclosing repo (#936)', () => {
+    // `child/` is NOT its own repo, so `git` resolves the ENCLOSING repo from
+    // inside it — and `git ls-files --directory`, whose cwd is then a wholly
+    // ignored directory, emits the literal `./` ("this entire directory").
+    // That sentinel used to reach the `ignore` matcher and throw
+    // ("path should be a `path.relative()`d string, but got "./""), aborting
+    // buildScopeIgnore → the MCP daemon's watcher never started and auto-sync
+    // silently stalled until a manual `codegraph sync`.
+    write(path.join(ws, 'child/src/a.ts'), 'export const x = 1;\n');
+    write(path.join(ws, '.gitignore'), '/child/\n');
+    makeRepo(ws);
+
+    const child = path.join(ws, 'child');
+    // The crux: building scope for the ignored subdir must not throw.
+    const scope = buildScopeIgnore(child);
+    // The subdir's own source is watchable/indexable, not ignored.
+    expect(scope.ignores('src/a.ts')).toBe(false);
+    // And the `./` self entry must not be mistaken for a nested embedded repo.
+    expect(discoverEmbeddedRepoRoots(child)).toEqual([]);
   });
 
   it('sync picks up a change inside a gitignored embedded repo', async () => {
