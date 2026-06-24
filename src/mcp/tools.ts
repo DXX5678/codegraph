@@ -134,7 +134,7 @@ export interface ExploreOutputBudget {
   maxCharsPerFile: number;
   /** Cluster gap threshold in lines — tighter clustering on small projects. */
   gapThreshold: number;
-  /** Max symbols listed in the per-file header (`#### path — sym(kind), ...`). */
+  /** Max symbols listed in the per-file header (``**`path`** — sym(kind), ...``). */
   maxSymbolsInFileHeader: number;
   /** Max edges shown per relationship kind in the Relationships section. */
   maxEdgesPerRelationshipKind: number;
@@ -289,6 +289,27 @@ function adaptiveExploreEnabled(): boolean {
 }
 
 /**
+ * How long the FIRST tool call waits on the post-open catch-up reconcile before
+ * giving up and serving anyway (issue #905). On a normal repo the reconcile
+ * finishes in well under this, so the gate is fully honored and nothing changes.
+ * On a very large repo (~100k files) the reconcile takes minutes — blocking the
+ * first call on all of it presents as a multi-minute hang — so we wait briefly
+ * for a clean answer, then serve and let the reconcile finish in the background
+ * (it yields to the event loop, so a concurrent read still runs).
+ *
+ * `CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS` overrides the default; `0` restores the
+ * old unbounded-wait behavior (always block until the reconcile completes).
+ */
+const DEFAULT_CATCHUP_GATE_TIMEOUT_MS = 3000;
+function resolveCatchUpGateTimeoutMs(): number {
+  const raw = process.env.CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS;
+  if (raw === undefined || raw === '') return DEFAULT_CATCHUP_GATE_TIMEOUT_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_CATCHUP_GATE_TIMEOUT_MS;
+  return Math.floor(n);
+}
+
+/**
  * Prefix each line of a source slice with its 1-based line number, matching
  * the Read tool's `cat -n` convention (number + tab) so the agent treats it
  * the same way it treats Read output.
@@ -303,6 +324,23 @@ function numberSourceLines(slice: string, firstLineNumber: number): string {
     out.push(`${firstLineNumber + i}\t${split[i]}`);
   }
   return out.join('\n');
+}
+
+/**
+ * Unique line-prefix for a per-file source section in codegraph_explore output.
+ * Issue #778: tool results dropped ATX headings (`####`, `##`, `###`) for bold
+ * labels so Markdown-rendering MCP clients (e.g. the Claude Code VSCode
+ * extension) stop blowing every header up to H1–H4. The path is bold + a code
+ * span so it still reads as a header, and the leading ``**` `` stays a UNIQUE,
+ * greppable marker — no other explore line begins with it — that the explore
+ * truncation boundary (`handleExplore`) and the offload chunker
+ * (`reasoning/reasoner.ts`) both key off to cut on whole file sections.
+ */
+const FILE_SECTION_PREFIX = '**`';
+function fileSectionHeader(filePath: string, suffix: string): string {
+  return suffix
+    ? `${FILE_SECTION_PREFIX}${filePath}\`** — ${suffix}`
+    : `${FILE_SECTION_PREFIX}${filePath}\`**`;
 }
 
 /**
@@ -400,7 +438,7 @@ export interface ToolResult {
  */
 const projectPathProperty: PropertySchema = {
   type: 'string',
-  description: 'Path to a different project with .codegraph/ initialized. If omitted, uses current project. Use this to query other codebases.',
+  description: 'Absolute path to the project to query (or any directory inside it) — codegraph uses the nearest .codegraph/ index at or above that path. Omit to use this session\'s default project. Pass it to query a second codebase, or when the server root has no index of its own (e.g. a monorepo where only sub-projects are indexed, so there is no default project).',
 };
 
 /**
@@ -632,28 +670,17 @@ export function getStaticTools(): ToolDefinition[] {
 }
 
 /**
- * The MCP tools served by DEFAULT (short names). The other defined tools
- * (callees, impact, files, status) remain fully functional — handlers stay,
- * the library API and CLI are untouched, and `CODEGRAPH_MCP_TOOLS` re-enables
- * any of them — they just aren't LISTED to agents anymore.
+ * The MCP tools served by DEFAULT (short names). Pared to ONLY `codegraph_explore`
+ * — the single tool that reliably earns its place: one capped call returns the
+ * verbatim source of the relevant symbols grouped by file. Every other tool is a
+ * narrower slice of what explore already does, and presence itself steers
+ * mis-picks, so they are no longer LISTED to agents.
  *
- * Evidence for the cut (the "adapt the tool to the agent" principle —
- * fewer tools = fewer mis-picks, and presence itself steers):
- * - `codegraph_impact` appears in ZERO recorded eval runs ever — its
- *   blast-radius info already arrives inline on explore (the "Blast radius"
- *   section) and node (the dependents note), so agents never need the
- *   standalone tool.
- * - `codegraph_callees` is redundant by construction: a symbol's body (which
- *   node returns) IS its callee list, plus the caller/callee trail.
- * - `codegraph_files` / `codegraph_status`: the tiny-repo audit (see
- *   getTools) found they "reduce to one grep"; staleness banners already
- *   inline the pending-sync info on every read tool, and the CLI covers
- *   diagnostics.
- * - `codegraph_callers` stays: exhaustive call-site enumeration (every
- *   caller with file:line, callback registrations labeled, one section per
- *   same-named definition) is the one job explore/node don't replicate.
+ * The other defined tools (`node`, `search`, `callers`, plus callees/impact/files/
+ * status) remain fully functional — handlers stay, the library API and CLI are
+ * untouched, and `CODEGRAPH_MCP_TOOLS=explore,node,...` re-enables any of them.
  */
-const DEFAULT_MCP_TOOLS = new Set(['explore', 'node', 'search', 'callers']);
+const DEFAULT_MCP_TOOLS = new Set(['explore']);
 
 /**
  * Tool handler that executes tools against a CodeGraph instance
@@ -678,7 +705,9 @@ export class ToolHandler {
   // this, a tool call that races past `catchUpSync()` serves rows for files
   // that were deleted (or edited) while no MCP server was running — and the
   // per-file staleness banner can't help, because `getPendingFiles()` is
-  // populated by the watcher, not by catch-up. Cleared on first await so
+  // populated by the watcher, not by catch-up. The wait is time-boxed
+  // (see {@link resolveCatchUpGateTimeoutMs}) so a minutes-long reconcile on a
+  // huge repo can't hang the first call (#905); cleared on first await so
   // subsequent calls don't pay any cost.
   private catchUpGate: Promise<void> | null = null;
 
@@ -700,6 +729,43 @@ export class ToolHandler {
    */
   setCatchUpGate(p: Promise<void> | null): void {
     this.catchUpGate = p;
+  }
+
+  /**
+   * Await the catch-up gate, but no longer than the configured timeout (#905).
+   * If the reconcile settles first, we got the fully-reconciled answer. If the
+   * timeout wins, we serve the call now and let the reconcile finish in the
+   * background — it yields to the event loop (see SYNC_RECONCILE_YIELD_INTERVAL),
+   * so a concurrent read still runs against the same connection. Never throws:
+   * a failed reconcile is logged by the engine, and we serve best-effort over
+   * the same potentially-stale data the un-gated path would have.
+   */
+  private async awaitCatchUpGate(gate: Promise<void>): Promise<void> {
+    const timeoutMs = resolveCatchUpGateTimeoutMs();
+    if (timeoutMs <= 0) {
+      // 0 = opt back into the original unbounded wait.
+      try { await gate; } catch { /* engine already logged */ }
+      return;
+    }
+    let timer: NodeJS.Timeout | undefined;
+    const timedOut = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), timeoutMs);
+      timer.unref?.();
+    });
+    try {
+      const outcome = await Promise.race([
+        gate.then(() => 'done' as const, () => 'done' as const),
+        timedOut,
+      ]);
+      if (outcome === 'timeout') {
+        process.stderr.write(
+          `[CodeGraph MCP] Catch-up reconcile still running after ${timeoutMs}ms; serving this tool call now and finishing the reconcile in the background (#905). ` +
+          `Set CODEGRAPH_CATCHUP_GATE_TIMEOUT_MS=0 to always wait for it.\n`
+        );
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /**
@@ -822,21 +888,19 @@ export class ToolHandler {
         throw new NotIndexedError(
           'No CodeGraph project is loaded for this session.\n' +
           `Searched for a .codegraph/ directory starting from: ${searched}\n` +
-          'If this project IS indexed, this is a working-directory detection issue: ' +
-          "the MCP client launched the server outside your project and didn't report the " +
-          'workspace root. Fix it either way:\n' +
-          '  • Pass projectPath to the tool call, e.g. projectPath: "/absolute/path/to/your/project"\n' +
+          'Either the server root has no index of its own (e.g. a monorepo where only ' +
+          "sub-projects are indexed), or the MCP client launched the server outside your " +
+          'project without reporting the workspace root. Either way, target the project ' +
+          'explicitly:\n' +
+          '  • Pass projectPath to the tool call, e.g. projectPath: "/absolute/path/to/your/project" ' +
+          '(any project that has a .codegraph/ — including a sub-project of a monorepo)\n' +
           '  • Or add --path to the server\'s MCP config args: ["serve", "--mcp", "--path", "/absolute/path/to/your/project"]\n' +
-          'If the project simply has no index, continue with your built-in tools (Read/Grep/Glob) ' +
-          "and don't call codegraph again this session — the user can run 'codegraph init' to enable it."
+          'If a project simply has no index, use your built-in tools (Read/Grep/Glob) for THAT ' +
+          "project (the user can run 'codegraph init' there to enable it) — you can still query " +
+          'other indexed projects by projectPath in the same session.'
         );
       }
-      return this.cg;
-    }
-
-    // Check cache first (using original path as key)
-    if (this.projectCache.has(projectPath)) {
-      return this.projectCache.get(projectPath)!;
+      return this.freshen(this.cg);
     }
 
     // Reject sensitive system directories before opening. Only validate a
@@ -851,7 +915,16 @@ export class ToolHandler {
       }
     }
 
-    // Walk up parent directories to find nearest .codegraph/
+    // Always RE-RESOLVE the nearest .codegraph/ from the input path. The walk
+    // is cheap (a few existsSync up the tree) and is the only thing that
+    // notices a path whose index root CHANGED since it was first seen — most
+    // importantly a git worktree that gained its own .codegraph/ after the
+    // (long-lived) server first resolved it up to the parent checkout. We used
+    // to short-circuit on a `projectCache[projectPath]` entry before resolving,
+    // which pinned that first resolution for the server's whole lifetime, so a
+    // worktree kept being served the parent checkout's index until restart
+    // (#926). The DB connection itself is still cached (by resolved root,
+    // below), so re-resolving costs only the stat walk, never a reopen.
     const resolvedRoot = findNearestCodeGraphRoot(projectPath);
 
     if (!resolvedRoot) {
@@ -866,27 +939,46 @@ export class ToolHandler {
     // If the path resolves to the default project, reuse the already-open
     // default instance rather than opening a SECOND connection to the same DB.
     // A duplicate connection serializes reads against the watcher's auto-sync
-    // writes; on the wasm backend (no WAL) that surfaces as intermittent
-    // "database is locked" on concurrent tool calls. See issue #238. Deliberately
-    // not cached under projectPath — the server owns and closes the default
-    // instance, so routing it through projectCache.closeAll() would double-close it.
+    // writes; when WAL isn't in effect (e.g. a filesystem without shared-memory
+    // support) that surfaces as intermittent
+    // "database is locked" on concurrent tool calls. See issue #238. The
+    // default instance is owned/closed by the server, so it's never cached.
     if (this.cg && this.cg.getProjectRoot() === resolvedRoot) {
-      return this.cg;
+      return this.freshen(this.cg);
     }
 
-    // Check if we already have this resolved root cached (different path, same project)
-    if (this.projectCache.has(resolvedRoot)) {
-      const cg = this.projectCache.get(resolvedRoot)!;
-      // Cache under original path too for faster future lookups
-      this.projectCache.set(projectPath, cg);
-      return cg;
-    }
+    // Cache the open DB connection by RESOLVED ROOT only — never by the input
+    // path. One key per instance means closeAll() closes each exactly once, and
+    // a changed resolution maps to a different entry instead of a stale hit.
+    const cached = this.projectCache.get(resolvedRoot);
+    if (cached) return this.freshen(cached);
 
-    // Open and cache under both paths
     const cg = loadCodeGraph().openSync(resolvedRoot);
     this.projectCache.set(resolvedRoot, cg);
-    if (projectPath !== resolvedRoot) {
-      this.projectCache.set(projectPath, cg);
+    return cg;
+  }
+
+  /**
+   * Heal a long-lived connection whose `.codegraph/` was removed and recreated
+   * at the same path (a worktree recreated, or `rm -rf .codegraph` + re-init)
+   * before handing it to a tool. Otherwise the daemon keeps serving the
+   * pre-removal snapshot from its now-unlinked file handle until restart — and
+   * because the daemon registry is keyed by path, a same-path recreate routes
+   * new clients straight back to this same stale daemon (#925). The check is one
+   * stat() and a no-op unless the inode actually changed; it never throws into a
+   * tool call.
+   */
+  private freshen(cg: CodeGraph): CodeGraph {
+    try {
+      if (cg.reopenIfReplaced()) {
+        process.stderr.write(
+          '[CodeGraph MCP] The index was replaced on disk (e.g. a git worktree ' +
+          'recreated at the same path); reopened the live database in place.\n'
+        );
+      }
+    } catch {
+      // Best-effort self-heal — a failed reopen must never break the tool call;
+      // the (still stale) handle keeps serving and the next call retries.
     }
     return cg;
   }
@@ -958,17 +1050,30 @@ export class ToolHandler {
    */
   private worktreeMismatchFor(projectPath?: string): WorktreeIndexMismatch | null {
     const startPath = projectPath ?? this.defaultProjectHint ?? process.cwd();
-    const cached = this.worktreeMismatchCache.get(startPath);
-    if (cached !== undefined) return cached;
 
-    let mismatch: WorktreeIndexMismatch | null = null;
+    // The verdict depends on BOTH the start path AND the index root it resolves
+    // to, so the cache must be keyed on the pair. Resolve the index root first
+    // (cheap — getCodeGraph re-walks to the nearest .codegraph/, no git), then
+    // key on `(startPath, indexRoot)`. The moment that root changes — most
+    // importantly when a git worktree gains its own index and the walk-up stops
+    // there instead of at the parent checkout — the key changes and the verdict
+    // is recomputed, instead of serving the stale "borrowed the parent's index"
+    // warning for the server's whole lifetime. Keying on startPath alone pinned
+    // that first verdict until restart (#926).
+    let indexRoot: string;
     try {
-      mismatch = detectWorktreeIndexMismatch(startPath, this.getCodeGraph(projectPath).getProjectRoot());
+      indexRoot = this.getCodeGraph(projectPath).getProjectRoot();
     } catch {
       // No resolvable project (or any other resolution error) → nothing to warn.
-      mismatch = null;
+      return null;
     }
-    this.worktreeMismatchCache.set(startPath, mismatch);
+
+    const cacheKey = `${startPath}\u0000${indexRoot}`;
+    const cached = this.worktreeMismatchCache.get(cacheKey);
+    if (cached !== undefined) return cached;
+
+    const mismatch = detectWorktreeIndexMismatch(startPath, indexRoot);
+    this.worktreeMismatchCache.set(cacheKey, mismatch);
     return mismatch;
   }
 
@@ -1104,13 +1209,16 @@ export class ToolHandler {
     try {
       // Block the first tool call on the engine's post-open reconcile so we
       // never serve rows for files deleted/edited while no MCP server was
-      // running. The gate is cleared after first await — subsequent calls
-      // pay nothing. Catch-up failures are logged by the engine; we
-      // proceed regardless so a transient sync error never breaks tools.
+      // running. The wait is time-boxed (#905): a huge-repo reconcile takes
+      // minutes, and blocking the first call on all of it reads as a hang, so
+      // we wait briefly then serve and let it finish in the background. The
+      // gate is cleared after first await — subsequent calls pay nothing.
+      // Catch-up failures are logged by the engine; we proceed regardless so a
+      // transient sync error never breaks tools.
       if (this.catchUpGate) {
         const gate = this.catchUpGate;
         this.catchUpGate = null;
-        try { await gate; } catch { /* engine already logged */ }
+        await this.awaitCatchUpGate(gate);
       }
       // Honor the optional tool allowlist (CODEGRAPH_MCP_TOOLS): a trimmed
       // surface rejects ablated tools defensively even if a client cached them.
@@ -1263,7 +1371,7 @@ export class ToolHandler {
   private definitionHeading(group: Node[]): string {
     const head = group[0]!;
     const line = head.startLine ? `:${head.startLine}` : '';
-    return `### ${head.qualifiedName} (${head.kind}) — ${head.filePath}${line}`;
+    return `**${head.qualifiedName}** (${head.kind}) — ${head.filePath}${line}`;
   }
 
   /**
@@ -1321,7 +1429,7 @@ export class ToolHandler {
     // agent never mistakes one app's callers for another's. Narrow with
     // `file` to focus a single definition.
     const lines: string[] = [
-      `## Callers of ${symbol} — ${groups.length} distinct definitions (narrow with \`file\`)`,
+      `**Callers of ${symbol} — ${groups.length} distinct definitions (narrow with \`file\`)**`,
     ];
     for (const group of groups) {
       const { callers, labels } = collect(group);
@@ -1391,7 +1499,7 @@ export class ToolHandler {
 
     // Multiple DISTINCT definitions (#764): per-definition sections.
     const lines: string[] = [
-      `## Callees of ${symbol} — ${groups.length} distinct definitions (narrow with \`file\`)`,
+      `**Callees of ${symbol} — ${groups.length} distinct definitions (narrow with \`file\`)**`,
     ];
     for (const group of groups) {
       const { callees, labels } = collect(group);
@@ -1460,7 +1568,7 @@ export class ToolHandler {
     // merging unrelated same-named classes (one UserService per monorepo app)
     // overstated impact and confused agents. Narrow with `file`.
     const sections: string[] = [
-      `## Impact of ${symbol} — ${groups.length} distinct definitions (each with its own blast radius; narrow with \`file\`)`,
+      `**Impact of ${symbol} — ${groups.length} distinct definitions (each with its own blast radius; narrow with \`file\`)**`,
     ];
     for (const group of groups) {
       const head = group[0]!;
@@ -1539,6 +1647,29 @@ export class ToolHandler {
         registeredAt,
       };
     }
+    if (m?.synthesizedBy === 'fn-pointer-dispatch') {
+      const via = m.via ? `\`${String(m.via)}\`` : 'a function pointer';
+      return {
+        label: `function-pointer dispatch via ${via} (dynamic dispatch)`,
+        compact: `dynamic: fn-pointer ${m.via ? String(m.via) : ''}${at}`,
+        registeredAt,
+      };
+    }
+    if (m?.synthesizedBy === 'goframe-route') {
+      const route = m.route ? `\`${String(m.route)}\`` : 'a route';
+      return {
+        label: `GoFrame route ${route} — reflective Bind → controller method (dynamic dispatch)`,
+        compact: `dynamic: GoFrame route ${m.route ? String(m.route) : ''}${at}`,
+        registeredAt,
+      };
+    }
+    // Generic fallback for any other synthesizer (redux-thunk, gin-middleware-chain,
+    // flutter-build, …): a synthesized hop must never read as a bare static `calls`.
+    // It's a dynamic-dispatch bridge — label it as one and keep its wiring site.
+    if (typeof m?.synthesizedBy === 'string') {
+      const kind = m.synthesizedBy.replace(/-/g, ' ');
+      return { label: `${kind} (dynamic dispatch)`, compact: `dynamic: ${kind}${at}`, registeredAt };
+    }
     return null;
   }
 
@@ -1556,8 +1687,11 @@ export class ToolHandler {
    * whose qualifiedName contains another named token (`PmsProductServiceImpl::list`),
    * dropping unrelated `OmsOrderService::list`.
    */
-  private buildFlowFromNamedSymbols(cg: CodeGraph, query: string): { text: string; pathNodeIds: Set<string>; namedNodeIds: Set<string>; uniqueNamedNodeIds: Set<string> } {
-    const EMPTY = { text: '', pathNodeIds: new Set<string>(), namedNodeIds: new Set<string>(), uniqueNamedNodeIds: new Set<string>() };
+  private buildFlowFromNamedSymbols(cg: CodeGraph, query: string): { text: string; pathNodeIds: Set<string>; namedNodeIds: Set<string>; uniqueNamedNodeIds: Set<string>; spineCallSites: Map<string, number> } {
+    // spineCallSites: for each spine node, the line where it CALLS the next hop —
+    // lets the source assembler window an oversize spine method (e.g. n8n's 962-line
+    // processRunExecutionData) to the call site instead of dumping the whole body.
+    const EMPTY = { text: '', pathNodeIds: new Set<string>(), namedNodeIds: new Set<string>(), uniqueNamedNodeIds: new Set<string>(), spineCallSites: new Map<string, number>() };
     try {
       const CALLABLE = new Set(['method', 'function', 'component', 'constructor']);
       // Strip only a REAL file extension (Create.cs → Create); KEEP qualified
@@ -1587,8 +1721,25 @@ export class ToolHandler {
       // the dynamic-boundary scan (a token is covered when ANY of its nodes
       // lands on the main chain — overloads off the chain don't count against).
       const tokenNodes = new Map<string, string[]>();
+      // token → its full same-name callable family (before the container filter).
+      // A LARGE family that fails to connect on the chain is a polymorphic
+      // interface/registry dispatch — surfaced by buildPolymorphicBoundaries below.
+      const tokenFamily = new Map<string, Node[]>();
+      // Non-callable endpoints (CONSTANT/VARIABLE/FIELD) connected by a SYNTHESIZED
+      // edge. RTK thunks are `const X = createAsyncThunk(...)`, so a thunk→thunk hop
+      // is constant→constant — the CALLABLE-only `named` set can't hold it, and
+      // without this the hop is invisible to the Flow path at every tier (the
+      // Relationships section catches it only on repos ≥500 files). Kept SEPARATE
+      // from `named` (which drives the call-chain + source sizing, callable-only);
+      // fed only to the dynamic-dispatch-links scan below.
+      const dynNamed = new Map<string, Node>();
+      const DYN_KINDS = new Set(['constant', 'variable', 'field', 'property']);
+      const hasHeuristicEdge = (id: string): boolean =>
+        [...cg.getCallers(id), ...cg.getCallees(id)].some(({ edge }) => edge.provenance === 'heuristic');
       for (const t of tokens) {
-        const cands = this.findAllSymbols(cg, t).nodes.filter((n) => CALLABLE.has(n.kind));
+        const hits = this.findAllSymbols(cg, t).nodes;
+        const cands = hits.filter((n) => CALLABLE.has(n.kind));
+        tokenFamily.set(t, cands);
         // A qualified or otherwise-specific name (<=3 hits) keeps all; an
         // ambiguous simple name keeps only candidates whose container is named.
         const specific = cands.length <= 3;
@@ -1605,18 +1756,58 @@ export class ToolHandler {
           named.set(n.id, n);
           if (specific) uniqueNamedNodeIds.add(n.id);
         }
+        // Same token, non-callable synth endpoints (capped, precision-gated on an
+        // actual heuristic edge so plain config constants never qualify).
+        if (dynNamed.size < 12) {
+          for (const n of hits) {
+            if (CALLABLE.has(n.kind) || !DYN_KINDS.has(n.kind) || dynNamed.has(n.id)) continue;
+            if (hasHeuristicEdge(n.id)) dynNamed.set(n.id, n);
+            if (dynNamed.size >= 12) break;
+          }
+        }
         if (named.size > 40) break;
       }
+      // Surface synthesized (heuristic) edges incident to a named symbol — INCLUDING
+      // the non-callable CONSTANT endpoints in `dynNamed`. `skipInChain` drops a hop
+      // already shown in the rendered main chain (a 2-node chain renders nothing, so a
+      // direct named→named synth hop still surfaces — #687).
+      const collectSynthLinks = (skipInChain: ((e: Edge) => boolean) | null): string[] => {
+        const synthLines: string[] = [];
+        const synthSeen = new Set<string>();
+        for (const n of [...named.values(), ...dynNamed.values()]) {
+          if (synthLines.length >= 6) break;
+          for (const { node: other, edge } of [...cg.getCallers(n.id), ...cg.getCallees(n.id)]) {
+            if (synthLines.length >= 6) break;
+            if (edge.provenance !== 'heuristic' || other.id === n.id) continue;
+            if (skipInChain && skipInChain(edge)) continue;
+            const src = edge.source === n.id ? n : other;
+            const tgt = edge.source === n.id ? other : n;
+            const key = `${src.name}>${tgt.name}`;
+            if (synthSeen.has(key)) continue;
+            synthSeen.add(key);
+            const note = this.synthEdgeNote(edge);
+            synthLines.push(`- ${src.name} → ${tgt.name}   [${note ? note.compact : edge.kind}]`);
+          }
+        }
+        return synthLines;
+      };
       if (named.size < 2) {
-        // The agent named a flow but only one side resolved (the other end is
-        // anonymous / runtime-registered / not extracted). The resolved side's
-        // body may still hold the dynamic-dispatch site that EXPLAINS the gap —
-        // surface that instead of silently returning nothing.
-        if (named.size === 0) return EMPTY;
-        const boundaries = this.buildDynamicBoundaries(cg, [...named.values()], named);
-        if (!boundaries) return EMPTY;
-        const text = boundaries + '> Full source for these symbols is below.\n';
-        return { text, pathNodeIds: new Set(), namedNodeIds: new Set(named.keys()), uniqueNamedNodeIds };
+        // <2 CALLABLES resolved. Two recoveries before giving up: (1) synthesized
+        // edges among named CONSTANT/VARIABLE endpoints — RTK thunk→thunk is
+        // constant→constant, so `named` can be empty while `dynNamed` holds the
+        // whole chain; (2) the one resolved callable's body may hold the
+        // dynamic-dispatch site that EXPLAINS a half-connected flow.
+        const synthLines = collectSynthLinks(null);
+        const boundaries = named.size === 0 ? '' : (this.buildDynamicBoundaries(cg, [...named.values()], named) || '');
+        if (synthLines.length === 0 && !boundaries) return EMPTY;
+        const out: string[] = [];
+        if (synthLines.length) out.push(
+          '**Dynamic-dispatch links among your symbols**',
+          '(synthesized — the indirect hops grep/Read would reconstruct; the `@file:line` is the wiring site)',
+          '', ...synthLines, '');
+        if (boundaries) out.push(boundaries);
+        out.push('> Full source for these symbols is below.\n');
+        return { text: out.join('\n'), pathNodeIds: new Set(), namedNodeIds: new Set<string>([...named.keys(), ...dynNamed.keys()]), uniqueNamedNodeIds, spineCallSites: new Map<string, number>() };
       }
       const MAX_HOPS = 7;
       let best: Array<{ node: Node; edge: Edge | null }> | null = null;
@@ -1651,6 +1842,14 @@ export class ToolHandler {
       }
       const hasMain = !!best && best.length >= 3;
       const pathIds = new Set((best ?? []).map((s) => s.node.id));
+      // Where each spine node calls the NEXT hop (best[i+1].edge is the edge from
+      // best[i] → best[i+1]; its line is the call site inside best[i]'s body). Lets
+      // the assembler window an oversize spine method to the call instead of dumping it.
+      const spineCallSites = new Map<string, number>();
+      if (best) for (let i = 0; i < best.length - 1; i++) {
+        const ln = best[i + 1]?.edge?.line;
+        if (ln && ln > 0 && !spineCallSites.has(best[i]!.node.id)) spineCallSites.set(best[i]!.node.id, ln);
+      }
 
       // Dynamic-boundary scan (#687) — fires ONLY when the flow the agent
       // asked about did not fully connect: some token resolved to nodes but
@@ -1682,41 +1881,43 @@ export class ToolHandler {
         }
       }
 
-      // Supplementary: dynamic-dispatch (synthesized) edges incident to a NAMED
-      // symbol — the indirect hops an agent would otherwise grep/Read to
-      // reconstruct ("where do the appended `validators` actually run?"). The
-      // synth edge IS that answer, so surface it even when the OTHER end wasn't
-      // named (e.g. the agent names `validate` but not the `didCompleteTask`
-      // that drains the collection). On-topic by construction: only heuristic
-      // edges touching a symbol the agent named; skipped when the hop already
-      // shows in the main chain.
-      const synthLines: string[] = [];
-      const synthSeen = new Set<string>();
-      for (const n of named.values()) {
-        if (synthLines.length >= 6) break;
-        for (const { node: other, edge } of [...cg.getCallers(n.id), ...cg.getCallees(n.id)]) {
-          if (synthLines.length >= 6) break;
-          if (edge.provenance !== 'heuristic' || other.id === n.id) continue;
-          // "Already in the main chain" only applies when a chain RENDERS
-          // (hasMain). A 2-node chain populates pathIds but renders nothing,
-          // so a direct synthesized hop between two named symbols (custom
-          // EventBus emit→handler, #687) was invisible — too short for Flow,
-          // skipped here as in-chain. Surface it.
-          if (hasMain && pathIds.has(edge.source) && pathIds.has(edge.target)) continue;
-          const src = edge.source === n.id ? n : other;
-          const tgt = edge.source === n.id ? other : n;
-          const key = `${src.name}>${tgt.name}`;
-          if (synthSeen.has(key)) continue;
-          synthSeen.add(key);
-          const note = this.synthEdgeNote(edge);
-          synthLines.push(`- ${src.name} → ${tgt.name}   [${note ? note.compact : edge.kind}]`);
+      // Interface/registry-dispatch announcement (extends #687 to GRAPH-visible
+      // polymorphism). A method the agent NAMED that resolves to a large same-name
+      // family AND did not land on the main chain is almost always a runtime
+      // dispatch (plugin/strategy/handler interface): the concrete target is chosen
+      // at runtime from N implementations, so no single static edge is the answer.
+      // The body-scan above can't see this — `nodeType.execute()` is textually an
+      // ordinary call; the polymorphism lives in the graph (implements edges), so
+      // detect it there. Fires ONLY for an uncovered named token; a connected flow
+      // stays silent.
+      let polyText = '';
+      {
+        const POLY_MIN_FAMILY = 8; // smaller families are overload sets, not dispatch
+        const polyCands: Array<{ token: string; family: Node[] }> = [];
+        for (const [t, fam] of tokenFamily) {
+          if (fam.length < POLY_MIN_FAMILY) continue;
+          const ids = tokenNodes.get(t) || [];
+          if (ids.some((id) => pathIds.has(id))) continue; // covered by the flow — silent
+          polyCands.push({ token: t, family: fam });
         }
+        if (polyCands.length) polyText = this.buildPolymorphicBoundaries(cg, polyCands, named);
       }
 
-      if (!hasMain && synthLines.length === 0 && !boundaryText) return EMPTY;
+      // Supplementary: dynamic-dispatch (synthesized) edges incident to a named
+      // symbol (incl. the non-callable CONSTANT endpoints in `dynNamed`) — the
+      // indirect hops an agent would otherwise grep/Read to reconstruct ("where do
+      // the appended `validators` actually run?"). Surfaced even when the OTHER end
+      // wasn't named. The skip drops a hop already in the rendered main chain; a
+      // 2-node chain renders nothing (hasMain false) so a direct named→named synth
+      // hop still surfaces — too short for Flow, but #687-visible here.
+      const synthLines = collectSynthLinks(
+        hasMain ? (e: Edge) => pathIds.has(e.source) && pathIds.has(e.target) : null
+      );
+
+      if (!hasMain && synthLines.length === 0 && !boundaryText && !polyText) return EMPTY;
       const out: string[] = [];
       if (hasMain) {
-        out.push('## Flow (call path among the symbols you queried)', '');
+        out.push('**Flow (call path among the symbols you queried)**', '');
         for (let i = 0; i < best!.length; i++) {
           const step = best![i]!;
           if (step.edge) { const sy = this.synthEdgeNote(step.edge); out.push(`   ↓ ${sy ? sy.compact : step.edge.kind}`); }
@@ -1726,7 +1927,7 @@ export class ToolHandler {
       }
       if (synthLines.length) {
         out.push(
-          '## Dynamic-dispatch links among your symbols',
+          '**Dynamic-dispatch links among your symbols**',
           '(synthesized — the indirect hops grep/Read would reconstruct; the `@file:line` is the wiring site)',
           '',
           ...synthLines,
@@ -1734,13 +1935,14 @@ export class ToolHandler {
         );
       }
       if (boundaryText) out.push(boundaryText);
+      if (polyText) out.push(polyText);
       out.push('> Full source for these symbols is below — the call flow among them, followed by their bodies.', '');
       // namedNodeIds = every callable the agent explicitly named (a superset of
       // the spine). A file holding one is something the agent asked to SEE, so it
       // must keep full source even if it's an off-spine polymorphic sibling — the
       // agent named `getResponseWithInterceptorChain` / `SQLCompiler.execute_sql`
       // as the mechanism, not as an interchangeable leaf. See the skeleton gate.
-      return { text: out.join('\n'), pathNodeIds: pathIds, namedNodeIds: new Set(named.keys()), uniqueNamedNodeIds };
+      return { text: out.join('\n'), pathNodeIds: pathIds, namedNodeIds: new Set<string>([...named.keys(), ...dynNamed.keys()]), uniqueNamedNodeIds, spineCallSites };
     } catch {
       return EMPTY;
     }
@@ -1793,11 +1995,98 @@ export class ToolHandler {
     }
     if (notes.length === 0) return '';
     return [
-      '## Dynamic boundaries (the static path ends at runtime dispatch)',
+      '**Dynamic boundaries (the static path ends at runtime dispatch)**',
       '',
       ...notes,
       '',
       '> These sites choose their call target at runtime (registry / bus / reflection) — the site shown IS where the flow continues. To follow it, run codegraph_explore or codegraph_node on a candidate; source for the sites above is included below.',
+      '',
+    ].join('\n');
+  }
+
+  /**
+   * Interface/registry-dispatch announcement — #687 extended to GRAPH-visible
+   * polymorphism (the body-scan can't see it: `nodeType.execute()` is textually
+   * an ordinary call; the polymorphism lives in the `implements`/`extends` edges).
+   *
+   * A method the agent named that resolves to a large same-name family whose
+   * definers overwhelmingly implement/extend ONE supertype is a runtime dispatch:
+   * the concrete target is chosen at runtime from N implementations, so no single
+   * static edge is "the answer" — the implementations ARE the continuations. We
+   * announce the supertype, its TRUE implementer count, and a few concrete targets,
+   * then steer to codegraph_explore. Graph-only, query-time, zero mutation; the
+   * caller fires it ONLY for an UNCOVERED named token, so a connected flow is silent.
+   *
+   * Robust to FTS sampling bias: the same-name family is a capped FTS sample that
+   * over-represents whatever FTS ranks first (n8n: DB `TableOperation.execute`
+   * outnumbered `INodeType.execute` in the sample 7:6 even though INodeType has
+   * 611 implementers vs a handful). So candidate supertypes are ranked by their
+   * TRUE graph-wide implementer count, NOT their frequency in the sample.
+   */
+  private buildPolymorphicBoundaries(cg: CodeGraph, candidates: Array<{ token: string; family: Node[] }>, named: Map<string, Node>): string {
+    const CLASSY = new Set(['class', 'struct', 'interface', 'trait', 'protocol', 'abstract']);
+    const MIN_IMPL = 8;     // a supertype needs >= this many implementers to count as "polymorphic"
+    const MIN_SUPPORT = 2;  // >= this many sampled definers must share the supertype (ties it to the token)
+    const SAMPLE = 40;      // family members inspected per token
+    const MAX_NOTES = 3;
+    const rel = (p: string) => p.replace(/\\/g, '/');
+    const containerOf = (m: Node): Node | null => {
+      try { const ce = cg.getIncomingEdges(m.id).find((e) => e.kind === 'contains'); return ce ? cg.getNode(ce.source) : null; }
+      catch { return null; }
+    };
+    const notes: string[] = [];
+    const seenSuper = new Set<string>();
+    for (const { token, family } of candidates) {
+      if (notes.length >= MAX_NOTES) break;
+      // supertype id → how many sampled definers share it + a few example definers
+      const supers = new Map<string, { node: Node; count: number; targets: Node[] }>();
+      for (const m of family.slice(0, SAMPLE)) {
+        const container = containerOf(m);
+        if (!container || !CLASSY.has(container.kind)) continue;
+        let sups: Node[] = [];
+        try {
+          sups = cg.getOutgoingEdges(container.id)
+            .filter((e) => e.kind === 'implements' || e.kind === 'extends')
+            .map((e) => { try { return cg.getNode(e.target); } catch { return null; } })
+            .filter((n): n is Node => !!n && CLASSY.has(n.kind) && (n.name?.length || 0) >= 3);
+        } catch { /* no supertypes — free function or unresolved */ }
+        for (const s of sups) {
+          const e = supers.get(s.id) || { node: s, count: 0, targets: [] };
+          e.count++;
+          if (e.targets.length < 6) e.targets.push(m);
+          supers.set(s.id, e);
+        }
+      }
+      // Pick the supertype with the most TRUE implementers (graph-wide), among
+      // those genuinely shared by the token's definers.
+      let best: { node: Node; impl: number; targets: Node[] } | null = null;
+      for (const { node, count, targets } of supers.values()) {
+        if (count < MIN_SUPPORT) continue;
+        let impl = 0;
+        try { impl = cg.getIncomingEdges(node.id).filter((e) => e.kind === 'implements' || e.kind === 'extends').length; }
+        catch { /* leave 0 — gated out below */ }
+        if (impl < MIN_IMPL) continue;
+        if (!best || impl > best.impl) best = { node, impl, targets };
+      }
+      if (!best || seenSuper.has(best.node.id)) continue;
+      seenSuper.add(best.node.id);
+      const namedNames = new Set([...named.values()].map((n) => n.name));
+      const eg = best.targets.slice(0, 4).map((m) => {
+        const cont = containerOf(m);
+        const disp = cont ? `${cont.name}.${m.name}` : (m.qualifiedName || m.name);
+        const mark = cont && namedNames.has(cont.name) ? ' ← you named this' : '';
+        return `\`${disp}\` (${rel(m.filePath)}:${m.startLine})${mark}`;
+      });
+      const more = best.impl > eg.length ? ` +${best.impl - eg.length} more` : '';
+      notes.push(`- \`${token}\` → runtime dispatch to **${best.impl}** types implementing \`${best.node.name}\` — the static path ends here, the target is chosen at runtime. e.g. ${eg.join(', ')}${more}`);
+    }
+    if (notes.length === 0) return '';
+    return [
+      '**Interface dispatch (a named method has many implementations)**',
+      '',
+      ...notes,
+      '',
+      '> The method above is dispatched at runtime to one of the listed implementations (a registry / plugin / strategy interface) — there is no single static caller→callee edge; the implementations ARE the continuations. To follow one, run codegraph_explore on a listed target.',
       '',
     ].join('\n');
   }
@@ -1922,7 +2211,7 @@ export class ToolHandler {
     if (entries.length === 0) return '';
 
     return [
-      '### Blast radius — what depends on these (update/verify before editing)',
+      '**Blast radius — what depends on these (update/verify before editing)**',
       '',
       ...entries,
       '',
@@ -2327,6 +2616,26 @@ export class ToolHandler {
       if (n) namedSeedFiles.add(n.filePath);
     }
 
+    // Multi-term corroboration tier: a file that is BOTH (a) an entry/central file
+    // (a search root, named seed, or graph-central hub — i.e. structurally part of
+    // the answer) AND (b) matched by ≥2 DISTINCT query terms must not be buried by
+    // graph-centrality mass that accrued to a denser-but-off-topic cluster. In a
+    // cross-layer monorepo (an API server alongside a much larger, internally dense
+    // frontend that mirrors the same domain words) the Random-Walk-with-Restart mass
+    // — seeded from text matches that skew to the bigger layer — floats hits=0
+    // frontend files above the hits=2/3 backend service that IS the answer (its many
+    // callers don't help: it's call-isolated from the frontend seed cluster). The
+    // entry/central GUARD keeps this safe: an INCIDENTAL multi-term file that is
+    // neither entry nor central (a type/util file that matches "element"+x but isn't
+    // the flow) is NOT promoted, so it can't displace the graph-central answer file
+    // (hits=1) the way a blunt hits-only tier would. Single-layer repos with one
+    // cluster are unaffected (no competing mass). Set CODEGRAPH_RANK_NO_MULTITERM=1
+    // to disable.
+    const MULTITERM_OFF = process.env.CODEGRAPH_RANK_NO_MULTITERM === '1';
+    const isCorroborated = (fp: string) =>
+      !MULTITERM_OFF &&
+      (fileTermHits.get(fp) ?? 0) >= 2 &&
+      (entryFiles.has(fp) || centralFiles.has(fp));
     const sortedFiles = relevantFiles.sort((a, b) => {
       const aPath = a[0].toLowerCase();
       const bPath = b[0].toLowerCase();
@@ -2335,6 +2644,11 @@ export class ToolHandler {
       const aNamed = namedSeedFiles.has(a[0]) ? 1 : 0;
       const bNamed = namedSeedFiles.has(b[0]) ? 1 : 0;
       if (aNamed !== bNamed) return bNamed - aNamed;
+
+      // Corroborated (entry/central + ≥2 terms) tier, above the graph signal.
+      const aCorr = isCorroborated(a[0]) ? 1 : 0;
+      const bCorr = isCorroborated(b[0]) ? 1 : 0;
+      if (aCorr !== bCorr) return bCorr - aCorr;
 
       // Graph connectivity is the next key (small epsilon so near-ties fall
       // through to the text signal rather than coin-flipping on float noise).
@@ -2366,7 +2680,7 @@ export class ToolHandler {
 
     // Step 3: Build relationship map
     const lines: string[] = [
-      `## Exploration: ${query}`,
+      `**Exploration: ${query}**`,
       '',
       `Found ${subgraph.nodes.size} symbols across ${fileGroups.size} files.`,
       '',
@@ -2384,7 +2698,7 @@ export class ToolHandler {
     );
 
     if (budget.includeRelationships && significantEdges.length > 0) {
-      lines.push('### Relationships');
+      lines.push('**Relationships**');
       lines.push('');
 
       // Group edges by kind for readability
@@ -2471,7 +2785,7 @@ export class ToolHandler {
       return false;
     };
 
-    lines.push('### Source Code');
+    lines.push('**Source Code**');
     lines.push('');
     lines.push('> The code below is the **verbatim, current on-disk source** of these files — re-read from disk on this call and line-numbered, byte-for-byte identical to what the Read tool returns. It is NOT a summary, outline, or stale cache. Treat each block as a Read you have already performed: do not Read a file shown here.');
     lines.push('');
@@ -2615,7 +2929,7 @@ export class ToolHandler {
           const tag = bodyIds.size > 0
             ? 'focused (the methods you named in full, the rest as signatures — codegraph_explore a signature by name for its body; do NOT Read)'
             : 'skeleton (signatures only — codegraph_explore a name for its full body; do NOT Read)';
-          lines.push(`#### ${filePath} — ${names} · ${tag}`, '', '```' + lang, skel.join('\n'), '```', '');
+          lines.push(fileSectionHeader(filePath, `${names} · ${tag}`), '', '```' + lang, skel.join('\n'), '```', '');
           totalChars += skel.join('\n').length + 120;
           filesIncluded++;
           continue;
@@ -2656,7 +2970,7 @@ export class ToolHandler {
         )];
         const headerNames = uniqSymbols.slice(0, budget.maxSymbolsInFileHeader);
         const omitted = uniqSymbols.length - headerNames.length;
-        const wholeHeader = `#### ${filePath} — ${omitted > 0 ? `${headerNames.join(', ')}, +${omitted} more` : headerNames.join(', ')}`;
+        const wholeHeader = fileSectionHeader(filePath, omitted > 0 ? `${headerNames.join(', ')}, +${omitted} more` : headerNames.join(', '));
 
         if (!fileNecessary && totalChars + wholeSection.length + 200 > budget.maxOutputChars) {
           // Don't slice a whole file mid-method: an incidental file that doesn't
@@ -2705,7 +3019,7 @@ export class ToolHandler {
         const n = cg.getNode(id);
         if (n && n.filePath === filePath && n.startLine > 0 && n.endLine > 0) rangeNodes.set(id, n);
       }
-      const ranges: Array<{ start: number; end: number; name: string; kind: string; importance: number }> = [...rangeNodes.values()]
+      const ranges: Array<{ start: number; end: number; name: string; kind: string; importance: number; spine: boolean; spineCallLine?: number }> = [...rangeNodes.values()]
         // Drop whole-file envelope nodes (containers covering >50% of the file).
         .filter(n => !(ENVELOPE_KINDS.has(n.kind) && (n.endLine - n.startLine + 1) > fileLines.length * 0.5))
         .map(n => {
@@ -2714,7 +3028,12 @@ export class ToolHandler {
           else if (flow.namedNodeIds.has(n.id)) importance = 9; // agent named it → keep its cluster
           else if (glueNodeIds.has(n.id)) importance = 6; // bridging caller/callee of an entry
           else if (connectedToEntry.has(n.id)) importance = 3;
-          return { start: n.startLine, end: n.endLine, name: n.name, kind: n.kind, importance };
+          // On the rendered call-path spine? That IS the flow answer — its cluster
+          // must never be dropped by the per-file budget (n8n's huge workflow-execute.ts:
+          // processRunExecutionData, the named flow ENTRY at L1562, is a large
+          // low-density method that lost the budget to denser blocks and got cut, so
+          // the agent Read it back — the very thing explore exists to prevent).
+          return { start: n.startLine, end: n.endLine, name: n.name, kind: n.kind, importance, spine: flow.pathNodeIds.has(n.id), spineCallLine: flow.spineCallSites.get(n.id) };
         });
 
       // Add edge source locations in this file — captures template references
@@ -2732,7 +3051,7 @@ export class ToolHandler {
           // Look up target name from subgraph first, fall back to edge kind
           const targetNode = subgraph.nodes.get(edge.target);
           const targetName = targetNode?.name ?? edge.kind;
-          ranges.push({ start: edge.line, end: edge.line, name: targetName, kind: edge.kind, importance: 2 });
+          ranges.push({ start: edge.line, end: edge.line, name: targetName, kind: edge.kind, importance: 2, spine: false });
         }
       }
 
@@ -2741,13 +3060,15 @@ export class ToolHandler {
       if (ranges.length === 0) continue;
 
       const gapThreshold = budget.gapThreshold;
-      const clusters: Array<{ start: number; end: number; symbols: string[]; score: number; maxImportance: number }> = [];
+      const clusters: Array<{ start: number; end: number; symbols: string[]; score: number; maxImportance: number; hasSpine: boolean; spineCallLine?: number }> = [];
       let current = {
         start: ranges[0]!.start,
         end: ranges[0]!.end,
         symbols: [`${ranges[0]!.name}(${ranges[0]!.kind})`],
         score: ranges[0]!.importance,
         maxImportance: ranges[0]!.importance,
+        hasSpine: ranges[0]!.spine,
+        spineCallLine: ranges[0]!.spineCallLine,
       };
 
       for (let i = 1; i < ranges.length; i++) {
@@ -2757,6 +3078,8 @@ export class ToolHandler {
           current.symbols.push(`${r.name}(${r.kind})`);
           current.score += r.importance;
           current.maxImportance = Math.max(current.maxImportance, r.importance);
+          current.hasSpine = current.hasSpine || r.spine;
+          current.spineCallLine = current.spineCallLine ?? r.spineCallLine;
         } else {
           clusters.push(current);
           current = {
@@ -2765,6 +3088,8 @@ export class ToolHandler {
             symbols: [`${r.name}(${r.kind})`],
             score: r.importance,
             maxImportance: r.importance,
+            hasSpine: r.spine,
+            spineCallLine: r.spineCallLine,
           };
         }
       }
@@ -2779,16 +3104,40 @@ export class ToolHandler {
       // get tail-trimmed with a marker.
       const contextPadding = 3;
       const withLineNumbers = exploreLineNumbersEnabled();
-      const buildSection = (c: { start: number; end: number }): string => {
+      // Language-neutral separator (no `//` — not a comment in Python, Ruby,
+      // etc.). With line numbers on, the line-number jump also signals the gap.
+      const GAP_MARKER = '\n\n... (gap) ...\n\n';
+      // An oversize spine method (the call path runs THROUGH a god-method — n8n's
+      // processRunExecutionData is 962 lines) is windowed to its next-hop CALL site
+      // plus the signature head, NOT dumped whole. Without this the cluster is too big
+      // for any per-file cap and gets dropped, so the agent Reads the method back —
+      // the exact gap this closes. Bounded, so a god-method can't blow the budget yet
+      // the spine's call still appears in context.
+      const OVERSIZE_SPINE_LINES = 200;
+      const SPINE_WINDOW = 28; // lines each side of the next-hop call site
+      const buildSection = (c: { start: number; end: number; hasSpine?: boolean; spineCallLine?: number }): string => {
+        if (c.hasSpine && c.spineCallLine && (c.end - c.start + 1) > OVERSIZE_SPINE_LINES) {
+          const call = c.spineCallLine;
+          const winStart = Math.max(c.start, call - SPINE_WINDOW);
+          const winEnd = Math.min(c.end, call + SPINE_WINDOW);
+          const parts: string[] = [];
+          // Signature head, only when it sits clearly above the window (else the
+          // window already covers the method opening).
+          const headEnd = Math.min(c.start + 4, winStart - 2);
+          if (headEnd >= c.start) {
+            const head = fileLines.slice(c.start - 1, headEnd).join('\n');
+            parts.push(withLineNumbers ? numberSourceLines(head, c.start) : head);
+          }
+          const win = fileLines.slice(winStart - 1, winEnd).join('\n');
+          parts.push(withLineNumbers ? numberSourceLines(win, winStart) : win);
+          return parts.join(GAP_MARKER);
+        }
         const startIdx = Math.max(0, c.start - 1 - contextPadding);
         const endIdx = Math.min(fileLines.length, c.end + contextPadding);
         const slice = fileLines.slice(startIdx, endIdx).join('\n');
         // startIdx is 0-based, so the slice's first line is line startIdx + 1.
         return withLineNumbers ? numberSourceLines(slice, startIdx + 1) : slice;
       };
-      // Language-neutral separator (no `//` — not a comment in Python, Ruby,
-      // etc.). With line numbers on, the line-number jump also signals the gap.
-      const GAP_MARKER = '\n\n... (gap) ...\n\n';
 
       // Rank clusters for inclusion under the per-file cap. Entry-point
       // clusters come first: a cluster containing a query entry point
@@ -2803,6 +3152,11 @@ export class ToolHandler {
       const rankedClusters = clusters
         .map((c, i) => ({ idx: i, span: c.end - c.start + 1, c }))
         .sort((a, b) => {
+          // Spine clusters first — the rendered call path IS the flow answer, so it
+          // outranks any denser block of peripheral declarations (a low-density entry
+          // method must not lose the budget to them). Within spine / within non-spine,
+          // the existing importance → density → score → span order holds.
+          if (a.c.hasSpine !== b.c.hasSpine) return (b.c.hasSpine ? 1 : 0) - (a.c.hasSpine ? 1 : 0);
           if (b.c.maxImportance !== a.c.maxImportance) return b.c.maxImportance - a.c.maxImportance;
           const densityA = a.c.score / a.span;
           const densityB = b.c.score / b.span;
@@ -2818,6 +3172,11 @@ export class ToolHandler {
       // That source-order slice is what cut Django's `_fetch_all` (L2237, importance
       // 9 — agent-named) when query.py was the last of four big files to be emitted.
       const fileBudget = Math.min(budget.maxCharsPerFile, Math.max(0, budget.maxOutputChars - totalChars - 200));
+      // Spine ceiling: a flow-path cluster may exceed the per-file cap (the call
+      // path is the answer), but bounded — at most ~2.5× the per-file cap and never
+      // past what's left of the total output cap — so a pathological long in-file
+      // spine can't run away or starve co-flow files entirely.
+      const SPINE_CEILING = Math.min(budget.maxCharsPerFile * 2.5, Math.max(0, budget.maxOutputChars - totalChars - 200));
       const chosenIndices = new Set<number>();
       let projectedChars = 0;
       for (const rc of rankedClusters) {
@@ -2830,7 +3189,12 @@ export class ToolHandler {
           projectedChars += sectionLen;
           continue;
         }
-        if (projectedChars + sectionLen > fileBudget) continue;
+        // A spine cluster (the rendered call path) is the flow answer — include it
+        // past the per-file budget up to the spine ceiling; non-spine clusters obey
+        // the normal per-file budget.
+        const fits = projectedChars + sectionLen <= fileBudget;
+        const spineFits = rc.c.hasSpine && projectedChars + sectionLen <= SPINE_CEILING;
+        if (!fits && !spineFits) continue;
         chosenIndices.add(rc.idx);
         projectedChars += sectionLen;
       }
@@ -2873,7 +3237,7 @@ export class ToolHandler {
       const headerSuffix = omittedCount > 0
         ? `${headerSymbols.join(', ')}, +${omittedCount} more`
         : headerSymbols.join(', ');
-      const fileHeader = `#### ${filePath} — ${headerSuffix}`;
+      const fileHeader = fileSectionHeader(filePath, headerSuffix);
 
       // The total cap bounds INCIDENTAL files only. A file that DEFINES a symbol
       // the agent named (or that's on the flow spine) renders even when the
@@ -2914,7 +3278,7 @@ export class ToolHandler {
         .sort((a, b) => b[1].score - a[1].score);
       const remainingFiles = [...remainingRelevant, ...peripheralFiles];
       if (remainingFiles.length > 0) {
-        lines.push('### Not shown above — explore these names for their source');
+        lines.push('**Not shown above — explore these names for their source**');
         lines.push('');
         for (const [filePath, group] of remainingFiles.slice(0, 10)) {
           const symbols = group.nodes.map(n => `${n.name}:${n.startLine}`).join(', ');
@@ -2960,15 +3324,16 @@ export class ToolHandler {
     // necessary overflow above the 24K budget, but hard-stop at 25K — never into
     // externalize territory.
     const output = flow.text + lines.join('\n');
+
     const hardCeiling = Math.min(Math.round(budget.maxOutputChars * 1.5), 25000);
     if (output.length > hardCeiling) {
-      // Cut at a FILE-SECTION boundary (the last `#### ` header before the
+      // Cut at a FILE-SECTION boundary (the last ``**` `` file header before the
       // ceiling) so we drop whole trailing file-sections rather than slicing
       // through a method body — a half-rendered method just forces the Read this
       // tool exists to prevent. Fall back to a line boundary only if no section
       // header sits in the back half (degenerate single-giant-section case).
       const cut = output.slice(0, hardCeiling);
-      const lastSection = cut.lastIndexOf('\n#### ');
+      const lastSection = cut.lastIndexOf('\n' + FILE_SECTION_PREFIX);
       const boundary = lastSection > hardCeiling * 0.5 ? lastSection : cut.lastIndexOf('\n');
       const safe = boundary > 0 ? cut.slice(0, boundary) : cut;
       return this.textResult(safe + '\n\n... (output truncated to budget; the source above is complete and verbatim — treat it as already Read. For any area not covered, run another codegraph_explore with the specific names — do NOT Read these files.)');
@@ -3083,7 +3448,7 @@ export class ToolHandler {
       const shownList = listed.slice(0, LIST_CAP);
       out.push(
         '',
-        '### Other definitions',
+        '**Other definitions**',
         ...shownList.map((n) => `- \`${n.name}\` (${n.kind}) — ${n.filePath}:${n.startLine}`),
       );
       if (listed.length > LIST_CAP) out.push(`- … +${listed.length - LIST_CAP} more`);
@@ -3165,7 +3530,7 @@ export class ToolHandler {
     // symbolsOnly → the cheap structural overview, no source.
     if (opts.symbolsOnly) {
       const out = [`**${filePath}** — ${nodes.length} symbol${nodes.length === 1 ? '' : 's'}, ${depSummary}`, ''];
-      if (nodes.length) out.push(...symbolMap('### Symbols'));
+      if (nodes.length) out.push(...symbolMap('**Symbols**'));
       else out.push('_No indexed symbols in this file._');
       out.push('', '> Drop `symbolsOnly` (or pass `offset`/`limit`) to read the source, like Read.');
       return this.textResult(this.truncateOutput(out.join('\n')));
@@ -3175,7 +3540,7 @@ export class ToolHandler {
     // line is `key: <secret>`. Summarize by key and point to a real Read.
     if (CONFIG_LEAF_LANGUAGES.has(resolved.language)) {
       const out = [`**${filePath}** — configuration/data file, ${depSummary}`, ''];
-      if (nodes.length) out.push(...symbolMap('### Keys (values withheld for safety)'));
+      if (nodes.length) out.push(...symbolMap('**Keys (values withheld for safety)**'));
       out.push('', '> Values may be secrets, so codegraph indexes keys only. Read the file directly if you need a value.');
       return this.textResult(this.truncateOutput(out.join('\n')));
     }
@@ -3189,7 +3554,7 @@ export class ToolHandler {
     }
     if (content === null) {
       const out = [`**${filePath}** — could not read from disk (it may have moved since indexing). ${depSummary}`, ''];
-      if (nodes.length) out.push(...symbolMap('### Symbols'));
+      if (nodes.length) out.push(...symbolMap('**Symbols**'));
       out.push('', `> Read \`${filePath}\` directly for its current content.`);
       return this.textResult(this.truncateOutput(out.join('\n')));
     }
@@ -3286,7 +3651,7 @@ export class ToolHandler {
     const callees = collect(cg.getCallees(node.id));
     const callers = collect(cg.getCallers(node.id));
     if (callees.length === 0 && callers.length === 0) return '';
-    const lines: string[] = ['', '### Trail — codegraph_node any of these to follow it (no Read needed)'];
+    const lines: string[] = ['', '**Trail — codegraph_node any of these to follow it (no Read needed)**'];
     if (callees.length > 0) {
       lines.push(`**Calls →** ${callees.slice(0, TRAIL_CAP).map(fmt).join(', ')}${callees.length > TRAIL_CAP ? `, +${callees.length - TRAIL_CAP} more` : ''}`);
     }
@@ -3322,7 +3687,7 @@ export class ToolHandler {
     const mismatch = this.worktreeMismatchFor(args.projectPath as string | undefined);
 
     const lines: string[] = [
-      '## CodeGraph Status',
+      '**CodeGraph Status**',
       '',
     ];
     if (mismatch) {
@@ -3353,7 +3718,7 @@ export class ToolHandler {
       );
     }
 
-    lines.push('', '### Nodes by Kind:');
+    lines.push('', '**Nodes by Kind:**');
 
     for (const [kind, count] of Object.entries(stats.nodesByKind)) {
       if ((count as number) > 0) {
@@ -3361,7 +3726,7 @@ export class ToolHandler {
       }
     }
 
-    lines.push('', '### Languages:');
+    lines.push('', '**Languages:**');
     for (const [lang, count] of Object.entries(stats.filesByLanguage)) {
       if ((count as number) > 0) {
         lines.push(`- ${lang}: ${count}`);
@@ -3375,7 +3740,7 @@ export class ToolHandler {
     if (cg.isWatcherDegraded()) {
       lines.push(
         '',
-        '### Auto-sync disabled:',
+        '**Auto-sync disabled:**',
         `- ${cg.getWatcherDegradedReason() ?? 'live file watching stopped'}`,
         '- The index is frozen; Read files directly for current content.'
       );
@@ -3387,7 +3752,7 @@ export class ToolHandler {
     // banners on other tool calls.
     const pending = cg.getPendingFiles();
     if (pending.length > 0) {
-      lines.push('', '### Pending sync:');
+      lines.push('', '**Pending sync:**');
       const now = Date.now();
       for (const p of pending) {
         const ageMs = Math.max(0, now - p.lastSeenMs);
@@ -3478,7 +3843,7 @@ export class ToolHandler {
    * Format files as a flat list
    */
   private formatFilesFlat(files: { path: string; language: string; nodeCount: number }[], includeMetadata: boolean): string {
-    const lines: string[] = [`## Files (${files.length})`, ''];
+    const lines: string[] = [`**Files (${files.length})**`, ''];
 
     for (const file of files.sort((a, b) => a.path.localeCompare(b.path))) {
       if (includeMetadata) {
@@ -3503,13 +3868,13 @@ export class ToolHandler {
       byLang.set(file.language, existing);
     }
 
-    const lines: string[] = [`## Files by Language (${files.length} total)`, ''];
+    const lines: string[] = [`**Files by Language (${files.length} total)**`, ''];
 
     // Sort languages by file count (descending)
     const sortedLangs = [...byLang.entries()].sort((a, b) => b[1].length - a[1].length);
 
     for (const [lang, langFiles] of sortedLangs) {
-      lines.push(`### ${lang} (${langFiles.length})`);
+      lines.push(`**${lang} (${langFiles.length})**`);
       for (const file of langFiles.sort((a, b) => a.path.localeCompare(b.path))) {
         if (includeMetadata) {
           lines.push(`- ${file.path} (${file.nodeCount} symbols)`);
@@ -3561,7 +3926,7 @@ export class ToolHandler {
     }
 
     // Render tree
-    const lines: string[] = [`## Project Structure (${files.length} files)`, ''];
+    const lines: string[] = [`**Project Structure (${files.length} files)**`, ''];
 
     const renderNode = (node: TreeNode, prefix: string, isLast: boolean, depth: number): void => {
       if (maxDepth !== undefined && depth > maxDepth) return;
@@ -3774,13 +4139,13 @@ export class ToolHandler {
   // =========================================================================
 
   private formatSearchResults(results: SearchResult[]): string {
-    const lines: string[] = [`## Search Results (${results.length} found)`, ''];
+    const lines: string[] = [`**Search Results (${results.length} found)**`, ''];
 
     for (const result of results) {
       const { node } = result;
       const location = node.startLine ? `:${node.startLine}` : '';
       // Compact format: one line per result with key info
-      lines.push(`### ${node.name} (${node.kind})`);
+      lines.push(`**${node.name}** (${node.kind})`);
       lines.push(`${node.filePath}${location}`);
       if (node.signature) lines.push(`\`${node.signature}\``);
       lines.push('');
@@ -3790,7 +4155,7 @@ export class ToolHandler {
   }
 
   private formatNodeList(nodes: Node[], title: string, labels?: Map<string, string>): string {
-    const lines: string[] = [`## ${title} (${nodes.length} found)`, ''];
+    const lines: string[] = [`**${title} (${nodes.length} found)**`, ''];
 
     for (const node of nodes) {
       const location = node.startLine ? `:${node.startLine}` : '';
@@ -3825,7 +4190,7 @@ export class ToolHandler {
 
     // Compact format: just list affected symbols grouped by file
     const lines: string[] = [
-      `## Impact: "${symbol}" affects ${nodeCount} symbols`,
+      `**Impact: "${symbol}" affects ${nodeCount} symbols**`,
       '',
     ];
 
@@ -3873,7 +4238,7 @@ export class ToolHandler {
   private formatNodeDetails(node: Node, code: string | null, outline?: string | null): string {
     const location = node.startLine ? `:${node.startLine}` : '';
     const lines: string[] = [
-      `## ${node.name} (${node.kind})`,
+      `**${node.name}** (${node.kind})`,
       '',
       `**Location:** ${node.filePath}${location}`,
     ];

@@ -14,10 +14,12 @@ import {
   FileRecord,
   ExtractionResult,
   ExtractionError,
+  Edge,
 } from '../types';
 import { QueryBuilder } from '../db/queries';
 import { extractFromSource } from './tree-sitter';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages } from './grammars';
+import { loadExtensionOverrides } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
@@ -30,6 +32,18 @@ import type { ResolutionContext } from '../resolution/types';
  * File reads are I/O-bound; batching overlaps I/O wait with CPU parse work.
  */
 const FILE_IO_BATCH_SIZE = 10;
+
+/**
+ * How many files the `sync()` reconcile processes between cooperative yields to
+ * the event loop. The reconcile runs two O(files) loops of synchronous `fs`
+ * calls (existsSync for removals, statSync for adds/mods); on a very large repo
+ * (~100k files) an un-yielded run wedges the main thread for minutes, which both
+ * trips the liveness watchdog (it SIGKILLs a process whose loop stops turning)
+ * and blocks the first MCP tool call behind the catch-up gate (issue #905).
+ * Yielding every N files keeps the socket, the watchdog heartbeat, and any
+ * concurrent read query responsive while the reconcile runs.
+ */
+const SYNC_RECONCILE_YIELD_INTERVAL = 1000;
 
 // PARSER_RESET_INTERVAL moved to parse-worker.ts (runs in worker thread)
 
@@ -256,6 +270,21 @@ function defaultsOnlyIgnore(): Ignore {
 }
 
 /**
+ * `git ls-files --directory` collapses a wholly-untracked/ignored directory into
+ * one entry — and when the command's own cwd is such a directory (the indexed
+ * root is itself a git-ignored subdir of an enclosing repo), git emits the
+ * literal `./` meaning "this entire directory". That sentinel is not a real
+ * nested path: feeding it to the `ignore` matcher throws ("path should be a
+ * `path.relative()`d string, but got "./""), which used to abort `buildScopeIgnore`
+ * and so break the MCP daemon's watcher/auto-sync on connect; and joining it back
+ * onto `repoDir` would just re-point at the cwd. Drop it wherever we consume
+ * `--directory` output. (#936)
+ */
+function isWholeCwdEntry(entry: string): boolean {
+  return entry === './' || entry === '.' || entry === '';
+}
+
+/**
  * List the gitignored DIRECTORIES of a repo (collapsed, trailing-slash form),
  * relative to `repoDir`. These are invisible to every other `git ls-files` /
  * `git status` mode — and in a multi-repo workspace they are exactly where the
@@ -269,7 +298,7 @@ function listIgnoredDirs(repoDir: string): string[] {
       ['ls-files', '-z', '-o', '-i', '--exclude-standard', '--directory'],
       { cwd: repoDir, encoding: 'utf-8' as const, timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'] as ['pipe', 'pipe', 'pipe'], windowsHide: true }
     );
-    return out.split('\0').filter((e) => e.endsWith('/'));
+    return out.split('\0').filter((e) => e.endsWith('/') && !isWholeCwdEntry(e));
   } catch {
     return [];
   }
@@ -288,8 +317,10 @@ const EMBEDDED_REPO_SEARCH_ENTRIES = 2000;
  * - A `.git` **file** is a pointer (`gitdir: …`). A git **worktree** points into
  *   the host repo's own `.git/worktrees/<name>`, so it is a second working view
  *   of a repo CodeGraph already indexes — indexing it just duplicates the whole
- *   graph N times; skip it (#848). A **submodule** points into `.git/modules/`
- *   and is distinct code, so index it as before.
+ *   graph N times; skip it (#848). A **submodule worktree** points into
+ *   `.git/modules/<module>/worktrees/<name>` — same duplication, so skip it too
+ *   (#945). A **submodule** checkout points into `.git/modules/<module>` (no
+ *   `worktrees/` segment) and is distinct code, so index it as before.
  *
  * Returns `'none'` when there is no `.git` entry here.
  */
@@ -304,9 +335,12 @@ function classifyGitDir(absDir: string): 'embedded' | 'worktree' | 'none' {
   if (!st.isFile()) return 'none';
   try {
     const gitdir = fs.readFileSync(path.join(absDir, '.git'), 'utf8').match(/^gitdir:\s*(.+)$/m)?.[1]?.trim();
-    // A linked worktree's gitdir lives under some repo's `.git/worktrees/`.
+    // A worktree's gitdir lives under some repo's `.git/worktrees/<name>` —
+    // either the top-level repo's (`.git/worktrees/`) or, for a worktree of a
+    // submodule, that submodule's gitdir (`.git/modules/<module>/worktrees/`).
+    // The optional `modules/<module>` segment covers the submodule case (#945).
     // Match both separators so a Windows-style pointer is recognized too.
-    if (gitdir && /(^|[\\/])\.git[\\/]worktrees[\\/]/.test(gitdir)) return 'worktree';
+    if (gitdir && /(^|[\\/])\.git[\\/](modules[\\/][^\\/]+[\\/])?worktrees[\\/]/.test(gitdir)) return 'worktree';
   } catch {
     // Unreadable `.git` pointer — fall back to the prior "index it" behavior.
   }
@@ -433,7 +467,7 @@ export function discoverEmbeddedRepoRoots(rootDir: string): string[] {
         { cwd: repoAbs, encoding: 'utf-8', timeout: 30000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
       );
       for (const e of o.split('\0')) {
-        if (e.endsWith('/') && !defaults.ignores(e)) {
+        if (e.endsWith('/') && !isWholeCwdEntry(e) && !defaults.ignores(e)) {
           candidates.push(...findNestedGitRepos(path.join(repoAbs, e), e));
         }
       }
@@ -604,19 +638,34 @@ interface GitChanges {
 function getGitChangedFiles(rootDir: string): GitChanges | null {
   try {
     const changes: GitChanges = { modified: [], added: [], deleted: [] };
-    collectGitStatus(rootDir, '', changes);
+    // Custom extension → language overrides from the project's codegraph.json,
+    // so change detection sees the same custom-extension files the full index does.
+    const overrides = loadExtensionOverrides(rootDir);
+    collectGitStatus(rootDir, '', changes, overrides);
     return changes;
   } catch {
     return null;
   }
 }
 
-function collectGitStatus(repoDir: string, prefix: string, out: GitChanges): void {
+function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, overrides?: Record<string, Language>): void {
   const output = execFileSync(
     'git',
     ['status', '--porcelain', '--no-renames'],
     { cwd: repoDir, encoding: 'utf-8', timeout: 10000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
   );
+
+  // This repo's own ignore rules — built-in defaults (#407) plus its .gitignore.
+  // Change detection must exclude the SAME files the full index does, but git
+  // status hides neither: it ignores nothing for *tracked* paths, and the
+  // built-in defaults aren't gitignore at all. Without this filter a committed
+  // vendor/ dir, or a tracked file under a .gitignored dir, surfaces here as a
+  // change — so `codegraph status` (which reads getChangedFiles) reports a
+  // pending edit the full index never tracks and `sync` never clears. Matching
+  // repo-relative `rel` at each recursion level mirrors getGitVisibleFiles'
+  // ScopeIgnore: every embedded repo is judged by ITS OWN rules, never the
+  // parent's. (#766)
+  const ig = buildDefaultIgnore(repoDir);
 
   const untrackedDirs: string[] = [];
   for (const line of output.split('\n')) {
@@ -633,13 +682,22 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges): voi
     }
 
     const filePath = normalizePath(prefix + rel);
-    // Skip non-source files (git status already omits .gitignored paths).
-    if (!isSourceFile(filePath)) continue;
+    if (!isSourceFile(filePath, overrides)) continue;
+
+    if (statusCode.includes('D')) {
+      // Deletions stay unfiltered: getChangedFiles acts on one only when the
+      // path is already tracked in the DB, where removal is always correct — and
+      // that lets a newly-excluded dir's stale rows clean themselves up. (#766)
+      out.deleted.push(filePath);
+      continue;
+    }
+
+    // Added (`??`) / modified files inside an excluded dir must not enter the
+    // index — match against the repo-relative path, same as the full scan. (#766)
+    if (ig.ignores(rel)) continue;
 
     if (statusCode === '??') {
       out.added.push(filePath);
-    } else if (statusCode.includes('D')) {
-      out.deleted.push(filePath);
     } else {
       // M, MM, AM, A (staged), etc. — treat as modified
       out.modified.push(filePath);
@@ -650,11 +708,11 @@ function collectGitStatus(repoDir: string, prefix: string, out: GitChanges): voi
   // nested deeper) and under this repo's gitignored dirs.
   for (const rel of untrackedDirs) {
     for (const repoRel of findNestedGitRepos(path.join(repoDir, rel), rel)) {
-      collectGitStatus(path.join(repoDir, repoRel), prefix + repoRel, out);
+      collectGitStatus(path.join(repoDir, repoRel), prefix + repoRel, out, overrides);
     }
   }
   for (const rel of findIgnoredEmbeddedRepos(repoDir)) {
-    collectGitStatus(path.join(repoDir, rel), prefix + rel, out);
+    collectGitStatus(path.join(repoDir, rel), prefix + rel, out, overrides);
   }
 }
 
@@ -669,13 +727,16 @@ export function scanDirectory(
   rootDir: string,
   onProgress?: (current: number, file: string) => void
 ): string[] {
+  // Custom extension → language overrides from the project's codegraph.json.
+  const overrides = loadExtensionOverrides(rootDir);
+
   // Fast path: use git to get all visible files (respects .gitignore everywhere)
   const gitFiles = getGitVisibleFiles(rootDir);
   if (gitFiles) {
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
-      if (isSourceFile(filePath)) {
+      if (isSourceFile(filePath, overrides)) {
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -696,12 +757,15 @@ export async function scanDirectoryAsync(
   rootDir: string,
   onProgress?: (current: number, file: string) => void
 ): Promise<string[]> {
+  // Custom extension → language overrides from the project's codegraph.json.
+  const overrides = loadExtensionOverrides(rootDir);
+
   const gitFiles = getGitVisibleFiles(rootDir);
   if (gitFiles) {
     const files: string[] = [];
     let count = 0;
     for (const filePath of gitFiles) {
-      if (isSourceFile(filePath)) {
+      if (isSourceFile(filePath, overrides)) {
         files.push(filePath);
         count++;
         onProgress?.(count, filePath);
@@ -727,6 +791,8 @@ function scanDirectoryWalk(
   const files: string[] = [];
   let count = 0;
   const visitedDirs = new Set<string>();
+  // Custom extension → language overrides from the project's codegraph.json.
+  const overrides = loadExtensionOverrides(rootDir);
 
   // A .gitignore matcher scoped to the directory that declared it. Patterns in
   // a nested .gitignore are relative to that directory, so we keep the dir
@@ -803,7 +869,7 @@ function scanDirectoryWalk(
               walk(fullPath, active);
             }
           } else if (stat.isFile()) {
-            if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath)) {
+            if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath, overrides)) {
               files.push(relativePath);
               count++;
               onProgress?.(count, relativePath);
@@ -820,7 +886,7 @@ function scanDirectoryWalk(
           walk(fullPath, active);
         }
       } else if (entry.isFile()) {
-        if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath)) {
+        if (!isIgnored(fullPath, false, active) && isSourceFile(relativePath, overrides)) {
           files.push(relativePath);
           count++;
           onProgress?.(count, relativePath);
@@ -940,6 +1006,11 @@ export class ExtractionOrchestrator {
     let totalNodes = 0;
     let totalEdges = 0;
 
+    // Custom extension → language overrides from the project's codegraph.json.
+    // Threaded into language detection so custom-extension files load the right
+    // grammar and store under the mapped language.
+    const overrides = loadExtensionOverrides(this.rootDir);
+
     const log = verbose
       ? (msg: string) => { console.log(`[worker] ${msg}`); }
       : (_msg: string) => {};
@@ -996,7 +1067,7 @@ export class ExtractionOrchestrator {
     await new Promise(resolve => setImmediate(resolve));
 
     // Detect needed languages and load grammars in the parse worker
-    const neededLanguages = [...new Set(files.map((f) => detectLanguage(f)))];
+    const neededLanguages = [...new Set(files.map((f) => detectLanguage(f, undefined, overrides)))];
     // .h files default to 'c' but may be C++ — ensure cpp grammar is loaded when c is needed
     if (neededLanguages.includes('c') && !neededLanguages.includes('cpp')) {
       neededLanguages.push('cpp');
@@ -1107,12 +1178,17 @@ export class ExtractionOrchestrator {
     }
 
     async function requestParse(filePath: string, content: string): Promise<ExtractionResult> {
+      // Resolve the language on the main thread (where the project's
+      // codegraph.json overrides are loaded) and hand it to the worker, so the
+      // worker never needs the override map itself.
+      const language = detectLanguage(filePath, content, overrides);
+
       if (!WorkerClass) {
         // In-process fallback
         return extractFromSource(
           filePath,
           content,
-          detectLanguage(filePath, content),
+          language,
           frameworkNames
         );
       }
@@ -1144,7 +1220,7 @@ export class ExtractionOrchestrator {
         }, timeoutMs);
 
         pendingParses.set(id, { resolve, reject, timer });
-        worker.postMessage({ type: 'parse', id, filePath, content, frameworkNames });
+        worker.postMessage({ type: 'parse', id, filePath, content, frameworkNames, language });
       });
     }
 
@@ -1169,7 +1245,10 @@ export class ExtractionOrchestrator {
       const fileContents = await Promise.all(
         batch.map(async (fp) => {
           try {
-            const fullPath = validatePathWithinRoot(this.rootDir, fp);
+            // Indexing read: follow in-root symlinks the directory walk already
+            // descended into (the `../` guard still applies) so files reached
+            // via an in-root symlink-to-outside still index (#935).
+            const fullPath = validatePathWithinRoot(this.rootDir, fp, { allowSymlinkEscape: true });
             if (!fullPath) {
               logWarn('Path traversal blocked in batch reader', { filePath: fp });
               return { filePath: fp, content: null as string | null, stats: null as fs.Stats | null, error: new Error('Path traversal blocked') };
@@ -1258,7 +1337,7 @@ export class ExtractionOrchestrator {
 
         // Store in database on main thread (SQLite is not thread-safe)
         if (result.nodes.length > 0 || result.errors.length === 0) {
-          const language = detectLanguage(filePath, content);
+          const language = detectLanguage(filePath, content, overrides);
           this.storeExtractionResult(filePath, content, language, stats, result);
         }
 
@@ -1279,7 +1358,7 @@ export class ExtractionOrchestrator {
           // Files with no symbols but no errors (yaml, twig, properties) are
           // tracked at the file level — count them as indexed so the CLI
           // doesn't misleadingly report "No files found to index".
-          const lang = detectLanguage(filePath, content);
+          const lang = detectLanguage(filePath, content, overrides);
           if (isFileLevelOnlyLanguage(lang)) {
             filesIndexed++;
           } else {
@@ -1339,7 +1418,7 @@ export class ExtractionOrchestrator {
         }
 
         if (result.nodes.length > 0 || result.errors.length === 0) {
-          const language = detectLanguage(filePath, content);
+          const language = detectLanguage(filePath, content, overrides);
           const stats = await fsp.stat(path.join(this.rootDir, filePath));
           this.storeExtractionResult(filePath, content, language, stats, result);
 
@@ -1390,7 +1469,7 @@ export class ExtractionOrchestrator {
           }
 
           if (result.nodes.length > 0 || result.errors.length === 0) {
-            const language = detectLanguage(filePath, fullContent);
+            const language = detectLanguage(filePath, fullContent, overrides);
             const stats = await fsp.stat(path.join(this.rootDir, filePath));
             this.storeExtractionResult(filePath, fullContent, language, stats, result);
 
@@ -1475,7 +1554,8 @@ export class ExtractionOrchestrator {
    * Index a single file
    */
   async indexFile(relativePath: string): Promise<ExtractionResult> {
-    const fullPath = validatePathWithinRoot(this.rootDir, relativePath);
+    // Indexing read: follow in-root symlinks (the `../` guard still applies), #935.
+    const fullPath = validatePathWithinRoot(this.rootDir, relativePath, { allowSymlinkEscape: true });
 
     if (!fullPath) {
       return {
@@ -1522,8 +1602,8 @@ export class ExtractionOrchestrator {
     content: string,
     stats: fs.Stats
   ): Promise<ExtractionResult> {
-    // Prevent path traversal
-    const fullPath = validatePathWithinRoot(this.rootDir, relativePath);
+    // Prevent `../` traversal; follow in-root symlinks like the directory walk (#935).
+    const fullPath = validatePathWithinRoot(this.rootDir, relativePath, { allowSymlinkEscape: true });
     if (!fullPath) {
       logWarn('Path traversal blocked in indexFileWithContent', { relativePath });
       return {
@@ -1553,8 +1633,8 @@ export class ExtractionOrchestrator {
       };
     }
 
-    // Detect language
-    const language = detectLanguage(relativePath, content);
+    // Detect language (honoring the project's codegraph.json extension overrides)
+    const language = detectLanguage(relativePath, content, loadExtensionOverrides(this.rootDir));
     if (!isLanguageSupported(language)) {
       return {
         nodes: [],
@@ -1597,6 +1677,26 @@ export class ExtractionOrchestrator {
       return; // No changes
     }
 
+    // Snapshot incoming cross-file edges BEFORE deleting this file's nodes.
+    // `deleteFile` cascades to delete every edge whose source OR target is a
+    // node in this file (edges.FK ... ON DELETE CASCADE). Edges whose SOURCE is
+    // in this file are re-emitted by the extractor below, but edges whose SOURCE
+    // is in a *different* (unchanged) file are not — they would be silently
+    // dropped, which is issue #899: re-indexing a callee file severs `calls`/
+    // `references` edges from callers that import it via module-attribute
+    // access (`pkg.mod.fn(...)`).
+    //
+    // We snapshot the edge plus the target node's (name, kind) so we can
+    // re-resolve to the re-indexed target's NEW id. Node ids are
+    // `sha256(filePath:kind:name:line)`, so any line shift in the callee file
+    // (e.g. a docstring-only edit above the symbol) changes every target id and
+    // a naive re-insert by old id would silently drop every edge. Matching by
+    // (filePath, kind, name) is stable across line shifts; if the symbol was
+    // renamed/removed, no match is found and the edge stays dropped (correct).
+    const crossFileIncomingEdges = existingFile
+      ? this.queries.getCrossFileIncomingEdgesWithTarget(filePath)
+      : [];
+
     // Delete existing data for this file
     if (existingFile) {
       this.queries.deleteFile(filePath);
@@ -1620,6 +1720,32 @@ export class ExtractionOrchestrator {
       );
       if (validEdges.length > 0) {
         this.queries.insertEdges(validEdges);
+      }
+    }
+
+    // Re-insert cross-file incoming edges snapshotted before the delete,
+    // re-resolving each edge's target to the re-indexed node's new id by
+    // (filePath, kind, name). Node ids include the source line, so any line
+    // shift in the callee file (e.g. a docstring-only edit above the symbol)
+    // changes every target id and a naive re-insert by old id would drop them
+    // all. `insertEdges` still filters to endpoints that exist, so edges whose
+    // caller (source) was deleted, or whose callee (target) was renamed/removed
+    // during the re-index (no match in `newTargetIds`), are dropped. This
+    // closes the #899 edge-drop on `sync`.
+    if (crossFileIncomingEdges.length > 0) {
+      const newNodesByKindName = new Map<string, string>();
+      for (const n of validNodes) {
+        newNodesByKindName.set(`${n.kind}\0${n.name}`, n.id);
+      }
+      const reinserted: Edge[] = [];
+      for (const e of crossFileIncomingEdges) {
+        const newTargetId = newNodesByKindName.get(`${e.targetKind}\0${e.targetName}`);
+        if (newTargetId) {
+          reinserted.push({ source: e.source, target: newTargetId, kind: e.kind, metadata: e.metadata, line: e.line, column: e.column, provenance: e.provenance });
+        }
+      }
+      if (reinserted.length > 0) {
+        this.queries.insertEdges(reinserted);
       }
     }
 
@@ -1686,7 +1812,7 @@ export class ExtractionOrchestrator {
     // whether or not the project uses git, and crucially also catches committed
     // changes from `git pull`/`checkout`/`merge`/`rebase` — which `git status`
     // cannot see, because the working tree is clean afterward.
-    const currentFiles = scanDirectory(this.rootDir);
+    const currentFiles = await scanDirectoryAsync(this.rootDir);
     filesChecked = currentFiles.length;
     const currentSet = new Set(currentFiles);
 
@@ -1699,15 +1825,27 @@ export class ExtractionOrchestrator {
     // Removals: tracked in the DB but no longer a present source file. Check the
     // filesystem directly — `scanDirectory` (via `git ls-files`) still lists a
     // file deleted from disk but not yet staged, so set membership alone misses it.
+    // `reconcileChecks` drives the cooperative yield shared with the adds/mods loop
+    // below (see SYNC_RECONCILE_YIELD_INTERVAL / issue #905).
+    let reconcileChecks = 0;
     for (const tracked of trackedFiles) {
       if (!currentSet.has(tracked.path) || !fs.existsSync(path.join(this.rootDir, tracked.path))) {
         this.queries.deleteFile(tracked.path);
         filesRemoved++;
       }
+      if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
     }
 
     // Adds / modifications.
     for (const filePath of currentFiles) {
+      // Same cooperative yield as the removals loop — this is the other O(files)
+      // synchronous-stat loop that wedges the main thread on a large repo (#905).
+      // Yield at the top of the body so the `continue` fast-paths below still hit it.
+      if (++reconcileChecks % SYNC_RECONCILE_YIELD_INTERVAL === 0) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
       const fullPath = path.join(this.rootDir, filePath);
       const tracked = trackedMap.get(filePath);
 
@@ -1751,7 +1889,8 @@ export class ExtractionOrchestrator {
 
     // Load only grammars needed for changed files
     if (filesToIndex.length > 0) {
-      const neededLanguages = [...new Set(filesToIndex.map((f) => detectLanguage(f)))];
+      const overrides = loadExtensionOverrides(this.rootDir);
+      const neededLanguages = [...new Set(filesToIndex.map((f) => detectLanguage(f, undefined, overrides)))];
       // .h files default to 'c' but may be C++ — ensure cpp grammar is loaded
       if (neededLanguages.includes('c') && !neededLanguages.includes('cpp')) {
         neededLanguages.push('cpp');

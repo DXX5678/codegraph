@@ -26,7 +26,7 @@
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
-import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot } from '../directory';
+import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload } from '../directory';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
@@ -1014,6 +1014,104 @@ program
     } catch (err) {
       error(`Explore failed: ${err instanceof Error ? err.message : String(err)}`);
       process.exit(1);
+    }
+  });
+
+/**
+ * codegraph prompt-hook  (hidden)
+ *
+ * A Claude Code `UserPromptSubmit` hook entry point. Reads `{prompt, cwd}` JSON
+ * on stdin; for a structural/flow/impact prompt it runs `codegraph_explore` on
+ * the indexed project and prints the result to stdout, which Claude injects into
+ * the agent's context — so the agent's reflex grep/read has nothing left to find
+ * and reliably uses CodeGraph (the adoption problem). Installed by the installer
+ * into Claude's settings.json (opt-in, default-yes).
+ *
+ * LOAD-BEARING: this must NEVER break the user's prompt. Every failure path —
+ * kill-switch, non-structural prompt, no index, engine error — exits 0 with no
+ * output. The only effect is additive context when it can confidently provide it.
+ */
+program
+  .command('prompt-hook', { hidden: true })
+  .description('Claude UserPromptSubmit hook: inject CodeGraph context for structural prompts (reads {prompt,cwd} JSON on stdin)')
+  .action(async () => {
+    try {
+      // Kill-switch: lets a user disable the nudge without uninstalling /
+      // editing settings.json (CI, low-power machines, personal preference).
+      if (process.env.CODEGRAPH_NO_PROMPT_HOOK === '1' || process.env.CODEGRAPH_PROMPT_HOOK === '0') return;
+      if (process.stdin.isTTY) return; // invoked by hand, no piped payload
+
+      const raw = await new Promise<string>((resolve) => {
+        let data = '';
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', (c) => { data += c; });
+        process.stdin.on('end', () => resolve(data));
+        process.stdin.on('error', () => resolve(data));
+      });
+
+      let input: { prompt?: string; cwd?: string } = {};
+      try { input = JSON.parse(raw); } catch { return; }
+      const prompt = String(input.prompt || '');
+
+      // Gate: only structural / flow / impact / where-how prompts get context.
+      // A cheap regex keeps every other prompt ("fix this typo") a zero-cost
+      // no-op so we never add latency where there's no structural answer to give.
+      const STRUCTURAL = /\b(how|where|trace|flow|path|reach(?:es|ed)?|call(?:s|ed|er|ers|ee)?|depend|impact|affect|wired?|connect|implement|architect|structure|breaks?|what calls|why does)\b/i;
+      if (!prompt || !STRUCTURAL.test(prompt)) return;
+
+      // Decide what to inject, shaped by WHERE the index(es) are: the nearest
+      // indexed ancestor of cwd, or — when cwd is an un-indexed workspace root
+      // whose indexed project(s) live in sub-dirs (the monorepo case, #964) —
+      // the sub-project the prompt points at, plus a `projectPath` nudge for any
+      // others. Without the down-scan the hook injected nothing at a monorepo
+      // root (it only walked up), so the validated adoption lever never fired
+      // exactly where the agent most needs it.
+      const plan = planFrontload(String(input.cwd || process.cwd()), prompt);
+      if (!plan.exploreRoot && plan.nudgeProjects.length === 0) return; // nothing reachable — the agent's normal tools apply
+
+      // A "pass projectPath" line for indexed sub-projects we did NOT front-load.
+      // Follow-up codegraph_explore calls against a sub-project (cwd isn't its
+      // index root) need an explicit projectPath, so spell it out.
+      const nudge = (projects: string[], lead: string): string =>
+        `${lead}\n${projects.map((p) => `  - projectPath: "${p}"`).join('\n')}\n`;
+
+      if (plan.exploreRoot) {
+        const { default: CodeGraph } = await loadCodeGraph();
+        const cg = await CodeGraph.open(plan.exploreRoot);
+        try {
+          const { ToolHandler } = await import('../mcp/tools');
+          const handler = new ToolHandler(cg);
+          const result = await handler.execute('codegraph_explore', { query: prompt });
+          const text = result.content[0]?.text ?? '';
+          if (!result.isError && text.trim()) {
+            // Cap the injection so a large-repo explore can't flood the prompt.
+            const MAX = 16000;
+            const body = text.length > MAX ? `${text.slice(0, MAX)}\n…(truncated; call codegraph_explore for the rest)` : text;
+            // For a front-loaded SUB-project, a follow-up explore needs its path.
+            const more = plan.viaSubScan
+              ? `call codegraph_explore with projectPath: "${plan.exploreRoot}" for more`
+              : 'call codegraph_explore for more';
+            const others = plan.nudgeProjects.length
+              ? `\n${nudge(plan.nudgeProjects, 'Other indexed projects in this workspace — pass projectPath to query them:')}`
+              : '';
+            process.stdout.write(
+              `<codegraph_context note="Structural context from CodeGraph for this prompt — treat returned source as already read; ${more}.">\n${body}${others}\n</codegraph_context>\n`,
+            );
+          }
+        } finally {
+          cg.destroy();
+        }
+      } else {
+        // Several indexed sub-projects, none a clear match — don't guess; tell
+        // the agent they exist and how to query one.
+        process.stdout.write(
+          `<codegraph_context note="CodeGraph is available for this workspace's indexed sub-projects — query one by passing projectPath to codegraph_explore.">\n` +
+          nudge(plan.nudgeProjects, "This workspace's CodeGraph indexes live in sub-projects. To use CodeGraph, call codegraph_explore with the projectPath of the relevant one:") +
+          `</codegraph_context>\n`,
+        );
+      }
+    } catch {
+      // Degradable by contract: never surface an error to the prompt pipeline.
     }
   });
 
