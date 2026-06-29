@@ -5,6 +5,7 @@
  */
 
 import type CodeGraph from '../index';
+import type { QueryPool } from './query-pool';
 import { findNearestCodeGraphRoot } from '../directory';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
@@ -337,6 +338,12 @@ function numberSourceLines(slice: string, firstLineNumber: number): string {
  * (`reasoning/reasoner.ts`) both key off to cut on whole file sections.
  */
 const FILE_SECTION_PREFIX = '**`';
+// Placeholder for codegraph_explore's "Found N symbols across M files." line.
+// The honest N/M can only be known after the final truncation drops trailing
+// sections (#1046), so the header is emitted as this sentinel and substituted
+// at the very end. This bracketed token never occurs in rendered source or a
+// file path, so the final string-replace can't collide.
+const SUMMARY_SENTINEL = '[[codegraph-explore-summary]]';
 function fileSectionHeader(filePath: string, suffix: string): string {
   return suffix
     ? `${FILE_SECTION_PREFIX}${filePath}\`** — ${suffix}`
@@ -413,6 +420,34 @@ export interface ToolDefinition {
     properties: Record<string, PropertySchema>;
     required?: string[];
   };
+  /** Behavioral hints for clients (see {@link ToolAnnotations}). */
+  annotations?: ToolAnnotations;
+}
+
+/**
+ * MCP ToolAnnotations — behavioral hints a client MAY use to decide how, or
+ * whether, to run a tool (introduced in the 2025-03-26 spec, carried in
+ * 2025-06-18). They are advisory and never to be trusted for security, but
+ * clients gate on them: Cursor's Ask mode, for one, refuses any MCP tool that
+ * doesn't advertise `readOnlyHint: true` (issue #1018).
+ *
+ * The field is purely additive — a client that predates annotations ignores it
+ * — so codegraph advertises these even though `initialize` still negotiates the
+ * 2024-11-05 protocol version.
+ *
+ * https://modelcontextprotocol.io/specification/2025-06-18/schema#toolannotations
+ */
+export interface ToolAnnotations {
+  /** Human-readable title for the tool. */
+  title?: string;
+  /** If true, the tool does not modify its environment. Default (unset): false. */
+  readOnlyHint?: boolean;
+  /** Meaningful only when NOT read-only: may the tool perform destructive updates? */
+  destructiveHint?: boolean;
+  /** If true, repeat calls with the same arguments have no additional effect. */
+  idempotentHint?: boolean;
+  /** If true, the tool interacts with an open world of external entities. */
+  openWorldHint?: boolean;
 }
 
 interface PropertySchema {
@@ -439,6 +474,24 @@ export interface ToolResult {
 const projectPathProperty: PropertySchema = {
   type: 'string',
   description: 'Absolute path to the project to query (or any directory inside it) — codegraph uses the nearest .codegraph/ index at or above that path. Omit to use this session\'s default project. Pass it to query a second codebase, or when the server root has no index of its own (e.g. a monorepo where only sub-projects are indexed, so there is no default project).',
+};
+
+/**
+ * EVERY codegraph tool is query-only: it reads the pre-built index and never
+ * mutates the workspace (indexing is the user's explicit CLI call, never the
+ * agent's). Advertising this read-only contract lets clients that gate on it run
+ * the tools where a possibly-mutating tool would be blocked — most concretely,
+ * Cursor's Ask mode, which rejects any MCP tool lacking `readOnlyHint: true`
+ * (issue #1018). `idempotentHint`: a repeated query has no additional effect.
+ * `openWorldHint: false`: the domain is the closed local index, not an open
+ * external world. Shared so the contract is declared once; a hypothetical
+ * mutating tool would simply not reference it.
+ */
+const READ_ONLY_ANNOTATIONS: ToolAnnotations = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
 };
 
 /**
@@ -475,6 +528,7 @@ export const tools: ToolDefinition[] = [
       },
       required: ['query'],
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
   {
     name: 'codegraph_callers',
@@ -499,6 +553,7 @@ export const tools: ToolDefinition[] = [
       },
       required: ['symbol'],
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
   {
     name: 'codegraph_callees',
@@ -523,6 +578,7 @@ export const tools: ToolDefinition[] = [
       },
       required: ['symbol'],
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
   {
     name: 'codegraph_impact',
@@ -547,6 +603,7 @@ export const tools: ToolDefinition[] = [
       },
       required: ['symbol'],
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
   {
     name: 'codegraph_node',
@@ -588,6 +645,7 @@ export const tools: ToolDefinition[] = [
       },
       required: [],
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
   {
     name: 'codegraph_explore',
@@ -608,6 +666,7 @@ export const tools: ToolDefinition[] = [
       },
       required: ['query'],
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
   {
     name: 'codegraph_status',
@@ -618,6 +677,7 @@ export const tools: ToolDefinition[] = [
         projectPath: projectPathProperty,
       },
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
   {
     name: 'codegraph_files',
@@ -651,8 +711,39 @@ export const tools: ToolDefinition[] = [
         projectPath: projectPathProperty,
       },
     },
+    annotations: READ_ONLY_ANNOTATIONS,
   },
 ];
+
+/**
+ * Return `defs` with `projectPath` marked `required` in each tool's inputSchema.
+ *
+ * Used for the NO-DEFAULT-PROJECT tool surface (issue #993): when the MCP server
+ * has no default project to fall back to — a gateway server started outside any
+ * repo, or a monorepo root whose `.codegraph/` indexes live only in sub-projects
+ * — every call MUST carry an explicit `projectPath`, so the schema should say so.
+ * A `required` field is a HIGH-salience channel (MCP clients surface and often
+ * validate it), unlike the instructions text the reporter found too weak to stop
+ * the agent omitting the param. When a default project IS open, callers leave
+ * projectPath optional and never call this.
+ *
+ * Pure: clones each tool's schema rather than mutating the shared module-level
+ * `tools` array (reused by every session and the static surface). A tool that
+ * doesn't expose projectPath, or already requires it, is returned untouched;
+ * explore's `['query']` becomes `['query', 'projectPath']`, and a tool with no
+ * `required` list (status/files) gains `['projectPath']`.
+ */
+function withRequiredProjectPath(defs: ToolDefinition[]): ToolDefinition[] {
+  return defs.map((tool) => {
+    if (!tool.inputSchema.properties.projectPath) return tool;
+    const required = tool.inputSchema.required ?? [];
+    if (required.includes('projectPath')) return tool;
+    return {
+      ...tool,
+      inputSchema: { ...tool.inputSchema, required: [...required, 'projectPath'] },
+    };
+  });
+}
 
 /**
  * Allowlist-filtered tool definitions WITHOUT an engine — the static surface the
@@ -710,8 +801,23 @@ export class ToolHandler {
   // huge repo can't hang the first call (#905); cleared on first await so
   // subsequent calls don't pay any cost.
   private catchUpGate: Promise<void> | null = null;
+  // Optional worker-thread pool for off-loop read-tool dispatch (daemon mode).
+  // When set + healthy, the heavy read tools run on a worker so the daemon's
+  // main loop stays free for the MCP transport under concurrent load. Null in
+  // direct/in-process mode (one client, no concurrency to parallelize).
+  private queryPool: QueryPool | null = null;
 
   constructor(private cg: CodeGraph | null) {}
+
+  /**
+   * Engine-only: attach (or detach with null) the worker-thread query pool. The
+   * shared daemon sets this once its default project is open; the workers each
+   * hold their own WAL read connection and run {@link executeReadTool}. A
+   * worker's own ToolHandler never has a pool, so there is no nested off-loading.
+   */
+  setQueryPool(pool: QueryPool | null): void {
+    this.queryPool = pool;
+  }
 
   /**
    * Update the default CodeGraph instance (e.g. after lazy initialization)
@@ -819,7 +925,17 @@ export class ToolHandler {
     let visible = allow
       ? tools.filter(t => allow.has(t.name.replace(/^codegraph_/, '')))
       : tools.filter(t => DEFAULT_MCP_TOOLS.has(t.name.replace(/^codegraph_/, '')));
-    if (!this.cg) return visible;
+    // No default project loaded → no-root-index case (#993): a gateway server
+    // started outside any repo, or a monorepo root whose indexes live in
+    // sub-projects. With nothing to fall back to, EVERY call needs an explicit
+    // projectPath, so mark it required in the schema — a high-salience nudge the
+    // agent acts on, where SERVER_INSTRUCTIONS_NO_ROOT_INDEX's prose alone
+    // wasn't enough (the reporter had to add an AGENTS.md note). `this.cg` is
+    // settled by `retryInitIfNeeded()` before `handleToolsList` calls us, so a
+    // null here means "genuinely no default", not a startup race. When a default
+    // IS open we leave projectPath optional (below): a bare call falls back to
+    // it, exactly as in the common single-project launch.
+    if (!this.cg) return withRequiredProjectPath(visible);
 
     try {
       const stats = this.cg.getStats();
@@ -1244,36 +1360,27 @@ export class ToolHandler {
         if (typeof check === 'object' && check !== undefined) return check;
       }
 
-      // Read tools resolve through a single result variable so cross-cutting
-      // notices — worktree-index mismatch (issue #155) and per-file
-      // staleness (issue #403) — can be applied in one place. status embeds
-      // its own verbose worktree warning but still flows through the
-      // staleness wrapper so its pending-files section stays consistent
-      // with what the read tools surface.
-      let result: ToolResult;
-      switch (toolName) {
-        case 'codegraph_search':
-          result = await this.handleSearch(args); break;
-        case 'codegraph_callers':
-          result = await this.handleCallers(args); break;
-        case 'codegraph_callees':
-          result = await this.handleCallees(args); break;
-        case 'codegraph_impact':
-          result = await this.handleImpact(args); break;
-        case 'codegraph_explore':
-          result = await this.handleExplore(args); break;
-        case 'codegraph_node':
-          result = await this.handleNode(args); break;
-        case 'codegraph_status':
-          // status embeds the pending-files list as a first-class section
-          // (see handleStatus), so we skip the auto-banner wrapper here to
-          // avoid duplicating the same info at the top of the response.
-          return await this.handleStatus(args);
-        case 'codegraph_files':
-          result = await this.handleFiles(args); break;
-        default:
-          return this.errorResult(`Unknown tool: ${toolName}`);
+      // codegraph_status reports watcher state (pending files, degraded mode,
+      // worktree warning) and embeds its own sections — it must run on the MAIN
+      // thread against the watched default instance, so it is NEVER off-loaded to
+      // a worker (whose read connection has no watcher). It also skips the
+      // auto-banner wrapper to avoid duplicating its own pending-files section.
+      if (toolName === 'codegraph_status') {
+        return await this.handleStatus(args);
       }
+
+      // Read tools: off-load the CPU-heavy dispatch to the worker pool when one
+      // is attached and healthy (daemon mode), so the daemon's single event loop
+      // stays free for the MCP transport under concurrent load — otherwise N
+      // concurrent explores serialize AND starve the transport until the whole
+      // batch drains (clients then time out). With no pool (direct mode) or a
+      // degraded one, dispatch runs in-process exactly as before. Either way the
+      // result flows through the cross-cutting notices — worktree-index mismatch
+      // (#155) and per-file staleness (#403) — which need the watched MAIN
+      // instance and so are always applied here, never in the worker.
+      const result = (this.queryPool && this.queryPool.healthy)
+        ? await this.queryPool.run(toolName, args)
+        : await this.executeReadTool(toolName, args);
       const withWorktree = this.withWorktreeNotice(result, args.projectPath as string | undefined);
       return this.withStalenessNotice(withWorktree, args.projectPath as string | undefined);
     } catch (err) {
@@ -1292,6 +1399,56 @@ export class ToolHandler {
         'This is an internal codegraph error — retry the call once; if it persists, ' +
         'continue without codegraph for this task.'
       );
+    }
+  }
+
+  /**
+   * Run a single read tool to completion and return its raw {@link ToolResult},
+   * classifying expected failures the same way {@link execute}'s catch does so
+   * the SHAPE is identical whether dispatch runs in-process or on a worker:
+   * NotIndexed → success-shaped guidance, PathRefusal → clean error, anything
+   * else → internal-error-with-retry. Never throws.
+   *
+   * This is the worker thread's entry point (see {@link ./query-worker}) and the
+   * in-process fallback for {@link execute}. It deliberately does NOT run the
+   * catch-up gate or the staleness/worktree notices — those need the daemon's
+   * watched main instance and stay on the main thread. Cross-cutting allowlist +
+   * path validation already ran in {@link execute} before routing here.
+   */
+  async executeReadTool(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+    try {
+      return await this.dispatchTool(toolName, args);
+    } catch (err) {
+      if (err instanceof NotIndexedError) {
+        return this.textResult(err.message);
+      }
+      if (err instanceof PathRefusalError) {
+        return this.errorResult(err.message);
+      }
+      return this.errorResult(
+        `Tool execution failed: ${err instanceof Error ? err.message : String(err)}. ` +
+        'This is an internal codegraph error — retry the call once; if it persists, ' +
+        'continue without codegraph for this task.'
+      );
+    }
+  }
+
+  /**
+   * Pure dispatch over the read tools — the switch, with no gate, no notices, no
+   * allowlist/validation (the caller owns those). `codegraph_status` is handled
+   * on the main thread in {@link execute} and never reaches here. May throw
+   * NotIndexed/PathRefusal, which {@link executeReadTool} classifies.
+   */
+  private async dispatchTool(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
+    switch (toolName) {
+      case 'codegraph_search': return await this.handleSearch(args);
+      case 'codegraph_callers': return await this.handleCallers(args);
+      case 'codegraph_callees': return await this.handleCallees(args);
+      case 'codegraph_impact': return await this.handleImpact(args);
+      case 'codegraph_explore': return await this.handleExplore(args);
+      case 'codegraph_node': return await this.handleNode(args);
+      case 'codegraph_files': return await this.handleFiles(args);
+      default: return this.errorResult(`Unknown tool: ${toolName}`);
     }
   }
 
@@ -2682,9 +2839,16 @@ export class ToolHandler {
     const lines: string[] = [
       `**Exploration: ${query}**`,
       '',
-      `Found ${subgraph.nodes.size} symbols across ${fileGroups.size} files.`,
+      // Curated summary — filled in after the source loop (see below). We do NOT
+      // report `subgraph.nodes.size` / `fileGroups.size` here: that's the raw
+      // candidate gather, which a broad natural-language query inflates wildly
+      // (260 symbols / 124 files on a 636-file repo) even though only a handful
+      // render. Reporting the pool read as "260 results to wade through" when the
+      // real, correctly-ranked answer is the few files below (#1046).
+      '',
       '',
     ];
+    const summaryLineIdx = 2;
 
     // Blast radius (always-on, compact): for the entry symbols, who depends on
     // them + which tests cover them — locations only, no source — so the agent
@@ -2792,6 +2956,9 @@ export class ToolHandler {
 
     let totalChars = lines.join('\n').length;
     let filesIncluded = 0;
+    // Paths we actually render source for below. Drives the curated header count
+    // (#1046) — it must reflect what we show, not the raw candidate gather.
+    const renderedFilePaths: string[] = [];
     let anyFileTrimmed = false;
 
     for (const [filePath, group] of sortedFiles) {
@@ -2931,6 +3098,7 @@ export class ToolHandler {
             : 'skeleton (signatures only — codegraph_explore a name for its full body; do NOT Read)';
           lines.push(fileSectionHeader(filePath, `${names} · ${tag}`), '', '```' + lang, skel.join('\n'), '```', '');
           totalChars += skel.join('\n').length + 120;
+          renderedFilePaths.push(filePath);
           filesIncluded++;
           continue;
         }
@@ -2981,6 +3149,7 @@ export class ToolHandler {
         }
         lines.push(wholeHeader, '', '```' + lang, wholeSection, '```', '');
         totalChars += wholeSection.length + 200;
+        renderedFilePaths.push(filePath);
         filesIncluded++;
         continue;
       }
@@ -3265,8 +3434,15 @@ export class ToolHandler {
       lines.push('');
 
       totalChars += fileSection.length + 200;
+      renderedFilePaths.push(filePath);
       filesIncluded++;
     }
+
+    // The curated header count is computed from the files that SURVIVE the final
+    // truncation (see end of method) — `filesIncluded` can over-count when the
+    // hard ceiling drops trailing sections — so leave a sentinel here and fill it
+    // in once the output is final.
+    lines[summaryLineIdx] = SUMMARY_SENTINEL;
 
     // Add remaining files as references (from both relevant and peripheral files).
     // Small projects (per budget) skip this — the relevant story already fits
@@ -3326,6 +3502,7 @@ export class ToolHandler {
     const output = flow.text + lines.join('\n');
 
     const hardCeiling = Math.min(Math.round(budget.maxOutputChars * 1.5), 25000);
+    let finalText: string;
     if (output.length > hardCeiling) {
       // Cut at a FILE-SECTION boundary (the last ``**` `` file header before the
       // ceiling) so we drop whole trailing file-sections rather than slicing
@@ -3336,9 +3513,33 @@ export class ToolHandler {
       const lastSection = cut.lastIndexOf('\n' + FILE_SECTION_PREFIX);
       const boundary = lastSection > hardCeiling * 0.5 ? lastSection : cut.lastIndexOf('\n');
       const safe = boundary > 0 ? cut.slice(0, boundary) : cut;
-      return this.textResult(safe + '\n\n... (output truncated to budget; the source above is complete and verbatim — treat it as already Read. For any area not covered, run another codegraph_explore with the specific names — do NOT Read these files.)');
+      finalText = safe + '\n\n... (output truncated to budget; the source above is complete and verbatim — treat it as already Read. For any area not covered, run another codegraph_explore with the specific names — do NOT Read these files.)';
+    } else {
+      finalText = output;
     }
-    return this.textResult(output);
+
+    // Curated header (#1046): substitute the sentinel with the count of files
+    // whose source SURVIVES in the final text — not `subgraph`/`fileGroups` (the
+    // raw gather a broad query inflates) and not `filesIncluded` (which can
+    // over-count when the ceiling above drops trailing sections). A file counts
+    // only if its section header is still present; its relevant (non-import)
+    // symbols are summed for N. Files we couldn't fit are still named under "Not
+    // shown above" + the budget note, so nothing is silently dropped.
+    const survivors = renderedFilePaths.filter((fp) =>
+      finalText.includes(`${FILE_SECTION_PREFIX}${fp}\``));
+    const shownSymbols = survivors.reduce((sum, fp) => {
+      const g = fileGroups.get(fp);
+      if (!g) return sum;
+      return sum + new Set(
+        g.nodes.filter((n) => n.kind !== 'import' && n.kind !== 'export').map((n) => n.id),
+      ).size;
+    }, 0);
+    const summaryLine = survivors.length > 0
+      ? `Found ${shownSymbols} symbol${shownSymbols === 1 ? '' : 's'} across ${survivors.length} file${survivors.length === 1 ? '' : 's'}.`
+      : `Found ${subgraph.nodes.size} symbol${subgraph.nodes.size === 1 ? '' : 's'} across ${fileGroups.size} file${fileGroups.size === 1 ? '' : 's'}.`;
+    finalText = finalText.replace(SUMMARY_SENTINEL, summaryLine);
+
+    return this.textResult(finalText);
   }
 
   /**

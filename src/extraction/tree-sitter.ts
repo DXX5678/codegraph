@@ -21,6 +21,7 @@ import { FN_REF_SPECS, captureFnRefCandidates, type FnRefSpec, type FnRefCandida
 import { isGeneratedFile } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
+import { stripCppTemplateArgs } from './languages/c-cpp';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -986,32 +987,46 @@ export class TreeSitterExtractor {
       this.scanFnRefSubtree(node, 0);
       skipChildren = true; // extractVariable handles children
     }
-    // Swift stored properties inside a type. Swift instance properties aren't
-    // extracted as their own nodes, but a property's PROPERTY WRAPPER
-    // (`@Argument`/`@Published`/`@State`/custom) and declared type ARE
-    // dependencies — attribute them to the enclosing type so the wrapper/type
-    // files get dependents. Don't skipChildren: an initializer's calls still
-    // matter. (Other languages extract properties via property/field types.)
+    // Swift properties inside a type. A stored instance property becomes a `field`
+    // node; a `static let`/`static var` member becomes `constant`/`variable`
+    // (Swift's `static`-namespacing idiom — value-reference edges can then target
+    // it); a COMPUTED property (getter block, no stored value) becomes a `property`
+    // node whose getter is walked below so its calls attribute to it. A property's
+    // PROPERTY WRAPPER (`@Argument`/`@Published`/`@State`/custom) and declared type
+    // are dependencies attributed to the enclosing type. (Other languages extract
+    // properties via property/field types.)
     else if (
       this.language === 'swift' &&
-      nodeType === 'property_declaration' &&
+      (nodeType === 'property_declaration' || nodeType === 'protocol_property_declaration') &&
       this.isInsideClassLikeNode()
     ) {
       const ownerId = this.nodeStack[this.nodeStack.length - 1];
-      // A `static let`/`static var` member is a SHARED constant of the type
-      // (Swift's `static`-namespacing idiom, esp. in `enum`/`struct`) — extract
-      // it as `constant`/`variable` so value-reference edges can target it. An
-      // instance stored property stays a `field` (per-instance; Swift instance
-      // properties otherwise aren't own nodes — that's unchanged). A *computed*
-      // property (getter, no stored value) is never a constant — skip the node.
       const { nameNode, isLet, isComputed } = swiftPropertyInfo(node, this.source);
-      if (nameNode && !isComputed) {
-        const isStatic = this.extractor.isStatic?.(node) ?? false;
-        this.createNode(isStatic ? (isLet ? 'constant' : 'variable') : 'field',
-          getNodeText(nameNode, this.source), node, {
+      let computedPropId: string | undefined;
+      if (nameNode) {
+        if (isComputed) {
+          // Computed property — accessed like a property but its getter holds real
+          // logic. Index as `property` so search/explore find it (#1020: computed
+          // props such as a heavily-read `var isCloudProxy: Bool` returned "No
+          // results found"); pushed below so the getter's calls attribute to it
+          // rather than flattening onto the owning type (SwiftUI `var body: some
+          // View { … }` — the whole subview tree — is the canonical case).
+          const prop = this.createNode('property', getNodeText(nameNode, this.source), node, {
             visibility: this.extractor.getVisibility?.(node),
-            isStatic,
+            isStatic: this.extractor.isStatic?.(node) ?? false,
           });
+          computedPropId = prop?.id;
+        } else {
+          // A `static let`/`static var` member is a SHARED constant of the type
+          // (esp. in `enum`/`struct`); an instance stored property stays a `field`
+          // (per-instance — Swift instance properties otherwise aren't own nodes).
+          const isStatic = this.extractor.isStatic?.(node) ?? false;
+          this.createNode(isStatic ? (isLet ? 'constant' : 'variable') : 'field',
+            getNodeText(nameNode, this.source), node, {
+              visibility: this.extractor.getVisibility?.(node),
+              isStatic,
+            });
+        }
       }
       if (ownerId) {
         this.extractDecoratorsFor(node, ownerId);
@@ -1035,6 +1050,23 @@ export class TreeSitterExtractor {
           };
           walkAttrArgs(modifiers);
         }
+      }
+      // A computed property's getter holds real logic — walk it with the property
+      // node pushed so its calls/instantiations attribute to the property (a
+      // SwiftUI `body`'s subview tree becomes the property's callees). skipChildren
+      // then stops the generic walker from re-walking the getter (and the
+      // modifiers/type annotation already handled above).
+      if (computedPropId) {
+        const getter = node.namedChildren.find(
+          (c: SyntaxNode) =>
+            c.type === 'computed_property' || c.type === 'protocol_property_requirements',
+        );
+        if (getter) {
+          this.nodeStack.push(computedPropId);
+          this.visitFunctionBody(getter, '');
+          this.nodeStack.pop();
+        }
+        skipChildren = true;
       }
     }
     // `export_statement` itself is not extracted — the walker descends
@@ -3851,6 +3883,47 @@ export class TreeSitterExtractor {
   }
 
   /**
+   * Is this C++ `declaration` a stack/direct-initialization object construction
+   * that invokes a constructor — `Calculator calc(0)` (direct-init) or
+   * `Widget w{1, 2}` (brace-init) — as opposed to a plain variable or a
+   * function declaration? Used to emit an `instantiates` edge for the
+   * call-less construction syntax (#1035); heap `new T(...)` is handled
+   * separately by INSTANTIATION_KINDS.
+   *
+   * Two signals, both required:
+   *  - the `type` field is a class-like NAMED type (`type_identifier`,
+   *    `template_type`, or `qualified_identifier`). Primitives (`int x(0)`),
+   *    `auto` (`placeholder_type_specifier` — that form always carries a real
+   *    `call_expression`, already handled), and sized specifiers are excluded —
+   *    they construct no class; and
+   *  - a declarator carries constructor arguments: an `init_declarator` whose
+   *    `value` is an `argument_list` (`(args)`) or `initializer_list` (`{args}`).
+   *    This skips default construction `Calculator c;` (no value) and the
+   *    most-vexing-parse `Calculator c();` (a bodyless `function_declarator`,
+   *    a function decl — not a construction).
+   */
+  private isCppStackConstruction(node: SyntaxNode): boolean {
+    const typeNode = getChildByField(node, 'type');
+    if (
+      !typeNode ||
+      (typeNode.type !== 'type_identifier' &&
+        typeNode.type !== 'template_type' &&
+        typeNode.type !== 'qualified_identifier')
+    ) {
+      return false;
+    }
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (child?.type !== 'init_declarator') continue;
+      const value = getChildByField(child, 'value');
+      if (value && (value.type === 'argument_list' || value.type === 'initializer_list')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Static-member / value-read pass. A type/enum/class used only via a member
    * VALUE — `Enum.value`, `Type.CONST`, `Colors.red`, `Foo::BAR` — recorded no
    * edge, because the body walker only handled CALLS (`Type.method()`). So a
@@ -4227,6 +4300,19 @@ export class TreeSitterExtractor {
         }
       }
 
+      // C++ stack / direct-initialization construction — `Calculator calc(0)`
+      // and `Widget w{1, 2}`. Unlike heap `new Calculator(0)` (a new_expression
+      // handled above), these carry the constructor arguments directly on the
+      // declarator with NO call/new node, so the body walker saw no constructor
+      // invocation and recorded no `instantiates` edge (#1035). A declaration's
+      // `type` field IS the constructed class name, so reuse extractInstantiation
+      // (which strips template args / namespace and emits the `instantiates`
+      // ref). Children still recurse below, so a nested ctor-arg call
+      // (`Calculator calc(make())`) keeps its own `calls` ref.
+      if (nodeType === 'declaration' && this.language === 'cpp' && this.isCppStackConstruction(node)) {
+        this.extractInstantiation(node);
+      }
+
       // Static-member / value-read: `Enum.value`, `Type.CONST`, `Foo::BAR`.
       this.extractStaticMemberRef(node);
 
@@ -4424,7 +4510,11 @@ export class TreeSitterExtractor {
 
       // C++ base classes: `class Derived : public Base, private Other` →
       // base_class_clause holds access specifiers + base type(s). Emit an extends
-      // ref per base type (skip the public/private/protected keywords).
+      // ref per base type (skip the public/private/protected keywords). A
+      // templated base (`Base<int>`, `ns::Tpl<int>`) arrives as a `template_type`
+      // or a `qualified_identifier` wrapping one; strip the `<…>` args so the ref
+      // matches the bare class the template was defined as — `Base`, `ns::Tpl` —
+      // instead of never resolving (#1043).
       if (child.type === 'base_class_clause') {
         for (const t of child.namedChildren) {
           if (
@@ -4434,7 +4524,7 @@ export class TreeSitterExtractor {
           ) {
             this.unresolvedReferences.push({
               fromNodeId: classId,
-              referenceName: getNodeText(t, this.source),
+              referenceName: stripCppTemplateArgs(getNodeText(t, this.source)),
               referenceKind: 'extends',
               line: t.startPosition.row + 1,
               column: t.startPosition.column,
