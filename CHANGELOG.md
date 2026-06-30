@@ -10,6 +10,19 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 
+## [1.1.5] - 2026-06-30
+
+### Fixes
+
+- C++ classes annotated with an export or visibility macro are now indexed as real classes. This is the `class MYMODULE_API UMyComponent : public UActorComponent` style used throughout Unreal Engine — where an `XXX_API` macro sits between `class`/`struct` and the type name — as well as the equivalent `*_EXPORT` / `*_ABI` macros common in Qt, Boost, LLVM, and many other libraries. Previously that macro made the parser misread the whole declaration as a function, so the class was dropped entirely: it never appeared in the graph and its base class went unrecorded, which made "find subclasses", type-hierarchy, and impact-through-inheritance queries come back empty for effectively every gameplay class in an Unreal Engine project. The class, its members, and its inheritance link are now all captured. Thanks @luoyxy for the detailed report and proposed fix. (#1061)
+- `codegraph_explore` now surfaces the options/config type behind a function when you ask, in plain language, what to change to add a parameter to it. A question like "what do I need to change to add a new parameter to X" shares no words with the file that actually defines X's options — for example a functional-options struct and its `With…` builders living in a separate `options.go`, reachable only through X's signature — so that file scored near-zero on every text and connectivity signal and got dropped: explore returned X itself but not the file you'd edit, and the agent fell back to grep. Explore now follows a named function's parameter and return types and pulls in the file that defines them when ranking would otherwise bury it, so the options/config file shows up with its fields. Well-connected types that already rank are left untouched, so ordinary "how does X work" flow questions are unchanged. (The separate tools `codegraph_search`/`codegraph_impact`/`codegraph_node` remain available via `CODEGRAPH_MCP_TOOLS` for anyone who prefers driving each step explicitly.) Thanks @wauxhall for the detailed investigation. (#1064)
+
+## [1.1.4] - 2026-06-29
+
+### Fixes
+
+- CodeGraph again respects `.gitignore` for nested repositories that git tracks as gitlinks. The recent change that taught CodeGraph to descend into nested repos recorded as `160000` "commit" pointers (#1031, #1033) did so even when your `.gitignore` excludes the directory those repos live in — so a gitignored reference or benchmark corpus full of cloned repositories got pulled into the index anyway. One project with a gitignored `benchmark/repos/` of 19 cloned repos saw over 138,000 files swept in and a 4.8 GiB graph, and a full index then stalled in the "Resolving refs" phase until the watchdog killed it. CodeGraph now treats a gitignored gitlink the same as any other gitignored embedded repo: excluded by default, and re-included only when you opt the directory in with `codegraph.json` `includeIgnored`. Nested repos in non-ignored locations — the case #1031/#1033 fixed — are unchanged. Thanks @AriaShishegaran for the detailed report. (#1065)
+
 ## [1.1.3] - 2026-06-29
 
 ### Fixes
@@ -506,3 +519,5 @@ Thanks @andreinknv for the substantive draft this release was based on.
 [1.1.1]: https://github.com/colbymchenry/codegraph/releases/tag/v1.1.1
 [1.1.2]: https://github.com/colbymchenry/codegraph/releases/tag/v1.1.2
 [1.1.3]: https://github.com/colbymchenry/codegraph/releases/tag/v1.1.3
+[1.1.4]: https://github.com/colbymchenry/codegraph/releases/tag/v1.1.4
+[1.1.5]: https://github.com/colbymchenry/codegraph/releases/tag/v1.1.5
