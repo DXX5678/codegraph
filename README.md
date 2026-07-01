@@ -4,7 +4,7 @@
 
 ## 🎉 1.0 Released!
 
-Already installed? Run `codegraph upgrade` to update in place.
+Already installed? Run `codegraph upgrade`
 
 Follow [@getcodegraph](https://x.com/getcodegraph) on X for updates.
 
