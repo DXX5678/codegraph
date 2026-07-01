@@ -10,12 +10,20 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 
+## [1.1.6] - 2026-06-30
+
+### Fixes
+
+- The standalone installer (`install.sh`) no longer leaves old versions piling up on disk. Each upgrade installed the new release into its own directory and re-pointed the launcher at it, but never removed the previous ones — so on macOS and Linux a full vendored Node runtime (tens of MB per version) accumulated with every update. The installer now keeps only the version it just installed and removes the older ones automatically (the npm installer's download-fallback cache prunes the same way). Windows installs already replaced a single directory in place, so they were never affected. Anything still left behind under `~/.codegraph/versions` from earlier upgrades is safe to delete. Thanks @lalanbv for the report. (#1074)
+- `codegraph index` can now rebuild an existing oversized index from an older version, instead of hanging until the watchdog kills it. The previous fix (#1065) stopped *new* indexes from sweeping in a gitignored corpus of nested repos, but a project that had already built the multi-gigabyte graph before upgrading couldn't recover: `codegraph index` is meant to rebuild from scratch, yet it cleared the old graph by deleting every row one at a time, and on a graph of well over a million symbols that took longer than the 60-second responsiveness watchdog allows — so the command was killed before indexing even started, leaving the bad index in place. A full re-index now discards the old database outright and starts fresh, which is near-instant regardless of the old size and also frees the disk the bloated database was holding. Thanks @AriaShishegaran for the detailed follow-up report. (#1067)
+
 ## [1.1.5] - 2026-06-30
 
 ### Fixes
 
 - C++ classes annotated with an export or visibility macro are now indexed as real classes. This is the `class MYMODULE_API UMyComponent : public UActorComponent` style used throughout Unreal Engine — where an `XXX_API` macro sits between `class`/`struct` and the type name — as well as the equivalent `*_EXPORT` / `*_ABI` macros common in Qt, Boost, LLVM, and many other libraries. Previously that macro made the parser misread the whole declaration as a function, so the class was dropped entirely: it never appeared in the graph and its base class went unrecorded, which made "find subclasses", type-hierarchy, and impact-through-inheritance queries come back empty for effectively every gameplay class in an Unreal Engine project. The class, its members, and its inheritance link are now all captured. Thanks @luoyxy for the detailed report and proposed fix. (#1061)
 - `codegraph_explore` now surfaces the options/config type behind a function when you ask, in plain language, what to change to add a parameter to it. A question like "what do I need to change to add a new parameter to X" shares no words with the file that actually defines X's options — for example a functional-options struct and its `With…` builders living in a separate `options.go`, reachable only through X's signature — so that file scored near-zero on every text and connectivity signal and got dropped: explore returned X itself but not the file you'd edit, and the agent fell back to grep. Explore now follows a named function's parameter and return types and pulls in the file that defines them when ranking would otherwise bury it, so the options/config file shows up with its fields. Well-connected types that already rank are left untouched, so ordinary "how does X work" flow questions are unchanged. (The separate tools `codegraph_search`/`codegraph_impact`/`codegraph_node` remain available via `CODEGRAPH_MCP_TOOLS` for anyone who prefers driving each step explicitly.) Thanks @wauxhall for the detailed investigation. (#1064)
+- The standalone installers (`install.sh` / `install.ps1`) now warn when a different `codegraph` earlier on your PATH will run instead of the one they just installed. The usual cause is a leftover `npm i -g @colbymchenry/codegraph` from an earlier version, whose launcher keeps running its own pinned version — so the installer reports installing the latest while `codegraph --version` keeps printing the old one, with no hint as to why. The installer now points at the shadowing copy and tells you how to resolve it (remove the other install, or put the new one first on PATH). Thanks @SpringYear for the report. (#1071)
 
 ## [1.1.4] - 2026-06-29
 
@@ -521,3 +529,4 @@ Thanks @andreinknv for the substantive draft this release was based on.
 [1.1.3]: https://github.com/colbymchenry/codegraph/releases/tag/v1.1.3
 [1.1.4]: https://github.com/colbymchenry/codegraph/releases/tag/v1.1.4
 [1.1.5]: https://github.com/colbymchenry/codegraph/releases/tag/v1.1.5
+[1.1.6]: https://github.com/colbymchenry/codegraph/releases/tag/v1.1.6
