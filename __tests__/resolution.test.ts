@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { Node, UnresolvedReference } from '../src/types';
 import { ReferenceResolver, createResolver, ResolutionContext } from '../src/resolution';
-import { matchReference, resolveMethodOnType, matchByQualifiedName, preferCallSiteFile } from '../src/resolution/name-matcher';
+import { matchReference, resolveMethodOnType, matchByQualifiedName, preferCallSiteFile, matchMethodCall } from '../src/resolution/name-matcher';
 import { resolveImportPath, extractImportMappings, resolveJvmImport, loadCppIncludeDirs, clearCppIncludeDirCache, isPhpIncludePathRef } from '../src/resolution/import-resolver';
 import type { UnresolvedRef } from '../src/resolution/types';
 import { detectFrameworks, getAllFrameworkResolvers } from '../src/resolution/frameworks';
@@ -81,6 +81,96 @@ describe('Resolution Module', () => {
       expect(result).not.toBeNull();
       expect(result?.targetNodeId).toBe('func:test.ts:myFunction:10');
       expect(result?.resolvedBy).toBe('exact-match');
+    });
+
+    it('should resolve Erlang -behaviour refs only to module namespaces', () => {
+      // On emqx, `-behaviour(supervisor)` (OTP behaviour, not in the repo)
+      // fell through to bare-name matching and resolved to a
+      // `-define(supervisor, ...)` macro constant in an unrelated app.
+      const macroConstant: Node = {
+        id: 'constant:apps/bridge/src/impl.erl:supervisor:61',
+        kind: 'constant',
+        name: 'supervisor',
+        qualifiedName: 'impl::supervisor',
+        filePath: 'apps/bridge/src/impl.erl',
+        language: 'erlang',
+        startLine: 61,
+        endLine: 61,
+        startColumn: 0,
+        endColumn: 0,
+        updatedAt: Date.now(),
+      };
+      const behaviourModule: Node = {
+        id: 'namespace:src/my_behaviour.erl:my_behaviour:1',
+        kind: 'namespace',
+        name: 'my_behaviour',
+        qualifiedName: 'my_behaviour',
+        filePath: 'src/my_behaviour.erl',
+        language: 'erlang',
+        startLine: 1,
+        endLine: 1,
+        startColumn: 0,
+        endColumn: 0,
+        updatedAt: Date.now(),
+      };
+      const nodes = [macroConstant, behaviourModule];
+      const context: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: (name) => nodes.filter((n) => n.name === name),
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => false,
+        readFile: () => null,
+        getProjectRoot: () => '/test',
+        getAllFiles: () => [],
+        getNodesByLowerName: () => [],
+        getImportMappings: () => [],
+      };
+      const mkRef = (name: string) => ({
+        fromNodeId: 'namespace:src/worker.erl:worker:1',
+        referenceName: name,
+        referenceKind: 'implements' as const,
+        line: 2,
+        column: 0,
+        filePath: 'src/worker.erl',
+        language: 'erlang' as const,
+      });
+
+      // Out-of-repo behaviour whose name collides with a macro constant:
+      // stays unresolved instead of linking the constant.
+      expect(matchReference(mkRef('supervisor'), context)).toBeNull();
+      // In-repo behaviour module resolves to its namespace.
+      const resolved = matchReference(mkRef('my_behaviour'), context);
+      expect(resolved?.targetNodeId).toBe(behaviourModule.id);
+
+      // The same module-only rule covers refs emitted by .app/.app.src
+      // resource files: on emqx, the `ssl` OTP app dependency resolved to a
+      // test helper FUNCTION named ssl. A colliding non-module name stays
+      // unresolved; a real umbrella-sibling module resolves.
+      nodes.push({
+        id: 'function:test/ldap_SUITE.erl:ssl:12',
+        kind: 'function',
+        name: 'ssl',
+        qualifiedName: 'ldap_SUITE::ssl',
+        filePath: 'test/ldap_SUITE.erl',
+        language: 'erlang',
+        startLine: 12,
+        endLine: 14,
+        startColumn: 0,
+        endColumn: 0,
+        updatedAt: Date.now(),
+      });
+      const appRef = (name: string) => ({
+        fromNodeId: 'file:src/myapp.app.src',
+        referenceName: name,
+        referenceKind: 'imports' as const,
+        line: 6,
+        column: 0,
+        filePath: 'src/myapp.app.src',
+        language: 'erlang' as const,
+      });
+      expect(matchReference(appRef('ssl'), context)).toBeNull();
+      expect(matchReference(appRef('my_behaviour'), context)?.targetNodeId).toBe(behaviourModule.id);
     });
 
     it('should prefer same-module candidates over cross-module matches', () => {
@@ -1650,6 +1740,181 @@ func main() {
     });
   });
 
+  describe('Watchdog-safe resolution on collision-heavy repos (#1122)', () => {
+    // On a large Java-style repo, per-ref resolution cost is unbounded in the
+    // worst case (a colliding method name whose candidate set misses the LRU
+    // re-fetches tens of thousands of rows, and receiver inference re-splits
+    // the whole source file). v1.2.0 yielded only every 500 refs, so a dense
+    // pocket multiplied that cost past the #850 watchdog window and a VALID
+    // `init` was SIGKILLed at "Resolving refs". These pin the three guards:
+    // per-ref yield checkpoints, the (type, method) match memo, and the
+    // per-file lines cache with its generated/minified-line skip.
+    const methodNode = (
+      id: string,
+      filePath: string,
+      qualifiedName: string,
+      name: string,
+      language: Node['language'] = 'typescript',
+      kind: Node['kind'] = 'method',
+    ): Node => ({
+      id, kind, name, qualifiedName, filePath, language,
+      startLine: 1, endLine: 1, startColumn: 0, endColumn: 0, updatedAt: 0,
+    });
+
+    it('resolveMethodOnType consults the method-match memo and still disambiguates per call site', () => {
+      const logA = methodNode('m:a', 'a/svc.ts', 'Logger::log', 'log');
+      const logB = methodNode('m:b', 'b/svc.ts', 'Logger::log', 'log');
+      const shared = [logA, logB]; // one cached array served to every caller
+      let memoCalls = 0;
+      let rawNameLookups = 0;
+      const ctx: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: () => { rawNameLookups++; return shared; },
+        getMethodMatches: () => { memoCalls++; return shared; },
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => false,
+        readFile: () => null,
+        getProjectRoot: () => '',
+        getAllFiles: () => [],
+      };
+      const refFrom = (filePath: string): UnresolvedRef => ({
+        fromNodeId: 'caller', referenceName: 'lg.log', referenceKind: 'calls',
+        line: 2, column: 0, filePath, language: 'typescript',
+      });
+
+      // Both call sites read the SAME memoized array, yet each still resolves
+      // to its own file — per-ref disambiguation runs after the memo (#1079).
+      const fromA = resolveMethodOnType('Logger', 'log', refFrom('a/svc.ts'), ctx, 0.9, 'instance-method');
+      const fromB = resolveMethodOnType('Logger', 'log', refFrom('b/svc.ts'), ctx, 0.9, 'instance-method');
+      expect(fromA?.targetNodeId).toBe('m:a');
+      expect(fromB?.targetNodeId).toBe('m:b');
+      expect(memoCalls).toBe(2);
+      expect(rawNameLookups).toBe(0); // memo bypasses the unbounded name fetch
+    });
+
+    it('the production resolver context memoizes method matches per (language, type, method)', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'svc.ts'),
+        `class Logger { log() { return 1; } }\nexport function use() { const lg = new Logger(); return lg.log(); }\n`,
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const resolver = (cg as unknown as { resolver: ReferenceResolver }).resolver;
+      const ctx = (resolver as unknown as { context: ResolutionContext }).context;
+
+      const first = ctx.getMethodMatches!('Logger', 'log', 'typescript');
+      const second = ctx.getMethodMatches!('Logger', 'log', 'typescript');
+      expect(first.map((n) => n.qualifiedName)).toEqual(['Logger::log']);
+      // Same array instance = served from the memo, not recomputed.
+      expect(second).toBe(first);
+
+      resolver.clearCaches();
+      const afterClear = ctx.getMethodMatches!('Logger', 'log', 'typescript');
+      expect(afterClear).not.toBe(first);
+      expect(afterClear.map((n) => n.qualifiedName)).toEqual(['Logger::log']);
+    });
+
+    it('resolveBatchYielding offers a yield checkpoint for every ref', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'a.ts'),
+        `export function fnA() { return 1; }\nexport function fnB() { return fnA(); }\nexport function fnC() { return fnB(); }\n`,
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'b.ts'),
+        `import { fnA } from './a';\nexport function fnD() { return fnA(); }\n`,
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const resolver = (cg as unknown as { resolver: ReferenceResolver }).resolver;
+
+      // `init({ index: true })` already ran resolution, so feed the batch
+      // directly — resolveBatchYielding takes it as an argument; whether each
+      // ref resolves is irrelevant to the checkpoint contract.
+      const refs: UnresolvedReference[] = ['fnA', 'fnB', 'nosuchFn', 'fnA', 'alsoMissing'].map((name, i) => ({
+        fromNodeId: `caller-${i}`,
+        referenceName: name,
+        referenceKind: 'calls',
+        line: i + 1,
+        column: 0,
+        filePath: 'a.ts',
+        language: 'typescript',
+      }));
+
+      let checkpoints = 0;
+      const countingYield = async () => { checkpoints++; };
+      const result = await (resolver as unknown as {
+        resolveBatchYielding(batch: UnresolvedReference[], maybeYield: () => Promise<void>): Promise<{ stats: { total: number } }>;
+      }).resolveBatchYielding(refs, countingYield);
+
+      // One checkpoint per ref: a pocket of pathologically slow refs can never
+      // run more than ONE ref past the yield budget before the heartbeat gets
+      // a window — the #1122 kill required 500.
+      expect(checkpoints).toBe(refs.length);
+      expect(result.stats.total).toBe(refs.length);
+    });
+
+    it('receiver inference reads lines through getFileLines when the context provides it', () => {
+      const loggerClass = methodNode('c:logger', 'svc.ts', 'Logger', 'Logger', 'typescript', 'class');
+      const logMethod = methodNode('m:log', 'svc.ts', 'Logger::log', 'log');
+      const otherLog = methodNode('m:other', 'other.ts', 'Other::log', 'log');
+      const byName: Record<string, Node[]> = {
+        Logger: [loggerClass],
+        log: [logMethod, otherLog], // ambiguous bare name → only inference can resolve
+      };
+      const lines = ['const lg = new Logger();', 'lg.log();'];
+      const ctx: ResolutionContext = {
+        getNodesInFile: () => [],
+        getNodesByName: (name) => byName[name] ?? [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => false,
+        // Reading the raw source must not be needed when lines are provided.
+        readFile: () => { throw new Error('readFile must not be called when getFileLines exists'); },
+        getFileLines: () => lines,
+        getProjectRoot: () => '',
+        getAllFiles: () => [],
+      };
+      const ref: UnresolvedRef = {
+        fromNodeId: 'caller', referenceName: 'lg.log', referenceKind: 'calls',
+        line: 2, column: 0, filePath: 'svc.ts', language: 'typescript',
+      };
+      expect(matchMethodCall(ref, ctx)?.targetNodeId).toBe('m:log');
+    });
+
+    it('receiver inference skips generated/minified lines instead of regex-scanning them', () => {
+      const loggerClass = methodNode('c:logger', 'svc.ts', 'Logger', 'Logger', 'typescript', 'class');
+      const logMethod = methodNode('m:log', 'svc.ts', 'Logger::log', 'log');
+      const otherLog = methodNode('m:other', 'other.ts', 'Other::log', 'log');
+      const byName: Record<string, Node[]> = {
+        Logger: [loggerClass],
+        log: [logMethod, otherLog],
+      };
+      const ctxWithLines = (lines: string[]): ResolutionContext => ({
+        getNodesInFile: () => [],
+        getNodesByName: (name) => byName[name] ?? [],
+        getNodesByQualifiedName: () => [],
+        getNodesByKind: () => [],
+        fileExists: () => false,
+        readFile: () => null,
+        getFileLines: () => lines,
+        getProjectRoot: () => '',
+        getAllFiles: () => [],
+      });
+      const ref: UnresolvedRef = {
+        fromNodeId: 'caller', referenceName: 'lg.log', referenceKind: 'calls',
+        line: 1, column: 0, filePath: 'svc.ts', language: 'typescript',
+      };
+
+      // Control: the declaration on a normal-length line resolves.
+      const normal = matchMethodCall(ref, ctxWithLines(['const lg = new Logger(); lg.log();']));
+      expect(normal?.targetNodeId).toBe('m:log');
+
+      // The same declaration buried in a >10K-char generated/minified line is
+      // skipped — no resolution, and no per-ref regex pass over the huge line.
+      const minified = 'var pad="' + 'x'.repeat(10_000) + '";const lg = new Logger(); lg.log();';
+      expect(matchMethodCall(ref, ctxWithLines([minified]))).toBeNull();
+    });
+  });
+
   describe('Local-variable receiver-type inference (#1108)', () => {
     // `lg.log()` where `lg` is a local whose type is inferred from its
     // declaration/initializer. Before this, only C++ resolved these; every
@@ -1734,6 +1999,133 @@ func main() {
       // Logger.new is still an instantiation of the class.
       expect(out.some((e) => e.kind === 'instantiates' && e.target === logger.id)).toBe(true);
     });
+
+    it('TypeScript: infers a typed-parameter receiver, disambiguating same-named methods (#1125)', async () => {
+      // A typed function parameter used as a receiver — `function use(lg: Logger)`
+      // — never matched the old TS/JS pattern (it required a const|let|var
+      // prefix), so `lg.log()` fell through to no edge once a second class shared
+      // the method name. Two ambiguous classes are load-bearing here: a
+      // single-class version resolves via a same-name fallback even without
+      // inference, so only the collision proves type inference actually fired.
+      fs.writeFileSync(
+        path.join(tempDir, 'svc.ts'),
+        `class Logger { log() { return 1; } }\n` +
+          `class Other { log() { return 2; } }\n` +
+          `export function use(lg: Logger) { return lg.log(); }\n` +
+          `export function useOther(o: Other) { return o.log(); }\n`,
+      );
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const classes = cg.getNodesByKind('class');
+      const logger = classes.find((n) => n.name === 'Logger')!;
+      const other = classes.find((n) => n.name === 'Other')!;
+      const logs = cg.getNodesByKind('method').filter((n) => n.name === 'log');
+      expect(logs.length, 'both log methods should be indexed').toBe(2);
+
+      // Associate each same-named `log` with its class by line containment.
+      const inClass = (m: (typeof logs)[number], c: typeof logger) =>
+        m.startLine >= c.startLine && m.startLine <= (c.endLine ?? c.startLine);
+      const loggerLog = logs.find((m) => inClass(m, logger))!;
+      const otherLog = logs.find((m) => inClass(m, other))!;
+      expect(loggerLog, "Logger's log").toBeDefined();
+      expect(otherLog, "Other's log").toBeDefined();
+
+      const loggerCallers = cg.getCallers(loggerLog.id).map((x) => x.node.name);
+      const otherCallers = cg.getCallers(otherLog.id).map((x) => x.node.name);
+
+      // Each typed-param call routes to its OWN class's method, not the other's.
+      expect(loggerCallers).toContain('use');
+      expect(loggerCallers).not.toContain('useOther');
+      expect(otherCallers).toContain('useOther');
+      expect(otherCallers).not.toContain('use');
+    });
+
+    // The same typed-parameter gap existed in every language whose pattern set
+    // only matched keyword-anchored locals (let/var/:=/= new), not the bare
+    // parameter form — Rust, Go, Dart, PHP (#1125). Each case: two classes
+    // sharing a method name + two functions taking one as a typed param; a
+    // correct fix routes each call to its OWN type's method (the collision is
+    // load-bearing — a single class resolves via the same-name fallback either
+    // way). Method↔type association is by qualifiedName, robust where the method
+    // lives outside the type's line range (Rust `impl`, Go method decl).
+    const typedParamCases: Array<{
+      lang: string; file: string; method: string; callerA: string; callerB: string; src: string;
+    }> = [
+      { lang: 'Rust (fn f(x: &T))', file: 'svc.rs', method: 'log', callerA: 'use_it', callerB: 'use_other',
+        src: `pub struct Logger { n: i32 }\nimpl Logger { pub fn log(&self) -> i32 { self.n } }\npub struct Other { n: i32 }\nimpl Other { pub fn log(&self) -> i32 { self.n } }\npub fn use_it(lg: &Logger) -> i32 { lg.log() }\npub fn use_other(o: &Other) -> i32 { o.log() }\n` },
+      { lang: 'Go (func f(x T))', file: 'svc.go', method: 'Log', callerA: 'UseIt', callerB: 'UseOther',
+        src: `package a\ntype Logger struct{}\nfunc (l Logger) Log() int { return 1 }\ntype Other struct{}\nfunc (o Other) Log() int { return 2 }\nfunc UseIt(lg Logger) int { return lg.Log() }\nfunc UseOther(o Other) int { return o.Log() }\n` },
+      { lang: 'Dart (T f(U x))', file: 'svc.dart', method: 'log', callerA: 'useIt', callerB: 'useOther',
+        src: `class Logger { int log() { return 1; } }\nclass Other { int log() { return 2; } }\nint useIt(Logger lg) { return lg.log(); }\nint useOther(Other o) { return o.log(); }\n` },
+      { lang: 'PHP (f(T $x))', file: 'svc.php', method: 'log', callerA: 'useIt', callerB: 'useOther',
+        src: `<?php\nclass Logger { function log() { return 1; } }\nclass Other { function log() { return 2; } }\nfunction useIt(Logger $lg) { return $lg->log(); }\nfunction useOther(Other $o) { return $o->log(); }\n` },
+    ];
+
+    for (const c of typedParamCases) {
+      it(`infers a typed-parameter receiver, disambiguating same-named methods — ${c.lang} (#1125)`, async () => {
+        fs.writeFileSync(path.join(tempDir, c.file), c.src);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        cg.resolveReferences();
+
+        const methods = cg.getNodesByKind('method').filter((n) => n.name === c.method);
+        expect(methods.length, `${c.lang}: both ${c.method} methods indexed`).toBe(2);
+
+        const loggerLog = methods.find((m) => /Logger/.test(m.qualifiedName ?? ''));
+        const otherLog = methods.find((m) => /Other/.test(m.qualifiedName ?? ''));
+        expect(loggerLog, `${c.lang}: Logger's ${c.method}`).toBeDefined();
+        expect(otherLog, `${c.lang}: Other's ${c.method}`).toBeDefined();
+
+        const loggerCallers = cg.getCallers(loggerLog!.id).map((x) => x.node.name);
+        const otherCallers = cg.getCallers(otherLog!.id).map((x) => x.node.name);
+
+        expect(loggerCallers, `${c.lang}: Logger callers`).toContain(c.callerA);
+        expect(loggerCallers, `${c.lang}: Logger callers`).not.toContain(c.callerB);
+        expect(otherCallers, `${c.lang}: Other callers`).toContain(c.callerB);
+        expect(otherCallers, `${c.lang}: Other callers`).not.toContain(c.callerA);
+      });
+    }
+
+    // Lua/Luau: a PascalCase method call (`lg:Log()`, the Roblox convention)
+    // is the identical `receiver:Name` shape as a Luau type annotation, so it
+    // self-matched the annotation pattern on the call's own line and inferred
+    // "type = Log" (#1124). Two things are load-bearing in these fixtures:
+    // the declaration sits on an EARLIER line than the call (on one line,
+    // pattern order resolves it — the `.new` pattern wins first), and TWO
+    // classes share the method name (a single class resolves via the
+    // same-name fallback even when inference misfires). Luau's `useLogger`
+    // takes a typed param instead of calling `.new()`, pinning that the
+    // gated pattern still matches a genuine annotation.
+    const pascalMethodCases: Array<{ lang: string; file: string; src: string }> = [
+      { lang: 'Lua', file: 'svc.lua',
+        src: `local Logger = {}\nLogger.__index = Logger\nfunction Logger.new() return setmetatable({}, Logger) end\nfunction Logger:Log() return 1 end\n\nlocal Other = {}\nOther.__index = Other\nfunction Other.new() return setmetatable({}, Other) end\nfunction Other:Log() return 2 end\n\nlocal function useLogger()\n\tlocal lg = Logger.new()\n\treturn lg:Log()\nend\n\nlocal function useOther()\n\tlocal o = Other.new()\n\treturn o:Log()\nend\n\nreturn useLogger, useOther\n` },
+      { lang: 'Luau', file: 'svc.luau',
+        src: `local Logger = {}\nLogger.__index = Logger\nfunction Logger.new() return setmetatable({}, Logger) end\nfunction Logger:Log(): number return 1 end\n\nlocal Other = {}\nOther.__index = Other\nfunction Other.new() return setmetatable({}, Other) end\nfunction Other:Log(): number return 2 end\n\nlocal function useLogger(lg: Logger): number\n\treturn lg:Log()\nend\n\nlocal function useOther(): number\n\tlocal o = Other.new()\n\treturn o:Log()\nend\n\nreturn useLogger, useOther\n` },
+    ];
+
+    for (const c of pascalMethodCases) {
+      it(`resolves a PascalCase method call without self-matching the annotation pattern — ${c.lang} (#1124)`, async () => {
+        fs.writeFileSync(path.join(tempDir, c.file), c.src);
+        cg = await CodeGraph.init(tempDir, { index: true });
+        cg.resolveReferences();
+
+        const methods = cg.getNodesByKind('method').filter((n) => n.name === 'Log');
+        expect(methods.length, `${c.lang}: both Log methods indexed`).toBe(2);
+
+        const loggerLog = methods.find((m) => /Logger/.test(m.qualifiedName ?? ''));
+        const otherLog = methods.find((m) => /Other/.test(m.qualifiedName ?? ''));
+        expect(loggerLog, `${c.lang}: Logger's Log`).toBeDefined();
+        expect(otherLog, `${c.lang}: Other's Log`).toBeDefined();
+
+        const loggerCallers = cg.getCallers(loggerLog!.id).map((x) => x.node.name);
+        const otherCallers = cg.getCallers(otherLog!.id).map((x) => x.node.name);
+
+        expect(loggerCallers, `${c.lang}: Logger callers`).toContain('useLogger');
+        expect(loggerCallers, `${c.lang}: Logger callers`).not.toContain('useOther');
+        expect(otherCallers, `${c.lang}: Other callers`).toContain('useOther');
+        expect(otherCallers, `${c.lang}: Other callers`).not.toContain('useLogger');
+      });
+    }
   });
 
   describe('Name Matcher: kind bias for new ref kinds', () => {
@@ -4005,6 +4397,201 @@ procedure Helper; var t: TTgt; begin t.Hit; end;
       // body's call must attribute to `Helper`, not the file/module — alongside the
       // method `DoStuff`.
       expect(callerNamesOf('TTgt::Hit')).toEqual(['DoStuff', 'Helper']);
+    });
+  });
+
+  describe('Nix path import resolution', () => {
+    function fileNode(filePath: string) {
+      return cg.getNodesByKind('file').find((n) => n.filePath === filePath);
+    }
+
+    function importedFilePaths(fromFile: string): string[] {
+      const source = fileNode(fromFile);
+      expect(source, `${fromFile} file node`).toBeDefined();
+      return cg
+        .getOutgoingEdges(source!.id)
+        .filter((edge) => edge.kind === 'imports')
+        .map((edge) => cg.getNodesByKind('file').find((n) => n.id === edge.target)?.filePath)
+        .filter((filePath): filePath is string => Boolean(filePath))
+        .sort();
+    }
+
+    it('resolves relative Nix imports to indexed file nodes', async () => {
+      fs.mkdirSync(path.join(tempDir, 'core'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'data'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'core', 'ports.nix'), '{ http = 80; https = 443; }');
+      fs.writeFileSync(
+        path.join(tempDir, 'data', 'postgresql.nix'),
+        `let
+  ports = import ../core/ports.nix;
+in
+{
+  port = ports.https;
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      expect(importedFilePaths('data/postgresql.nix')).toEqual(['core/ports.nix']);
+    });
+
+    it('resolves Nix directory imports through default.nix and deduplicates called imports', async () => {
+      fs.mkdirSync(path.join(tempDir, 'dir'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'dir', 'default.nix'), '{ value = 1; }');
+      fs.writeFileSync(path.join(tempDir, 'x.nix'), '{ value = 2; }');
+      fs.writeFileSync(
+        path.join(tempDir, 'main.nix'),
+        `let
+  dir = import ./dir;
+  x = import ./x.nix {};
+in
+{
+  inherit dir x;
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      expect(importedFilePaths('main.nix')).toEqual(['dir/default.nix', 'x.nix']);
+    });
+
+    it('resolves NixOS module imports lists and callPackage paths to file nodes', async () => {
+      fs.mkdirSync(path.join(tempDir, 'modules'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'common'), { recursive: true });
+      fs.mkdirSync(path.join(tempDir, 'pkgs', 'hello'), { recursive: true });
+      fs.writeFileSync(path.join(tempDir, 'modules', 'users.nix'), '{ users.users.demo.isNormalUser = true; }');
+      fs.writeFileSync(path.join(tempDir, 'common', 'default.nix'), '{ time.timeZone = "UTC"; }');
+      fs.writeFileSync(
+        path.join(tempDir, 'pkgs', 'hello', 'default.nix'),
+        '{ stdenv }: stdenv.mkDerivation { pname = "hello"; }'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'configuration.nix'),
+        `{ config, pkgs, ... }:
+{
+  imports = [ ./modules/users.nix ./common ];
+  environment.systemPackages = [ (pkgs.callPackage ./pkgs/hello { }) ];
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      expect(importedFilePaths('configuration.nix')).toEqual([
+        'common/default.nix',
+        'modules/users.nix',
+        'pkgs/hello/default.nix',
+      ]);
+    });
+
+    it('never resolves another language\'s calls into nix bindings', async () => {
+      // Nix bindings are not linkable symbols from any other language —
+      // interop is eval/CLI. Without the target-side gate, a Python script's
+      // bare `resolve(...)` exact-matches a module's `resolve = ...` binding.
+      fs.writeFileSync(
+        path.join(tempDir, 'helpers.nix'),
+        `let
+  resolve = x: x;
+in
+{
+  inherit resolve;
+}
+`
+      );
+      fs.writeFileSync(path.join(tempDir, 'tool.py'), 'def main():\n    return resolve("target")\n');
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const nixNodeIds = new Set(
+        cg.getNodesByKind('variable').filter((n) => n.language === 'nix').map((n) => n.id)
+      );
+      const pyFns = cg.getNodesByKind('function').filter((n) => n.language === 'python');
+      expect(pyFns.length).toBeGreaterThan(0);
+      const crossEdges = pyFns.flatMap((f) => cg.getOutgoingEdges(f.id)).filter((e) => nixNodeIds.has(e.target));
+      expect(crossEdges).toEqual([]);
+    });
+
+    it('never cross-links Nix calls by bare name across files (lexical scope only)', async () => {
+      // Both modules `inherit (lib) mkOption` — the nixpkgs idiom. A call to
+      // mkOption in one file must NOT resolve to the other file's inherit
+      // binding: Nix has no ambient cross-file namespace, so any such edge is
+      // wrong by construction. Same-file bindings still resolve.
+      fs.writeFileSync(
+        path.join(tempDir, 'alpha.nix'),
+        `{ lib, ... }:
+let
+  inherit (lib) mkOption;
+  mkPort = default: mkOption { inherit default; };
+in
+{
+  options.alpha.port = mkPort 8080;
+}
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'beta.nix'),
+        `{ lib, ... }:
+let
+  inherit (lib) mkOption;
+in
+{
+  options.beta.enable = mkOption { default = false; };
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const crossFileCalls = cg
+        .getNodesByKind('file')
+        .flatMap((f) => cg.getOutgoingEdges(f.id))
+        .concat(
+          cg.getNodesByKind('function').flatMap((f) => cg.getOutgoingEdges(f.id)),
+          cg.getNodesByKind('variable').flatMap((v) => cg.getOutgoingEdges(v.id))
+        )
+        .filter((e) => e.kind === 'calls')
+        .map((e) => {
+          const src = cg.getNode(e.source);
+          const tgt = cg.getNode(e.target);
+          return { from: src?.filePath, to: tgt?.filePath, name: tgt?.name };
+        });
+
+      // No calls edge may cross files by bare-name matching.
+      expect(crossFileCalls.filter((e) => e.from !== e.to)).toEqual([]);
+      // The same-file chain still resolves: mkPort's mkOption call hits
+      // alpha.nix's own inherit binding.
+      const sameFile = crossFileCalls.filter((e) => e.from === e.to && e.name === 'mkOption');
+      expect(sameFile.length).toBeGreaterThan(0);
+      expect(sameFile.every((e) => e.from === 'alpha.nix' || e.from === 'beta.nix')).toBe(true);
+    });
+
+    it('does not resolve Nix angle-bracket, attribute, or variable imports as project file edges', async () => {
+      fs.writeFileSync(path.join(tempDir, 'nixpkgs.nix'), '{ bogus = true; }');
+      fs.writeFileSync(path.join(tempDir, 'selectedPath.nix'), '{ bogus = true; }');
+      fs.writeFileSync(
+        path.join(tempDir, 'main.nix'),
+        `let
+  pkgs = import <nixpkgs> {};
+  fromSources = import sources.nixpkgs {};
+  dynamic = import selectedPath;
+in
+{
+  inherit pkgs fromSources dynamic;
+}
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      expect(importedFilePaths('main.nix')).toEqual([]);
     });
   });
 });

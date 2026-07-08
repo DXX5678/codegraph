@@ -23,10 +23,16 @@
  *   codegraph upgrade [version]  Update CodeGraph to the latest release
  */
 
+// FIRST import, before anything else loads: capture process.ppid while our
+// launcher is (almost certainly) still alive. A launcher killed mid-startup
+// otherwise blinds the PPID watchdog forever (#1185) — see early-ppid.ts.
+import '../mcp/early-ppid';
+
 import { Command } from 'commander';
 import * as path from 'path';
 import * as fs from 'fs';
 import { getCodeGraphDir, isInitialized, unsafeIndexRootReason, findNearestCodeGraphRoot, planFrontload, hasStructuralKeyword, extractCodeTokens } from '../directory';
+import { extractProseCandidates } from '../search/identifier-segments';
 import { detectWorktreeIndexMismatch, worktreeMismatchWarning } from '../sync/worktree';
 import { createShimmerProgress } from '../ui/shimmer-progress';
 import { getGlyphs } from '../ui/glyphs';
@@ -353,6 +359,14 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
       clack.log.success(`Indexed ${formatNumber(result.filesIndexed)} files`);
     }
     clack.log.info(`${formatNumber(result.nodesCreated)} nodes, ${formatNumber(result.edgesCreated)} edges in ${formatDuration(result.durationMs)}`);
+    // A PARTIAL index (files silently dropped mid-pipeline) must not pass
+    // as a clean run — it's the difference between "indexed the repo" and
+    // "indexed most of the repo, quietly". Only the completeness
+    // reconciliation warning; per-file extractor warnings stay in the
+    // error-code summary below.
+    for (const w of result.errors.filter((e) => e.code === 'index_partial')) {
+      clack.log.warn(w.message);
+    }
   } else if (hasErrors) {
     clack.log.error(`Indexing failed ${getGlyphs().dash} all ${formatNumber(result.filesErrored)} files had errors`);
   } else {
@@ -396,6 +410,82 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
       fs.unlinkSync(logPath);
     }
   }
+}
+
+/**
+ * When an `init`/`index` produced an EMPTY graph and the reason is that the
+ * project's own `.gitignore` excludes nested git repositories — the "super-repo
+ * gitignores its child repos" layout (#1156), where `init` at the parent
+ * correctly indexes ~nothing while `init` inside each child works — name those
+ * repos and offer to index them. An interactive terminal gets a yes/no prompt
+ * that writes `includeIgnored` to codegraph.json and re-indexes; a
+ * non-interactive run just prints the one-line opt-in snippet. The caller gates
+ * this on `nodesCreated === 0`, so a project that DID index real content is
+ * never nagged about the gitignored reference clones it deliberately keeps out
+ * (#970, #1065). Best-effort throughout: detection never breaks the command.
+ */
+async function offerIndexIgnoredRepos(
+  clack: typeof import('@clack/prompts'),
+  projectPath: string,
+  reindex: () => Promise<IndexResult>,
+  opts: { interactive: boolean },
+): Promise<IndexResult | undefined> {
+  let repos: string[];
+  try {
+    const { findUnindexedIgnoredRepos } = await import('../extraction');
+    repos = findUnindexedIgnoredRepos(projectPath);
+  } catch {
+    return; // detection is advisory — never let it break the command
+  }
+  if (repos.length === 0) return;
+
+  const { PROJECT_CONFIG_FILENAME } = await import('../project-config');
+  const isOne = repos.length === 1;
+  const SHOWN = 6;
+  const names = repos.slice(0, SHOWN).map((r) => r.replace(/\/$/, ''));
+  const extra = repos.length > SHOWN ? ` (+${formatNumber(repos.length - SHOWN)} more)` : '';
+  const snippet = `{ "includeIgnored": [${repos.map((p) => JSON.stringify(p)).join(', ')}] }`;
+
+  clack.log.warn(
+    `Your .gitignore excludes ${isOne ? 'a nested git repository' : `${formatNumber(repos.length)} nested git repositories`} here, ` +
+    `so ${isOne ? 'it was' : 'they were'} not indexed: ${names.join(', ')}${extra}.`,
+  );
+
+  const manualHint = () => {
+    clack.log.info(
+      `If ${isOne ? "it's" : "they're"} your code, add ${isOne ? 'it' : 'them'} to ${PROJECT_CONFIG_FILENAME} and re-index:`,
+    );
+    clack.log.info(`  ${snippet}`);
+  };
+
+  if (!opts.interactive || !process.stdin.isTTY) {
+    manualHint();
+    return;
+  }
+
+  const yes = await clack.confirm({
+    message: `Index ${isOne ? 'it' : `these ${formatNumber(repos.length)}`} now? Adds ${isOne ? 'it' : 'them'} to ${PROJECT_CONFIG_FILENAME}.`,
+    initialValue: true,
+  });
+  if (clack.isCancel(yes) || !yes) {
+    manualHint();
+    return;
+  }
+
+  let added: number;
+  try {
+    const { addIncludeIgnoredPatterns } = await import('../project-config');
+    added = addIncludeIgnoredPatterns(projectPath, repos);
+  } catch (err) {
+    clack.log.error(`Could not update ${PROJECT_CONFIG_FILENAME}: ${err instanceof Error ? err.message : String(err)}`);
+    manualHint();
+    return;
+  }
+  clack.log.success(`Added ${formatNumber(added)} ${added === 1 ? 'entry' : 'entries'} to ${PROJECT_CONFIG_FILENAME} ${getGlyphs().dash} re-indexing…`);
+
+  const result = await reindex();
+  printIndexResult(clack, result, projectPath);
+  return result;
 }
 
 /**
@@ -508,27 +598,33 @@ program
       // accepted (so existing muscle memory and scripts don't break) but is a
       // no-op — initializing always builds the initial index.
       // Supervise the index: self-terminate if orphaned or wedged (#999).
-      const supervision = installCommandSupervision('init');
-      let result: IndexResult;
-      try {
-        if (options.verbose) {
-          result = await cg.indexAll({
-            onProgress: createVerboseProgress(),
-            verbose: true,
-          });
-        } else {
+      // A closure so we can re-run the exact same supervised, progress-rendered
+      // index if the user opts gitignored child repos in below (#1156).
+      const runIndex = async (): Promise<IndexResult> => {
+        const supervision = installCommandSupervision('init');
+        try {
+          if (options.verbose) {
+            return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
+          }
           process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
           const progress = createShimmerProgress();
-          result = await cg.indexAll({
-            onProgress: progress.onProgress,
-          });
+          const r = await cg.indexAll({ onProgress: progress.onProgress });
           await progress.stop();
+          return r;
+        } finally {
+          supervision.stop();
         }
-      } finally {
-        supervision.stop();
-      }
+      };
+      const result = await runIndex();
       printIndexResult(clack, result, projectPath);
       await recordIndexTelemetry(cg, result);
+
+      // An empty graph at a git super-repo usually means `.gitignore` excludes
+      // the child repos that hold the code — surface them and offer to opt in
+      // rather than leaving the user with a silent 0-node "Done". (#1156)
+      if (result.nodesCreated === 0) {
+        await offerIndexIgnoredRepos(clack, projectPath, runIndex, { interactive: true });
+      }
 
       try {
         const { offerWatchFallback } = await import('../installer');
@@ -658,26 +754,32 @@ program
         const clack = await importESM('@clack/prompts');
         clack.intro('Indexing project');
 
-        let result: IndexResult;
-
-        if (options.verbose) {
-          result = await cg.indexAll({
-            onProgress: createVerboseProgress(),
-            verbose: true,
-          });
-        } else {
+        // A closure so a re-index (after opting gitignored child repos in, #1156)
+        // renders identically. Supervision already wraps the whole command.
+        const renderIndex = async (): Promise<IndexResult> => {
+          if (options.verbose) {
+            return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
+          }
           process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
           const progress = createShimmerProgress();
-          result = await cg.indexAll({
-            onProgress: progress.onProgress,
-          });
+          const r = await cg.indexAll({ onProgress: progress.onProgress });
           await progress.stop();
-        }
+          return r;
+        };
+
+        const result = await renderIndex();
 
         printIndexResult(clack, result, projectPath);
         await recordIndexTelemetry(cg, result);
 
-        if (!result.success) {
+        // Empty graph at a git super-repo → likely `.gitignore`d child repos;
+        // name them and offer to opt in instead of a silent 0-node result (#1156).
+        let finalResult = result;
+        if (result.nodesCreated === 0) {
+          finalResult = (await offerIndexIgnoredRepos(clack, projectPath, renderIndex, { interactive: true })) ?? result;
+        }
+
+        if (!finalResult.success) {
           process.exit(1);
         }
 
@@ -797,6 +899,10 @@ program
 
       const buildInfo = cg.getIndexBuildInfo();
       const reindexRecommended = cg.isIndexStale();
+      const indexState = cg.getIndexState();
+      // Zero on a healthy index; non-zero at rest means a resolution pass was
+      // interrupted, so some files' call edges are missing (#1187).
+      const pendingRefs = cg.getPendingReferenceCount();
 
       // JSON output mode
       if (options.json) {
@@ -828,6 +934,14 @@ program
             builtWithExtractionVersion: buildInfo.extractionVersion,
             currentExtractionVersion: EXTRACTION_VERSION,
             reindexRecommended,
+            // 'complete' | 'partial' (files silently dropped) | 'indexing'
+            // (a run was killed mid-index — the index is truncated) |
+            // 'failed' | null (predates the marker).
+            state: indexState,
+            // References awaiting resolution. Non-zero at rest means an
+            // interrupted resolution pass left edges missing; the next
+            // sync sweeps them (#1187).
+            pendingRefs,
           },
         }));
         cg.destroy();
@@ -840,6 +954,16 @@ program
       console.log(chalk.cyan('Project:'), projectPath);
       if (worktreeMismatch) {
         warn(worktreeMismatchWarning(worktreeMismatch));
+      }
+      if (indexState === 'indexing') {
+        warn('The last index run never finished (killed mid-index?) — the index is truncated. Re-run "codegraph index".');
+      } else if (indexState === 'partial') {
+        warn('The last index run silently dropped files — the index is partial. Re-run "codegraph index".');
+      } else if (indexState === 'failed') {
+        warn('The last index run failed — results may be incomplete. Re-run "codegraph index".');
+      }
+      if (pendingRefs > 0) {
+        warn(`${formatNumber(pendingRefs)} references from an interrupted run are awaiting resolution — some callers/impact edges are missing. Run "codegraph sync" to resolve them.`);
       }
       console.log();
 
@@ -1070,15 +1194,30 @@ program
       try { input = JSON.parse(raw); } catch { return; }
       const prompt = String(input.prompt || '');
 
-      // Gate: only structural / flow / impact / where-how prompts get context, so
-      // every other prompt ("fix this typo") stays a zero-cost no-op. Language-aware
-      // (English + CJK keywords, plus code-shaped tokens) so it fires for non-English
-      // prompts too (issue #994). A keyword fires on its own; a code-token is only a
-      // CANDIDATE — verified against the graph below, so a tech brand ("JavaScript")
-      // that looks like a symbol but isn't one here doesn't inject spurious context.
+      // Gate telemetry: how often each tier fires vs. no-ops — counter names
+      // only, NEVER prompt content (see TELEMETRY.md). This is the data that
+      // turns "is the gate any good" from vibes into a measured recall rate.
+      const gate = (outcome: string): void => {
+        try { getTelemetry().recordUsage('cli_command', `prompt-hook-gate-${outcome}`, true); } catch { /* never break the hook */ }
+      };
+
+      // Gate, tiered by confidence (#994, #1126):
+      //   HIGH   — a structural keyword (any covered language), or a code-shaped
+      //            token verified in the index → full explore injection.
+      //   MEDIUM — no keyword/token, but prose words match indexed symbol-name
+      //            SEGMENTS ("state machine" → OrderStateMachine, in any
+      //            language): inject a short list of the matching symbols and
+      //            let the AGENT write the explore query — the graph-derived
+      //            tier, no vocabulary involved.
+      //   silent — nothing verified. Every other prompt ("fix this typo")
+      //            stays a zero-cost no-op.
+      // Keywords fire on their own; a token or prose word is only a CANDIDATE
+      // verified against the graph below, so a tech brand ("JavaScript") that
+      // merely looks like code doesn't inject spurious context.
       const keyworded = hasStructuralKeyword(prompt);
       const codeTokens = keyworded ? [] : extractCodeTokens(prompt);
-      if (!keyworded && codeTokens.length === 0) return;
+      const proseWords = keyworded ? [] : extractProseCandidates(prompt);
+      if (!keyworded && codeTokens.length === 0 && proseWords.length === 0) { gate('noop-shape'); return; }
 
       // Decide what to inject, shaped by WHERE the index(es) are: the nearest
       // indexed ancestor of cwd, or — when cwd is an un-indexed workspace root
@@ -1088,7 +1227,7 @@ program
       // root (it only walked up), so the validated adoption lever never fired
       // exactly where the agent most needs it.
       const plan = planFrontload(String(input.cwd || process.cwd()), prompt);
-      if (!plan.exploreRoot && plan.nudgeProjects.length === 0) return; // nothing reachable — the agent's normal tools apply
+      if (!plan.exploreRoot && plan.nudgeProjects.length === 0) { gate('noop-no-index'); return; } // nothing reachable — the agent's normal tools apply
 
       // A "pass projectPath" line for indexed sub-projects we did NOT front-load.
       // Follow-up codegraph_explore calls against a sub-project (cwd isn't its
@@ -1100,31 +1239,71 @@ program
         const { default: CodeGraph } = await loadCodeGraph();
         const cg = await CodeGraph.open(plan.exploreRoot);
         try {
-          // Code-token-only prompt: require that at least one token is a REAL symbol
-          // in THIS index before front-loading. Without it, a brand name or common
-          // word that merely looks like code ("JavaScript", "GitHub") would run
-          // explore and inject ~16KB of low-relevance context (issue #994 follow-up).
-          // A keyword-bearing prompt skips this — the keyword is signal enough.
-          if (!keyworded && !codeTokens.some((t) => cg.getNodesByName(t).length > 0)) return;
-          const { ToolHandler } = await import('../mcp/tools');
-          const handler = new ToolHandler(cg);
-          const result = await handler.execute('codegraph_explore', { query: prompt });
-          const text = result.content[0]?.text ?? '';
-          if (!result.isError && text.trim()) {
-            // Cap the injection so a large-repo explore can't flood the prompt.
-            const MAX = 16000;
-            const body = text.length > MAX ? `${text.slice(0, MAX)}\n…(truncated; call codegraph_explore for the rest)` : text;
-            // For a front-loaded SUB-project, a follow-up explore needs its path.
-            const more = plan.viaSubScan
-              ? `call codegraph_explore with projectPath: "${plan.exploreRoot}" for more`
-              : 'call codegraph_explore for more';
-            const others = plan.nudgeProjects.length
-              ? `\n${nudge(plan.nudgeProjects, 'Other indexed projects in this workspace — pass projectPath to query them:')}`
-              : '';
-            process.stdout.write(
-              `<codegraph_context note="Structural context from CodeGraph for this prompt — treat returned source as already read; ${more}.">\n${body}${others}\n</codegraph_context>\n`,
-            );
+          const others = plan.nudgeProjects.length
+            ? `\n${nudge(plan.nudgeProjects, 'Other indexed projects in this workspace — pass projectPath to query them:')}`
+            : '';
+
+          // Tier decision against THIS index (issue #994 follow-up: candidates
+          // must be real here — a brand name or prose about another domain
+          // must not inject). Keyword-bearing prompts skip verification — the
+          // keyword is signal enough.
+          const tokenVerified = !keyworded && codeTokens.some((t) => cg.getNodesByName(t).length > 0);
+          if (keyworded || tokenVerified) {
+            const { ToolHandler } = await import('../mcp/tools');
+            const handler = new ToolHandler(cg);
+            const result = await handler.execute('codegraph_explore', { query: prompt });
+            const text = result.content[0]?.text ?? '';
+            if (!result.isError && text.trim()) {
+              // Cap the injection so a large-repo explore can't flood the prompt.
+              const MAX = 16000;
+              const body = text.length > MAX ? `${text.slice(0, MAX)}\n…(truncated; call codegraph_explore for the rest)` : text;
+              // For a front-loaded SUB-project, a follow-up explore needs its path.
+              const more = plan.viaSubScan
+                ? `call codegraph_explore with projectPath: "${plan.exploreRoot}" for more`
+                : 'call codegraph_explore for more';
+              process.stdout.write(
+                `<codegraph_context note="Structural context from CodeGraph for this prompt — treat returned source as already read; ${more}.">\n${body}${others}\n</codegraph_context>\n`,
+              );
+              gate(keyworded ? 'high-keyword' : 'high-token');
+            } else {
+              // A high-* outcome must mean context was actually delivered —
+              // the funnel's noop-vs-high split is how gate recall is
+              // measured (#1143). An explore error or empty result is a
+              // delivery failure, not a gate success.
+              gate(keyworded ? 'noop-explore-keyword' : 'noop-explore-token');
+            }
+            return;
           }
+
+          // MEDIUM: prose words → symbol-name segments, co-occurrence/rarity
+          // scored, each hit re-verified to exist (see getSegmentMatches). The
+          // payload names the symbols but does NOT run explore — the agent owns
+          // the query where the hook's confidence is only "these are related".
+          //
+          // A database indexed before the vocab table existed starts with it
+          // EMPTY, and only sync() backfills it — which this hook never runs
+          // (#1142). Heal it here: on a populated vocab this is one SELECT;
+          // the actual backfill is a one-time batched pass whose cost the MCP
+          // server's own catch-up sync usually pays first (it runs at every
+          // session start). A distinct noop outcome keeps a dormant vocab
+          // from polluting the noop-unverified recall signal.
+          const vocabReady = await cg.healSegmentVocabIfEmpty().catch(() => false);
+          if (!vocabReady) { gate('noop-vocab-empty'); return; }
+          const related = cg.getSegmentMatches(proseWords);
+          if (related.length === 0) { gate('noop-unverified'); return; }
+          const lines = related
+            .map((m) => `  - ${m.name} (${m.kind} — ${m.filePath}:${m.startLine})`)
+            .join('\n');
+          const exampleQuery = related.slice(0, 3).map((m) => m.name).join(' ');
+          const projectHint = plan.viaSubScan ? ` with projectPath: "${plan.exploreRoot}"` : '';
+          process.stdout.write(
+            `<codegraph_context note="CodeGraph found indexed symbols matching this prompt — query the graph before searching files.">\n` +
+            `This project's CodeGraph index contains symbols matching this request:\n${lines}\n` +
+            `Call codegraph_explore ONCE${projectHint} with the relevant names in one query (e.g. "${exampleQuery}") ` +
+            `to get their source, call paths, and blast radius — cheaper and more complete than Read/Grep.\n${others}` +
+            `</codegraph_context>\n`,
+          );
+          gate('medium-segment');
         } finally {
           cg.destroy();
         }
@@ -1136,6 +1315,7 @@ program
           nudge(plan.nudgeProjects, "This workspace's CodeGraph indexes live in sub-projects. To use CodeGraph, call codegraph_explore with the projectPath of the relevant one:") +
           `</codegraph_context>\n`,
         );
+        gate('nudge-projects');
       }
     } catch {
       // Degradable by contract: never surface an error to the prompt pipeline.

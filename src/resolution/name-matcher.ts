@@ -140,7 +140,9 @@ function pickClosestFileNode(candidates: Node[], ref: UnresolvedRef): Node {
 const LANGUAGE_FAMILY: Record<string, string> = {
   java: 'jvm', kotlin: 'jvm', scala: 'jvm',
   swift: 'apple', objc: 'apple',
-  typescript: 'web', tsx: 'web', javascript: 'web', jsx: 'web',
+  // ArkTS is a TS superset — every HarmonyOS project mixes `.ets` UI with
+  // `.ts` logic modules, so refs must cross freely between them.
+  typescript: 'web', tsx: 'web', javascript: 'web', jsx: 'web', arkts: 'web',
   c: 'c', cpp: 'c',
   // Razor/Blazor markup names C# types — same family so `@model Foo` /
   // `<MyComponent/>` resolve to their `.cs` class through the cross-family gate.
@@ -226,6 +228,7 @@ export function matchFunctionRef(
   const bareFnOnly =
     ref.language === 'typescript' || ref.language === 'tsx' ||
     ref.language === 'javascript' || ref.language === 'jsx' ||
+    ref.language === 'arkts' ||
     ref.language === 'cpp' || ref.language === 'python' ||
     ref.language === 'php';
 
@@ -409,7 +412,21 @@ export function matchByQualifiedName(
     return null;
   }
 
-  const candidates = context.getNodesByQualifiedName(ref.referenceName);
+  // A method call `receiver.method()` can share an exact qualified name with a
+  // config-file key: `service.process()` (a `calls` ref named `service.process`)
+  // vs the yaml key `service.process`. Config keys are bound to their code refs
+  // upstream by the framework resolvers (`@Value` → `references`); a `calls` ref
+  // must never resolve to a yaml/properties config node — that's a wrong edge
+  // AND it hides the real callee. Drop those from both the exact and the partial
+  // candidate sets so resolution falls through to method resolution below (#1180).
+  const keepForRef = (nodes: Node[]): Node[] =>
+    ref.referenceKind === 'calls'
+      ? nodes.filter(
+          (n) => !(n.kind === 'constant' && (n.language === 'yaml' || n.language === 'properties')),
+        )
+      : nodes;
+
+  const candidates = keepForRef(context.getNodesByQualifiedName(ref.referenceName));
 
   if (candidates.length === 1) {
     return {
@@ -441,8 +458,7 @@ export function matchByQualifiedName(
   const parts = ref.referenceName.split(/[:.]/);
   const lastName = parts[parts.length - 1];
   if (lastName) {
-    const partialCandidates = context
-      .getNodesByName(lastName)
+    const partialCandidates = keepForRef(context.getNodesByName(lastName))
       .filter((candidate) => candidate.qualifiedName.endsWith(ref.referenceName));
     const chosen = preferCallSiteFile(partialCandidates, ref.filePath)[0];
     if (chosen) {
@@ -503,15 +519,25 @@ export function resolveMethodOnType(
   // in-class (`class Foo { int bar() { ... } }`) or out-of-line in a separate
   // file (`int Foo::bar() { ... }` in foo.cpp while class Foo is in foo.hpp).
   // The previous same-file approach missed the latter — the typical C++ layout.
-  const methodCandidates = context.getNodesByName(methodName);
-  const want = `${typeName}::${methodName}`;
-  const matches: Node[] = [];
-  for (const m of methodCandidates) {
-    if (m.kind !== 'method') continue;
-    if (m.language !== ref.language) continue;
-    const qn = m.qualifiedName;
-    if (qn === want || qn.endsWith(`::${want}`)) {
-      matches.push(m);
+  // Prefer the context's per-(type, method) memo: the raw name lookup fetches
+  // EVERY node sharing the method name — tens of thousands of rows for a
+  // collision-heavy Java name like `execute` — and re-filtering that per ref
+  // was a dominant term in the #1122 watchdog kill on large repos. Only the
+  // ref-independent filter is memoized; per-ref disambiguation stays below.
+  let matches: Node[];
+  if (context.getMethodMatches) {
+    matches = context.getMethodMatches(typeName, methodName, ref.language);
+  } else {
+    const methodCandidates = context.getNodesByName(methodName);
+    const want = `${typeName}::${methodName}`;
+    matches = [];
+    for (const m of methodCandidates) {
+      if (m.kind !== 'method') continue;
+      if (m.language !== ref.language) continue;
+      const qn = m.qualifiedName;
+      if (qn === want || qn.endsWith(`::${want}`)) {
+        matches.push(m);
+      }
     }
   }
   if (matches.length === 0) {
@@ -610,10 +636,14 @@ function inferCppReceiverType(
   context: ResolutionContext,
   depth = 0,
 ): string | null {
-  const source = context.readFile(ref.filePath);
-  if (!source) return null;
+  // Per-file lines cache when available — this runs per `receiver->method()`
+  // ref and re-splitting the file each time is the same quadratic as the
+  // shared inferrer's (#1122).
+  const lines = context.getFileLines
+    ? context.getFileLines(ref.filePath)
+    : (context.readFile(ref.filePath)?.split(/\r?\n/) ?? null);
+  if (!lines || lines.length === 0) return null;
 
-  const lines = source.split(/\r?\n/);
   const callLineIndex = Math.max(0, Math.min(lines.length - 1, ref.line - 1));
   const escapedReceiver = receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const receiverPattern = new RegExp(`\\b${escapedReceiver}\\b`);
@@ -646,10 +676,12 @@ function inferCppReceiverType(
 
   for (const headerPath of headerCandidates) {
     if (!context.fileExists(headerPath)) continue;
-    const headerSource = context.readFile(headerPath);
-    if (!headerSource) continue;
+    const headerLines = context.getFileLines
+      ? context.getFileLines(headerPath)
+      : (context.readFile(headerPath)?.split(/\r?\n/) ?? null);
+    if (!headerLines) continue;
 
-    for (const line of headerSource.split(/\r?\n/)) {
+    for (const line of headerLines) {
       if (!receiverPattern.test(line)) continue;
       const declaratorMatch = line.match(declaratorRegex);
       if (!declaratorMatch) continue;
@@ -1063,9 +1095,17 @@ function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
     case 'javascript':
     case 'tsx':
     case 'jsx':
+    case 'arkts':
       return [
         new RegExp(`\\b${r}\\b\\s*=\\s*new\\s+([A-Za-z_$][\\w.$]*)`), // = new Logger()
-        new RegExp(`\\b(?:const|let|var)\\s+${r}\\s*:\\s*([A-Z][\\w.$]*)`), // lg: Logger
+        // No keyword requirement, so this matches BOTH a local annotation
+        // (`const lg: Logger`) and a typed parameter (`function use(lg: Logger)`
+        // / `(lg: Logger) =>`) — the parameter case the old `const|let|var`
+        // prefix excluded (#1125). Mirrors Kotlin/Swift/Scala; the capture stops
+        // at `<` so a generic-typed param (`repo: Repository<User>`) still yields
+        // `Repository`. resolveMethodOnType validates the type actually declares
+        // the method, so the looser match produces no edge on a mis-inference.
+        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.$]*)`), // lg: Logger  (annotation or typed param)
       ];
     case 'python':
       return [
@@ -1095,12 +1135,21 @@ function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
     case 'rust':
       return [
         new RegExp(`\\blet\\s+(?:mut\\s+)?${r}\\b(?:\\s*:[^=]+)?=\\s*&?(?:mut\\s+)?([A-Z][\\w]*)`), // let lg = Logger::new()/Logger{}/Logger
-        new RegExp(`\\blet\\s+(?:mut\\s+)?${r}\\s*:\\s*&?(?:mut\\s+)?([A-Z][\\w]*)`), // let lg: Logger
+        // No `let`, so this covers a `let lg: Logger` binding AND a typed
+        // parameter (`fn use(lg: &Logger)`, a closure `|lg: Logger|`) — the
+        // parameter case the old `let`-anchored pattern excluded (#1125).
+        new RegExp(`\\b${r}\\s*:\\s*&?(?:mut\\s+)?([A-Z][\\w]*)`), // lg: Logger  (binding or typed param)
       ];
     case 'go':
       return [
         new RegExp(`\\b${r}\\b\\s*:=\\s*&?([A-Za-z_][\\w.]*)\\s*{`), // lg := Logger{} / &Logger{}
         new RegExp(`\\bvar\\s+${r}\\s+\\*?([A-Za-z_][\\w.]*)`), // var lg Logger / *Logger
+        // A typed parameter / method receiver (`func use(lg Logger)`,
+        // `func (l Logger) M()`) — name-before-type with no `var`/`:=` (#1125).
+        // PascalCase-guarded (unlike the anchored patterns above) to keep the
+        // keyword-free `ident Type` shape from matching unrelated pairs; the
+        // enclosing-scope bound already excludes package-level struct fields.
+        new RegExp(`\\b${r}\\s+\\*?([A-Z][\\w.]*)`), // func use(lg Logger) / (l Logger)
       ];
     case 'ruby':
       return [
@@ -1114,18 +1163,35 @@ function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
     case 'dart':
       return [
         new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w.]*)\\s*\\(`), // var lg = Logger(...)
-        new RegExp(`\\b([A-Z][\\w.]*)\\s+${r}\\b\\s*[=;]`), // Logger lg = ...
+        // Trailing `[=;,)]` (not just `[=;]`) so a typed parameter — `Logger lg)`
+        // / `Logger lg,` — matches too, not only `Logger lg = ...` / `Logger lg;`
+        // (#1125). Mirrors Java/C#.
+        new RegExp(`\\b([A-Z][\\w.]*)\\s+${r}\\b\\s*[=;,)]`), // Logger lg = ...  / param
       ];
     case 'php':
       return [
         new RegExp(`\\$?${r}\\b\\s*=\\s*new\\s+([A-Za-z_\\\\][\\w\\\\]*)`), // $lg = new Logger()
+        // A typed parameter (`function use(Logger $lg)`, `?Logger $lg`,
+        // `\\App\\Logger $lg`, `&$lg` by-ref) and a typed `catch (E $e)` — the
+        // type sits before the `$`-variable (#1125). Namespace `\\` allowed.
+        new RegExp(`\\b([A-Za-z_\\\\][\\w\\\\]*)\\s+&?\\$${r}\\b`), // Logger $lg  (typed param)
       ];
     case 'lua':
     case 'luau':
       return [
         new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w]*)\\.new\\b`), // local lg = Logger.new()
         new RegExp(`\\b${r}\\b\\s*=\\s*([A-Z][\\w]*)\\s*\\(`), // local lg = Logger(...)  (callable table)
-        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.]*)`), // Luau: local lg: Logger  / typed param
+        // Luau annotation (`local lg: Logger`) / typed param — but Lua's
+        // method-call syntax is the IDENTICAL `receiver:Name` shape, and the
+        // backward scan starts on the call's own line, so without a gate any
+        // PascalCase method call (`lg:Log()`, the Roblox convention)
+        // self-matches as "type = Log" before the scan reaches the real
+        // declaration (#1124). The lookahead rejects a capture followed by
+        // any of Lua's three call forms — `(args)`, `"s"`/`'s'`/`[[s]]`,
+        // `{t}` — and its leading `[\w.]` alternative stops backtracking from
+        // shrinking the capture to dodge the gate (`lg:Log()` would otherwise
+        // still match, as `Lo`).
+        new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w.]*)(?![\\w.]|\\s*[({"'\\[])`), // local lg: Logger  / typed param
       ];
     case 'r':
       return [
@@ -1135,6 +1201,36 @@ function localReceiverTypePatterns(language: Language, r: string): RegExp[] {
       return [
         new RegExp(`\\b${r}\\b\\s*:\\s*([A-Z][\\w]*)`), // var lg: TLogger  / param lg: TLogger
         new RegExp(`\\b${r}\\b\\s*:=\\s*([A-Z][\\w.]*)\\.Create\\b`), // lg := TLogger.Create
+      ];
+    case 'cfml':
+    case 'cfscript':
+      return [
+        // svc = new UserService() / new path.to.UserService() — dotted component
+        // paths reduce to their final segment via normalizeInferredTypeName.
+        // Also matches inside tag markup (`<cfset svc = new UserService()>`)
+        // since the scan reads raw source lines.
+        new RegExp(`\\b${r}\\b\\s*=\\s*new\\s+([A-Za-z_][\\w.]*)`),
+        // The classic form: svc = createObject("component", "path.to.UserService")
+        // (casing of createObject varies in the wild), plus the modern
+        // single-argument form createObject("path.to.UserService").
+        new RegExp(`\\b${r}\\b\\s*=\\s*[Cc]reate[Oo]bject\\s*\\(\\s*["']component["']\\s*,\\s*["']([\\w.]+)["']`),
+        new RegExp(`\\b${r}\\b\\s*=\\s*[Cc]reate[Oo]bject\\s*\\(\\s*["']([\\w.]+)["']\\s*\\)`),
+        // Typed cfscript parameter: `function save(UserService svc)` /
+        // `required UserService svc` — CFML's built-in types (string, numeric,
+        // any, struct…) are lowercase by convention, so the PascalCase guard
+        // excludes them.
+        new RegExp(`\\b([A-Z][\\w.]*)\\s+${r}\\b\\s*[=;,)]`),
+        // Tag-form typed argument, either attribute order:
+        // <cfargument name="svc" type="path.to.UserService">
+        new RegExp(`\\bcfargument[^>\\n]*\\bname\\s*=\\s*["']${r}["'][^>\\n]*\\btype\\s*=\\s*["']([\\w.]+)["']`, 'i'),
+        new RegExp(`\\bcfargument[^>\\n]*\\btype\\s*=\\s*["']([\\w.]+)["'][^>\\n]*\\bname\\s*=\\s*["']${r}["']`, 'i'),
+        // Component property (incl. WireBox DI): `property name="svc"
+        // inject="UserService";` / `<cfproperty name="svc" type="UserService">`,
+        // either attribute order. An inject DSL value with a namespace
+        // (`inject="svc@core"`) captures only the leading name and simply
+        // fails type-validation — no edge, never a wrong one.
+        new RegExp(`\\b(?:cf)?property\\b[^;\\n]*\\bname\\s*=\\s*["']${r}["'][^;\\n]*\\b(?:type|inject)\\s*=\\s*["']([\\w.]+)["']`, 'i'),
+        new RegExp(`\\b(?:cf)?property\\b[^;\\n]*\\b(?:type|inject)\\s*=\\s*["']([\\w.]+)["'][^;\\n]*\\bname\\s*=\\s*["']${r}["']`, 'i'),
       ];
     default:
       return [];
@@ -1166,29 +1262,74 @@ function inferLocalReceiverType(
   ref: UnresolvedRef,
   context: ResolutionContext,
 ): string | null {
+  // CFML scope prefixes: `variables.svc` / `this.svc` name a COMPONENT-scoped
+  // field whose assignment or `property` declaration usually lives outside the
+  // calling function (the init-pseudoconstructor / WireBox-injection pattern),
+  // and `local.svc` is an explicit function-local. Strip the prefix so the
+  // declaration patterns match (`variables.svc = new X()`, `property
+  // name="svc" …`, `var svc = …` all bind the bare name), and widen the scan
+  // to the whole file for the component-scoped forms — nearest-declaration-
+  // backward still wins, so a function-local shadowing the field is preferred.
+  let scanReceiver = receiverName;
+  let componentScoped = false;
+  if (ref.language === 'cfml' || ref.language === 'cfscript') {
+    const scoped = receiverName.match(/^(variables|this|local|arguments)\.(.+)$/i);
+    if (scoped) {
+      scanReceiver = scoped[2]!;
+      const scope = scoped[1]!.toLowerCase();
+      componentScoped = scope === 'variables' || scope === 'this';
+    }
+  }
+
   const patterns = localReceiverTypePatterns(
     ref.language,
-    receiverName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+    scanReceiver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
   );
   if (patterns.length === 0) return null;
 
-  const source = context.readFile(ref.filePath);
-  if (!source) return null;
+  // Split through the context's per-file lines cache when available: this runs
+  // for EVERY `receiver.method()` ref, and re-splitting the whole file per ref
+  // was ~20% of total index CPU on Java-heavy repos (#1122).
+  const lines = context.getFileLines
+    ? context.getFileLines(ref.filePath)
+    : (context.readFile(ref.filePath)?.split(/\r?\n/) ?? null);
+  if (!lines || lines.length === 0) return null;
 
-  const lines = source.split(/\r?\n/);
   const callIdx = Math.max(0, Math.min(lines.length - 1, ref.line - 1));
-  const startIdx = Math.max(0, enclosingScopeStartLine(ref, context) - 1);
+  const startIdx = componentScoped
+    ? 0
+    : Math.max(0, enclosingScopeStartLine(ref, context) - 1);
 
-  // Nearest declaration wins: scan backward from the call to the scope start.
-  for (let i = callIdx; i >= startIdx; i--) {
+  const matchLine = (i: number): string | null => {
     const line = lines[i];
-    if (!line) continue;
+    if (!line) return null;
+    // A generated/minified line (one multi-KB statement) is not something a
+    // human-written local declaration lives on, and regexing it per ref is
+    // pure waste — skip it rather than scan it.
+    if (line.length > 10_000) return null;
     for (const re of patterns) {
       const m = line.match(re);
       if (m && m[1]) {
         const type = normalizeInferredTypeName(m[1]);
         if (type) return type;
       }
+    }
+    return null;
+  };
+
+  // Nearest declaration wins: scan backward from the call to the scope start.
+  for (let i = callIdx; i >= startIdx; i--) {
+    const type = matchLine(i);
+    if (type) return type;
+  }
+  // A component-scoped field's declaration is position-independent — the
+  // `variables.svc = new X()` pseudoconstructor assignment or `property`
+  // declaration may sit BELOW the calling function in the file — so when the
+  // backward pass finds nothing, sweep the remainder of the file too.
+  if (componentScoped) {
+    for (let i = callIdx + 1; i < lines.length; i++) {
+      const type = matchLine(i);
+      if (type) return type;
     }
   }
   return null;
@@ -1618,6 +1759,9 @@ export function matchFuzzy(
 /**
  * Match all strategies in order of confidence
  */
+/** ArkUI attribute-helper decorators a `.attr(...)` chain may resolve to. */
+const ARKUI_ATTRIBUTE_DECORATORS = new Set(['Extend', 'Styles', 'AnimatableExtend', 'Builder']);
+
 export function matchReference(
   ref: UnresolvedRef,
   context: ResolutionContext
@@ -1627,6 +1771,63 @@ export function matchReference(
   // worse than none).
   if (ref.referenceKind === 'function_ref') {
     return matchFunctionRef(ref, context);
+  }
+
+  // ArkTS chained UI attributes — emitted with a leading dot (`.titleStyle`,
+  // `.width`) by the extractor — resolve ONLY to decorator-marked attribute
+  // helpers: `@Extend`/`@Styles`/`@AnimatableExtend` functions (and global
+  // `@Builder`s used attribute-position). Framework attributes (`.width`,
+  // `.fontSize` — on nearly every UI line) match no such helper and stay
+  // unresolved, NEVER falling through to bare-name matching: on a samples
+  // monorepo that fallthrough manufactured 36k wrong edges, giving single
+  // same-named properties thousands of false callers. Ambiguity rule matches
+  // the rest of the file: several same-named helpers → prefer the call-site
+  // file, still ambiguous → drop the ref rather than guess.
+  if (ref.language === 'arkts' && ref.referenceName.startsWith('.')) {
+    const base = ref.referenceName.slice(1);
+    const candidates = context
+      .getNodesByName(base)
+      .filter(
+        (n) =>
+          n.language === 'arkts' &&
+          n.kind === 'function' &&
+          (n.decorators ?? []).some((d) => ARKUI_ATTRIBUTE_DECORATORS.has(d))
+      );
+    const chosen =
+      candidates.length > 1 ? preferCallSiteFile(candidates, ref.filePath) : candidates;
+    if (chosen.length !== 1) return null;
+    return {
+      original: ref,
+      targetNodeId: chosen[0]!.id,
+      confidence: 0.85,
+      resolvedBy: 'exact-match',
+    };
+  }
+
+  // Erlang `-behaviour(m)` refs target a MODULE. Letting them fall through to
+  // bare-name matching grabs any same-named symbol — on emqx,
+  // `-behaviour(supervisor)` resolved to a `-define(supervisor, …)` macro
+  // constant in an unrelated app. Resolve only to the behaviour module's
+  // namespace; an out-of-repo behaviour (OTP's gen_server/supervisor) stays
+  // unresolved rather than guessed. The same module-only rule applies to every
+  // ref an `.app`/`.app.src` resource file emits — its `{mod, …}` callback and
+  // `{applications, …}` dependency names can only mean modules, and on emqx
+  // the `ssl` OTP app otherwise resolved to a test helper FUNCTION named ssl.
+  if (
+    ref.language === 'erlang' &&
+    (ref.referenceKind === 'implements' || /\.app(?:\.src)?$/i.test(ref.filePath))
+  ) {
+    const modules = context
+      .getNodesByName(ref.referenceName)
+      .filter((n) => n.language === 'erlang' && n.kind === 'namespace');
+    const chosen = preferCallSiteFile(modules, ref.filePath)[0];
+    if (!chosen) return null;
+    return {
+      original: ref,
+      targetNodeId: chosen.id,
+      confidence: 0.9,
+      resolvedBy: 'exact-match',
+    };
   }
 
   // Try strategies in order of confidence
