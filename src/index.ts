@@ -485,23 +485,33 @@ export class CodeGraph {
           // receiver conforms to (protocol-extension / inherited / default-
           // interface). Needs the implements/extends edges the main pass just
           // built, so it runs after resolution (#750).
+          const tChained = Date.now();
           await this.resolver.resolveChainedCallsViaConformance();
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[synth-timing] chainedConformance: ${Date.now() - tChained}ms`);
           // Same lifecycle for `this.<member>` callback registrations whose
           // member is inherited from a supertype (#808).
+          const tDeferred = Date.now();
           await this.resolver.resolveDeferredThisMemberRefs();
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[synth-timing] deferredThisMember: ${Date.now() - tDeferred}ms`);
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
-        // Cheap and non-blocking; never load-bearing for correctness.
+        // Off-thread (worker connection): on a multi-GB index this is minutes
+        // of IO, and inline it starved the #850 watchdog AFTER a fully
+        // successful index. Never load-bearing for correctness.
         if (result.success && result.filesIndexed > 0) {
-          this.db.runMaintenance();
+          const tMaint = Date.now();
+          await this.db.runMaintenance();
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] maintenance: ${Date.now() - tMaint}ms`);
         }
 
         // The orchestrator only sees extraction-phase counts; resolution and
         // synthesizer edges (often >50% of the graph on JVM repos) come later.
         // Recompute against the DB so the CLI summary reports the true totals.
         if (result.success && result.filesIndexed > 0) {
+          const tCount = Date.now();
           const after = this.queries.getNodeAndEdgeCount();
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] count-recompute: ${Date.now() - tCount}ms`);
           result.nodesCreated = after.nodes - before.nodes;
           result.edgesCreated = after.edges - before.edges;
         }
@@ -612,7 +622,9 @@ export class CodeGraph {
         if (filesChanged) {
           if (result.changedFilePaths) {
             // Scope resolution to changed files (git fast path — bounded set)
+            const tRefLoad = Date.now();
             const unresolvedRefs = this.queries.getUnresolvedReferencesByFiles(result.changedFilePaths);
+            if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-ref-load: ${Date.now() - tRefLoad}ms (${unresolvedRefs.length} refs)`);
 
             options.onProgress?.({
               phase: 'resolving',
@@ -687,8 +699,9 @@ export class CodeGraph {
         }
 
         // Refresh planner stats + checkpoint the WAL after bulk writes.
+        // Off-thread — see indexAll's call site.
         if (filesChanged || result.filesRemoved > 0 || orphanCount > 0) {
-          this.db.runMaintenance();
+          await this.db.runMaintenance();
         }
 
         // Heal the segment vocabulary on indexes built before the table

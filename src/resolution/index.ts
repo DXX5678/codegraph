@@ -329,6 +329,30 @@ export class ReferenceResolver {
   }
 
   /**
+   * warmCaches for the async resolution entry points: streams the distinct
+   * name set with periodic yields instead of one synchronous `.all()`. On a
+   * multi-million-node index the DISTINCT scan is a solid multi-second block
+   * (measured up to 28s inside `codegraph sync` on the Linux kernel index),
+   * long enough to matter to the #850 watchdog on slower hardware. Same
+   * result, same memory — only the event loop keeps turning.
+   */
+  async warmCachesYielding(onYield: MaybeYield): Promise<void> {
+    if (this.cachesWarmed) return;
+
+    this.knownFiles = new Set(this.queries.getAllFilePaths());
+
+    const names = new Set<string>();
+    let scanned = 0;
+    for (const name of this.queries.iterateNodeNames()) {
+      names.add(name);
+      if ((++scanned & 8191) === 0) await onYield();
+    }
+    this.knownNames = names;
+
+    this.cachesWarmed = true;
+  }
+
+  /**
    * Clear internal caches
    */
   clearCaches(): void {
@@ -420,6 +444,12 @@ export class ReferenceResolver {
         this.nodesByKindCache.set(kind, result);
         return result;
       },
+
+      // Streamed, uncached — synthesizers scan-and-filter whole kinds, and
+      // both the materialized array AND the per-kind cache retention are
+      // O(nodes) memory (#1212). Per-ref resolvers keep the cached array
+      // variant above.
+      iterateNodesByKind: (kind: Node['kind']) => this.queries.iterateNodesByKind(kind),
 
       fileExists: (filePath: string) => {
         // Check pre-built known files set first (O(1))
@@ -1113,8 +1143,6 @@ export class ReferenceResolver {
     onProgress?: (current: number, total: number) => void,
     batchSize: number = 5000
   ): Promise<ResolutionResult> {
-    this.warmCaches();
-
     // Resolution runs on the indexer's MAIN thread, and the #850 liveness
     // watchdog SIGKILLs a process whose event loop stalls past its window (60s
     // by default). A single dense batch's resolveAll — or the synthesis pass
@@ -1122,6 +1150,8 @@ export class ReferenceResolver {
     // (#1091). A shared yielder lets both give the watchdog heartbeat a regular
     // window to fire; see ./cooperative-yield.
     const maybeYield = createYielder();
+
+    await this.warmCachesYielding(maybeYield);
 
     const total = this.queries.getUnresolvedReferencesCount();
     let processed = 0;
@@ -1141,32 +1171,42 @@ export class ReferenceResolver {
 
       const result = await this.resolveBatchYielding(batch, maybeYield);
 
+      // Persist in bounded sub-transactions with yields between: a whole
+      // batch's edge insert / keyed deletes are otherwise one solid
+      // synchronous span each on a multi-GB index, sitting BETWEEN the
+      // per-ref yields — the last unyielded stretch of the resolution loop.
+      // Crash semantics are unchanged (already several transactions): edges
+      // land before their refs are deleted, so a kill mid-way re-resolves
+      // the remainder idempotently on the next run/sweep (#1187).
+      const PERSIST_CHUNK = 1000;
+
       // Persist edges immediately
       const edges = this.createEdges(result.resolved);
-      if (edges.length > 0) {
-        this.queries.insertEdges(edges);
+      for (let i = 0; i < edges.length; i += PERSIST_CHUNK) {
+        this.queries.insertEdges(edges.slice(i, i + PERSIST_CHUNK));
+        await maybeYield();
       }
 
       // Clean up resolved refs so they don't appear in the next batch
-      if (result.resolved.length > 0) {
-        this.queries.deleteSpecificResolvedReferences(
-          result.resolved.map((r) => ({
-            fromNodeId: r.original.fromNodeId,
-            referenceName: r.original.referenceName,
-            referenceKind: r.original.referenceKind,
-          }))
-        );
+      const resolvedKeys = result.resolved.map((r) => ({
+        fromNodeId: r.original.fromNodeId,
+        referenceName: r.original.referenceName,
+        referenceKind: r.original.referenceKind,
+      }));
+      for (let i = 0; i < resolvedKeys.length; i += PERSIST_CHUNK) {
+        this.queries.deleteSpecificResolvedReferences(resolvedKeys.slice(i, i + PERSIST_CHUNK));
+        await maybeYield();
       }
 
       // Delete unresolvable refs from this batch to avoid re-processing them
-      if (result.unresolved.length > 0) {
-        this.queries.deleteSpecificResolvedReferences(
-          result.unresolved.map((r) => ({
-            fromNodeId: r.fromNodeId,
-            referenceName: r.referenceName,
-            referenceKind: r.referenceKind,
-          }))
-        );
+      const unresolvedKeys = result.unresolved.map((r) => ({
+        fromNodeId: r.fromNodeId,
+        referenceName: r.referenceName,
+        referenceKind: r.referenceKind,
+      }));
+      for (let i = 0; i < unresolvedKeys.length; i += PERSIST_CHUNK) {
+        this.queries.deleteSpecificResolvedReferences(unresolvedKeys.slice(i, i + PERSIST_CHUNK));
+        await maybeYield();
       }
 
       // Aggregate stats

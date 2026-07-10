@@ -198,8 +198,8 @@ export class DatabaseConnection {
   }
 
   /**
-   * Lightweight, non-blocking maintenance to run after bulk writes
-   * (indexAll, sync). Two operations:
+   * Lightweight maintenance to run after bulk writes (indexAll, sync).
+   * Two operations:
    *
    *   - `PRAGMA optimize` — incremental ANALYZE; SQLite only re-analyzes
    *     tables whose row counts changed materially since the last
@@ -211,19 +211,60 @@ export class DatabaseConnection {
    *     unboundedly between automatic checkpoints (auto-fires at 1000
    *     pages by default; large indexAll runs blow past that).
    *
-   * Both operations are silently swallowed on failure — they're a
-   * best-effort optimization, never load-bearing for correctness.
+   * Runs on a WORKER THREAD with its own connection: on a multi-GB index
+   * these pragmas are minutes of synchronous IO (a 95k-file kernel index
+   * left a 593MB WAL whose checkpoint alone blew the #850 watchdog's 60s
+   * window and got a COMPLETED index SIGKILLed at the finish line). WAL
+   * checkpointing from a second connection is standard SQLite; `PRAGMA
+   * optimize` persists its statistics in sqlite_stat tables, so the main
+   * connection benefits the same. The main thread just awaits a message,
+   * so the event loop — and the watchdog heartbeat — keep turning.
+   *
+   * Everything is silently swallowed on failure — best-effort
+   * optimization, never load-bearing for correctness. If worker threads
+   * are unavailable, falls back to a bounded in-line `PRAGMA optimize`
+   * and SKIPS the checkpoint (the final close() checkpoints after the
+   * CLI has already disarmed its watchdog).
    */
-  runMaintenance(): void {
-    try {
-      this.db.exec('PRAGMA optimize');
-    } catch {
-      // ignore
+  async runMaintenance(): Promise<void> {
+    // In-memory / test databases: nothing worth a worker round-trip.
+    if (!this.dbPath || this.dbPath === ':memory:') {
+      try { this.db.exec('PRAGMA optimize'); } catch { /* ignore */ }
+      try { this.db.exec('PRAGMA wal_checkpoint(PASSIVE)'); } catch { /* ignore */ }
+      return;
     }
     try {
-      this.db.exec('PRAGMA wal_checkpoint(PASSIVE)');
+      const { Worker } = await import('node:worker_threads');
+      const workerSource = `
+        const { workerData, parentPort } = require('node:worker_threads');
+        try {
+          const { DatabaseSync } = require('node:sqlite');
+          const db = new DatabaseSync(workerData.dbPath);
+          try { db.exec('PRAGMA analysis_limit=1000'); } catch {}
+          try { db.exec('PRAGMA optimize'); } catch {}
+          try { db.exec('PRAGMA wal_checkpoint(PASSIVE)'); } catch {}
+          try { db.close(); } catch {}
+        } catch {}
+        parentPort.postMessage('done');
+      `;
+      await new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = (): void => {
+          if (!settled) { settled = true; resolve(); }
+        };
+        try {
+          const worker = new Worker(workerSource, { eval: true, workerData: { dbPath: this.dbPath } });
+          worker.once('message', () => { void worker.terminate(); finish(); });
+          worker.once('error', () => { void worker.terminate(); finish(); });
+          worker.once('exit', finish);
+        } catch {
+          finish();
+        }
+      });
     } catch {
-      // ignore (e.g., not in WAL mode)
+      // Worker threads unavailable — bounded in-line fallback, no checkpoint.
+      try { this.db.exec('PRAGMA analysis_limit=1000'); } catch { /* ignore */ }
+      try { this.db.exec('PRAGMA optimize'); } catch { /* ignore */ }
     }
   }
 

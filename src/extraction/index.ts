@@ -28,6 +28,7 @@ import { validatePathWithinRoot, normalizePath } from '../utils';
 import ignore, { Ignore } from 'ignore';
 import { detectFrameworks } from '../resolution/frameworks';
 import type { ResolutionContext } from '../resolution/types';
+import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
 
 /**
  * Number of files to read in parallel during indexing.
@@ -1479,6 +1480,10 @@ export class ExtractionOrchestrator {
       total: 0,
     });
 
+    // Phase attribution to stderr (same opt-in as the synthesis timings):
+    // early-run 5-10s single stalls were observed on 95k-file repos but never
+    // attributed — these labels settle scan vs framework-detect vs grammars.
+    const tScan = Date.now();
     const files = await scanDirectoryAsync(this.rootDir, (current, file) => {
       onProgress?.({
         phase: 'scanning',
@@ -1487,6 +1492,7 @@ export class ExtractionOrchestrator {
         currentFile: file,
       });
     });
+    if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] scan: ${Date.now() - tScan}ms (${files.length} files)`);
 
     // Detect frameworks once per indexAll run using the scanned file list.
     // Names are passed to each parse call so framework-specific extractors
@@ -1494,7 +1500,9 @@ export class ExtractionOrchestrator {
     // Framework detection is reset each run so adding e.g. requirements.txt
     // between runs is picked up without restarting the process.
     this.detectedFrameworkNames = null;
+    const tFw = Date.now();
     const frameworkNames = this.ensureDetectedFrameworks(files);
+    if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] framework-detect: ${Date.now() - tFw}ms`);
 
     if (signal?.aborted) {
       return {
@@ -1586,13 +1594,19 @@ export class ExtractionOrchestrator {
     let nextToStore = 0;   // cursor: next sequence to commit
     let aborted = false;
 
-    const storeResult = (filePath: string, content: string, stats: fs.Stats, result: ExtractionResult): void => {
+    // Yielder for the in-order commit path: a single giant generated file's
+    // store is otherwise one unyielding multi-second transaction span on the
+    // main thread (5–14s single stalls measured on llvm-project), starving
+    // the #850 watchdog heartbeat on slow hardware.
+    const commitYield = createYielder();
+
+    const storeResult = async (filePath: string, content: string, stats: fs.Stats, result: ExtractionResult): Promise<void> => {
       processed++;
 
       // Store in database on main thread (SQLite is not thread-safe)
       if (result.nodes.length > 0 || result.errors.length === 0) {
         const language = detectLanguage(filePath, content, overrides);
-        this.storeExtractionResult(filePath, content, language, stats, result);
+        await this.storeExtractionResult(filePath, content, language, stats, result, commitYield);
       }
 
       if (result.errors.length > 0) {
@@ -1637,17 +1651,31 @@ export class ExtractionOrchestrator {
 
     // Commit buffered parses to the DB in file order, advancing the cursor over
     // contiguous completed results. Runs after each parse settles (and once more
-    // after the drain). storeResult / recordParseFailure run here single-threaded,
-    // so shared counters and SQLite writes never race despite parallel parsing.
-    const flushOrdered = (): void => {
-      if (aborted) return;
-      while (completed.has(nextToStore)) {
-        const item = completed.get(nextToStore)!;
-        completed.delete(nextToStore);
-        nextToStore++;
-        if (item.ok) storeResult(item.filePath, item.content, item.stats, item.result);
-        else recordParseFailure(item.filePath, item.err);
-      }
+    // after the drain). storeResult is now async (it yields between chunked
+    // inserts), so commits are SERIALIZED on a promise chain — concurrent parse
+    // completions append to the chain instead of interleaving mid-store, which
+    // preserves both the file-order commit invariant (#1015: resolution
+    // disambiguates same-named candidates by insertion order) and the
+    // single-writer discipline for SQLite. Errors are recorded and re-thrown
+    // at the drain, matching the old synchronous propagation.
+    let flushChain: Promise<void> = Promise.resolve();
+    let flushError: unknown = null;
+    const flushOrdered = (): Promise<void> => {
+      flushChain = flushChain.then(async () => {
+        if (aborted || flushError) return;
+        try {
+          while (completed.has(nextToStore)) {
+            const item = completed.get(nextToStore)!;
+            completed.delete(nextToStore);
+            nextToStore++;
+            if (item.ok) await storeResult(item.filePath, item.content, item.stats, item.result);
+            else recordParseFailure(item.filePath, item.err);
+          }
+        } catch (err) {
+          flushError = err;
+        }
+      });
+      return flushChain;
     };
 
     // Dispatch one file's parse (parses run concurrently across the pool), tagged
@@ -1670,10 +1698,13 @@ export class ExtractionOrchestrator {
       // buffered), not just in-flight: a slow file sitting at the commit cursor
       // lets later parses finish and buffer, which would otherwise grow without
       // bound. Wait for parses to settle (each may advance the cursor) until the
-      // window has room. `inFlight.size > 0` guards against an empty race — the
-      // cursor file is always still in flight when the window is full.
-      while (nextSeq - nextToStore >= windowSize && inFlight.size > 0) {
-        await Promise.race(inFlight);
+      // window has room. When nothing is in flight but the window is still full,
+      // the async commit chain is what's behind — await it so the cursor
+      // advances (buffered items hold whole file contents, so this bound is
+      // load-bearing for memory).
+      while (nextSeq - nextToStore >= windowSize) {
+        if (inFlight.size > 0) await Promise.race(inFlight);
+        else await flushOrdered();
       }
     };
 
@@ -1751,7 +1782,8 @@ export class ExtractionOrchestrator {
     // then commit any results the cursor hasn't reached yet.
     if (!aborted) {
       await Promise.all(inFlight);
-      flushOrdered();
+      await flushOrdered();
+      if (flushError) throw flushError;
     }
 
     if (signal?.aborted || aborted) {
@@ -1823,7 +1855,7 @@ export class ExtractionOrchestrator {
         if (result.nodes.length > 0 || result.errors.length === 0) {
           const language = detectLanguage(filePath, content, overrides);
           const stats = await fsp.stat(path.join(this.rootDir, filePath));
-          this.storeExtractionResult(filePath, content, language, stats, result);
+          await this.storeExtractionResult(filePath, content, language, stats, result, commitYield);
 
           const idx = errors.indexOf(errEntry);
           if (idx >= 0) errors.splice(idx, 1);
@@ -1873,7 +1905,7 @@ export class ExtractionOrchestrator {
           if (result.nodes.length > 0 || result.errors.length === 0) {
             const language = detectLanguage(filePath, fullContent, overrides);
             const stats = await fsp.stat(path.join(this.rootDir, filePath));
-            this.storeExtractionResult(filePath, fullContent, language, stats, result);
+            await this.storeExtractionResult(filePath, fullContent, language, stats, result, commitYield);
 
             const idx = errors.indexOf(errEntry);
             if (idx >= 0) errors.splice(idx, 1);
@@ -2053,7 +2085,7 @@ export class ExtractionOrchestrator {
 
     // Store in database
     if (result.nodes.length > 0 || result.errors.length === 0) {
-      this.storeExtractionResult(relativePath, content, language, stats, result);
+      await this.storeExtractionResult(relativePath, content, language, stats, result, createYielder());
     }
 
     return result;
@@ -2062,13 +2094,21 @@ export class ExtractionOrchestrator {
   /**
    * Store extraction result in database
    */
-  private storeExtractionResult(
+  private async storeExtractionResult(
     filePath: string,
     content: string,
     language: Language,
     stats: fs.Stats,
-    result: ExtractionResult
-  ): void {
+    result: ExtractionResult,
+    onYield?: MaybeYield
+  ): Promise<void> {
+    // Bulk inserts run in bounded sub-transactions with a yield between, so a
+    // giant generated file (tens of thousands of symbols) can't block the
+    // event loop — and the #850 watchdog heartbeat — for the whole store.
+    // The file was NEVER one atomic transaction (each insert call has its
+    // own), and the files-table record still lands last, so crash recovery
+    // is unchanged: a partially-stored file has no record and re-indexes.
+    const STORE_CHUNK = 2000;
     const contentHash = hashContent(content);
 
     // Check if file already exists and hasn't changed
@@ -2107,9 +2147,10 @@ export class ExtractionOrchestrator {
     // be silently skipped by insertNode() (see issue #42).
     const validNodes = result.nodes.filter((n) => n.id && n.kind && n.name && n.filePath && n.language);
 
-    // Insert nodes
-    if (validNodes.length > 0) {
-      this.queries.insertNodes(validNodes);
+    // Insert nodes (chunked — see STORE_CHUNK above)
+    for (let i = 0; i < validNodes.length; i += STORE_CHUNK) {
+      this.queries.insertNodes(validNodes.slice(i, i + STORE_CHUNK));
+      await onYield?.();
     }
 
     // Filter edges to only reference nodes that were actually inserted
@@ -2118,8 +2159,9 @@ export class ExtractionOrchestrator {
       const validEdges = result.edges.filter(
         (e) => insertedIds.has(e.source) && insertedIds.has(e.target)
       );
-      if (validEdges.length > 0) {
-        this.queries.insertEdges(validEdges);
+      for (let i = 0; i < validEdges.length; i += STORE_CHUNK) {
+        this.queries.insertEdges(validEdges.slice(i, i + STORE_CHUNK));
+        await onYield?.();
       }
     }
 
@@ -2159,8 +2201,9 @@ export class ExtractionOrchestrator {
           filePath: ref.filePath ?? filePath,
           language: ref.language ?? language,
         }));
-      if (refsWithContext.length > 0) {
-        this.queries.insertUnresolvedRefsBatch(refsWithContext);
+      for (let i = 0; i < refsWithContext.length; i += STORE_CHUNK) {
+        this.queries.insertUnresolvedRefsBatch(refsWithContext.slice(i, i + STORE_CHUNK));
+        await onYield?.();
       }
     }
 
@@ -2212,11 +2255,15 @@ export class ExtractionOrchestrator {
     // whether or not the project uses git, and crucially also catches committed
     // changes from `git pull`/`checkout`/`merge`/`rebase` — which `git status`
     // cannot see, because the working tree is clean afterward.
+    const tSyncScan = Date.now();
     const currentFiles = await scanDirectoryAsync(this.rootDir);
+    if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-scan: ${Date.now() - tSyncScan}ms (${currentFiles.length} files)`);
     filesChecked = currentFiles.length;
     const currentSet = new Set(currentFiles);
 
+    const tTracked = Date.now();
     const trackedFiles = this.queries.getAllFiles();
+    if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-tracked-load: ${Date.now() - tTracked}ms (${trackedFiles.length} tracked)`);
     const trackedMap = new Map<string, FileRecord>();
     for (const f of trackedFiles) {
       trackedMap.set(f.path, f);
