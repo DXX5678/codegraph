@@ -165,7 +165,7 @@ function mtimeOf(p: string): number {
 // Built-in agent discovery
 // ---------------------------------------------------------------------------
 
-const BUILTIN_SEARCH = ['site-packages', 'chrys', 'profiles', 'agents', 'builtins'];
+const BUILTIN_SEARCH = ['site-packages', 'chrys', 'service', 'profiles', 'agents', 'builtins'];
 
 interface BuiltinProfile {
   /** Display name (the YAML filename without extension). */
