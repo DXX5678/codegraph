@@ -4250,6 +4250,54 @@ export class TreeSitterExtractor {
     } else {
       const func = getChildByField(node, 'function') || node.namedChild(0);
 
+      // C++ explicit operator call `a.operator+(b)` / `p->operator+(b)` (#1247):
+      // tree-sitter-cpp can't parse an operator_name in field position, so the
+      // callee is NOT a field_expression — the call_expression carries
+      // `function: <receiver>` plus an ERROR child wrapping the operator_name.
+      // Reading the function field alone yields just the receiver (`a`), an
+      // unresolvable ref. Recover `<receiver>.operator+` so it resolves like any
+      // other member call (matchMethodCall admits the operator method part).
+      // The infix forms `a + b` / `a[i]` need receiver type inference and are
+      // tracked separately (#1258).
+      if (this.language === 'cpp' && func) {
+        let operatorName = '';
+        for (let i = 0; i < node.namedChildCount; i++) {
+          const child = node.namedChild(i);
+          if (child?.type !== 'ERROR') continue;
+          const op = child.namedChildren.find((c: SyntaxNode) => c.type === 'operator_name');
+          if (op) { operatorName = getNodeText(op, this.source); break; }
+        }
+        if (operatorName) {
+          // Call sites may space the symbolic name (nlohmann/json's
+          // `it.operator * ()`, `other.operator < (*this)`) while definitions
+          // index compact (`operator*`) — normalize so they match. The word
+          // forms (`operator new`) keep their space.
+          const sym = operatorName.slice('operator'.length).trim();
+          if (/^[^\w\s]/.test(sym)) operatorName = `operator${sym.replace(/\s+/g, '')}`;
+          // `->` receivers resolve identically to `.` ones. A receiver that
+          // isn't a simple identifier/member chain (`(*it)`, a call result, …)
+          // can't aid type inference, and a bare operator name would fall
+          // through to exact-name matching — which GUESSES among the many
+          // same-named operators (on nlohmann/json it linked a std::map
+          // `object->operator[]` call to an unrelated in-repo operator[]).
+          // Drop the ref: a silent miss, never a wrong edge. `this->` keeps
+          // the bare name, matching how `this.method()` calls are emitted —
+          // the target is on the enclosing class, where exact-name's same-file
+          // preference is reliable.
+          const receiver = getNodeText(func, this.source).replace(/->/g, '.').replace(/\s+/g, '');
+          if (receiver !== 'this' && !/^[A-Za-z_][\w.]*$/.test(receiver)) return;
+          const calleeName = receiver === 'this' ? operatorName : `${receiver}.${operatorName}`;
+          this.unresolvedReferences.push({
+            fromNodeId: callerId,
+            referenceName: calleeName,
+            referenceKind: 'calls',
+            line: node.startPosition.row + 1,
+            column: node.startPosition.column,
+          });
+          return;
+        }
+      }
+
       if (func) {
         if (func.type === 'member_expression' || func.type === 'attribute' || func.type === 'selector_expression' || func.type === 'navigation_expression' || func.type === 'field_expression') {
           // Method call: obj.method() or obj.field.method()

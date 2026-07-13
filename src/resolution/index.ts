@@ -16,7 +16,7 @@ import {
   FrameworkResolver,
   ImportMapping,
 } from './types';
-import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
+import { matchReference, matchFunctionRef, matchDottedCallChain, matchScopedCallChain, matchMethodCall, sameLanguageFamily, crossesKnownFamily } from './name-matcher';
 import { resolveViaImport, resolveJvmImport, extractImportMappings, extractReExports, loadCppIncludeDirs, isPhpIncludePathRef, isCobolCopybookRef, isNixPathImportRef } from './import-resolver';
 import { detectFrameworks } from './frameworks';
 import { synthesizeCallbackEdges } from './callback-synthesizer';
@@ -43,6 +43,9 @@ const SCOPED_CHAIN_LANGUAGES = new Set(['rust']);
 
 /** The extractor's chained-receiver encoding: `<inner>().<method>`. */
 const CHAIN_SHAPE = /^(.+)\(\)\.(\w+)$/;
+
+/** PHP `$this->prop->method()` encoded as `this->prop.method` — no `()`, so CHAIN_SHAPE misses it. */
+const PHP_PROP_SHAPE = /^this->\w+\.\w+$/;
 
 /**
  * Cache size limits. Each per-resolver cache is bounded so memory
@@ -622,6 +625,7 @@ export class ReferenceResolver {
       column: ref.column,
       filePath: ref.filePath || this.getFilePathFromNodeId(ref.fromNodeId),
       language: ref.language || this.getLanguageFromNodeId(ref.fromNodeId),
+      rowId: ref.rowId,
     }));
 
     const total = refs.length;
@@ -919,6 +923,15 @@ export class ReferenceResolver {
         CHAIN_SHAPE.test(ref.referenceName)
       ) {
         this.deferredChainRefs.push(ref);
+      } else if (
+        // PHP `$this->prop->method()` (encoded `this->prop.method`): its method
+        // may live on the property's declared supertype, resolvable only once
+        // implements/extends edges exist — defer to the same conformance pass.
+        ref.referenceKind === 'calls' &&
+        ref.language === 'php' &&
+        PHP_PROP_SHAPE.test(ref.referenceName)
+      ) {
+        this.deferredChainRefs.push(ref);
       }
       return null;
     }
@@ -974,6 +987,18 @@ export class ReferenceResolver {
         metadata: {
           confidence: ref.confidence,
           resolvedBy: ref.resolvedBy,
+          // The ORIGINAL reference text (and kind, when edge-kind promotion
+          // rewrote it — calls→instantiates, extends→implements,
+          // function_ref→references). If this edge's target is later removed
+          // by a re-index, the edge is resurrected as exactly this ref and
+          // re-resolved (#1240 removal case) — a faithful resurrection, so
+          // re-resolution can never bind anywhere a full re-index wouldn't.
+          // Reconstruction from the target node's name instead would strip
+          // receiver/qualifier context (`h.greet` → `greet`) and risk a
+          // wrong rebind; edges without refName (pre-#1240, synthesized) are
+          // deliberately NOT resurrected for the same reason.
+          refName: ref.original.referenceName,
+          ...(ref.original.referenceKind !== kind ? { refKind: ref.original.referenceKind } : {}),
           // Uniform marker for function-as-value edges (#756), regardless of
           // which strategy resolved them (import vs matchFunctionRef) — lets
           // tooling label "callback registration" and lets validation diff
@@ -982,6 +1007,56 @@ export class ReferenceResolver {
         },
       };
     });
+  }
+
+  /**
+   * Split resolved refs into rows deletable by id and hand-built refs that
+   * must fall back to the key-tuple delete. Rows loaded from the database
+   * carry their row id and are deleted by exactly that id; the key tuple
+   * omits line/col, so it also removes SIBLING rows — the same caller calling
+   * the same callee at other lines — that a later batch hadn't attempted yet:
+   * when a batch boundary split a caller's same-named call sites, the later
+   * sites' edges were silently never created (#1269).
+   */
+  private static partitionResolvedCleanup(resolved: ResolvedRef[]): {
+    rowIds: number[];
+    legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>;
+  } {
+    const rowIds: number[] = [];
+    const legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }> = [];
+    for (const r of resolved) {
+      if (r.original.rowId != null) rowIds.push(r.original.rowId);
+      else legacyKeys.push({
+        fromNodeId: r.original.fromNodeId,
+        referenceName: r.original.referenceName,
+        referenceKind: r.original.referenceKind,
+      });
+    }
+    return { rowIds, legacyKeys };
+  }
+
+  /**
+   * Same row-id precision for parking unresolvable refs as status='failed'
+   * (#1240): the key-tuple fallback would flip same-key sibling rows in later
+   * batches to 'failed' before they were ever attempted, and resolution
+   * outcome can differ per call site (receiver-type inference reads the
+   * ref's line), so a sibling must not inherit this row's failure (#1269).
+   */
+  private static partitionFailedCleanup(unresolved: UnresolvedRef[]): {
+    byRowId: Array<{ rowId: number; referenceName: string }>;
+    legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>;
+  } {
+    const byRowId: Array<{ rowId: number; referenceName: string }> = [];
+    const legacyKeys: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }> = [];
+    for (const r of unresolved) {
+      if (r.rowId != null) byRowId.push({ rowId: r.rowId, referenceName: r.referenceName });
+      else legacyKeys.push({
+        fromNodeId: r.fromNodeId,
+        referenceName: r.referenceName,
+        referenceKind: r.referenceKind,
+      });
+    }
+    return { byRowId, legacyKeys };
   }
 
   /**
@@ -1003,30 +1078,67 @@ export class ReferenceResolver {
 
     // Clean up resolved refs from unresolved_refs table so metrics are accurate
     if (result.resolved.length > 0) {
-      this.queries.deleteSpecificResolvedReferences(
-        result.resolved.map((r) => ({
-          fromNodeId: r.original.fromNodeId,
-          referenceName: r.original.referenceName,
-          referenceKind: r.original.referenceKind,
-        }))
-      );
+      const { rowIds, legacyKeys } = ReferenceResolver.partitionResolvedCleanup(result.resolved);
+      this.queries.deleteReferencesByRowIds(rowIds);
+      this.queries.deleteSpecificResolvedReferences(legacyKeys);
     }
 
-    // Delete unresolvable refs too — parity with resolveAndPersistBatched.
-    // Keeping them bought nothing: a ref is only ever retried when its file
-    // is re-extracted, which cascade-deletes and re-inserts its rows anyway.
-    // And it broke the #1187 orphan sweep's invariant — after a COMPLETED
-    // pass the table must hold nothing that pass processed, so that any row
-    // still present belongs to an interrupted run and the sweep can key off
-    // a bare row count.
+    // Park unresolvable refs as status='failed' — parity with
+    // resolveAndPersistBatched. Deleting them was wrong (#1240): a ref whose
+    // own file never changes is otherwise gone forever, so when a DIFFERENT
+    // file later gains the export/symbol that would satisfy it, no sync can
+    // recreate the edge — only a full re-index. Failed rows are excluded from
+    // the pending readers, which preserves the #1187 orphan sweep's
+    // invariant in status form: after a COMPLETED pass nothing it processed
+    // is still 'pending', so any pending row at rest belongs to an
+    // interrupted run and the sweep can key off the pending count.
     if (result.unresolved.length > 0) {
-      this.queries.deleteSpecificResolvedReferences(
-        result.unresolved.map((r) => ({
-          fromNodeId: r.fromNodeId,
-          referenceName: r.referenceName,
-          referenceKind: r.referenceKind,
-        }))
-      );
+      const { byRowId, legacyKeys } = ReferenceResolver.partitionFailedCleanup(result.unresolved);
+      this.queries.markReferencesFailedByRowIds(byRowId);
+      this.queries.markReferencesFailed(legacyKeys);
+    }
+
+    return result;
+  }
+
+  /**
+   * Yielding counterpart of {@link resolveAndPersist} for a caller-supplied
+   * ref list — used by sync's failed-ref retry pass (#1240). Same persistence
+   * semantics: resolved refs become edges and their rows are deleted;
+   * still-unresolvable refs are (re-)marked failed (a no-op for rows already
+   * in that status). Yields per-ref because sync can run on the daemon's
+   * liveness-watchdog thread (#850/#1091) and a retry set is unbounded when
+   * a large edit lands many popular symbol names at once.
+   */
+  async resolveAndPersistListYielding(refs: UnresolvedReference[]): Promise<ResolutionResult> {
+    const maybeYield = createYielder();
+    const result = await this.resolveBatchYielding(refs, maybeYield);
+
+    const PERSIST_CHUNK = 1000;
+    const edges = this.createEdges(result.resolved);
+    for (let i = 0; i < edges.length; i += PERSIST_CHUNK) {
+      this.queries.insertEdges(edges.slice(i, i + PERSIST_CHUNK));
+      await maybeYield();
+    }
+
+    const resolvedCleanup = ReferenceResolver.partitionResolvedCleanup(result.resolved);
+    for (let i = 0; i < resolvedCleanup.rowIds.length; i += PERSIST_CHUNK) {
+      this.queries.deleteReferencesByRowIds(resolvedCleanup.rowIds.slice(i, i + PERSIST_CHUNK));
+      await maybeYield();
+    }
+    for (let i = 0; i < resolvedCleanup.legacyKeys.length; i += PERSIST_CHUNK) {
+      this.queries.deleteSpecificResolvedReferences(resolvedCleanup.legacyKeys.slice(i, i + PERSIST_CHUNK));
+      await maybeYield();
+    }
+
+    const failedCleanup = ReferenceResolver.partitionFailedCleanup(result.unresolved);
+    for (let i = 0; i < failedCleanup.byRowId.length; i += PERSIST_CHUNK) {
+      this.queries.markReferencesFailedByRowIds(failedCleanup.byRowId.slice(i, i + PERSIST_CHUNK));
+      await maybeYield();
+    }
+    for (let i = 0; i < failedCleanup.legacyKeys.length; i += PERSIST_CHUNK) {
+      this.queries.markReferencesFailed(failedCleanup.legacyKeys.slice(i, i + PERSIST_CHUNK));
+      await maybeYield();
     }
 
     return result;
@@ -1060,9 +1172,13 @@ export class ReferenceResolver {
     const maybeYield = createYielder();
     const resolved: ResolvedRef[] = [];
     for (const ref of deferred) {
-      // `::`-receiver languages (Rust) split on `::` (matchScopedCallChain);
+      // PHP `this->prop.method` resolves via matchMethodCall (declared-type
+      // inference + resolveMethodOnType conformance walk); `::`-receiver
+      // languages (Rust) split on `::` (matchScopedCallChain); other
       // dotted-receiver languages on `.` (matchDottedCallChain).
-      const chainMatch = SCOPED_CHAIN_LANGUAGES.has(ref.language)
+      const chainMatch = (ref.language === 'php' && PHP_PROP_SHAPE.test(ref.referenceName))
+        ? matchMethodCall(ref, this.context)
+        : SCOPED_CHAIN_LANGUAGES.has(ref.language)
         ? matchScopedCallChain(ref, this.context)
         : matchDottedCallChain(ref, this.context);
       const match = this.gateLanguage(chainMatch, ref);
@@ -1111,6 +1227,7 @@ export class ReferenceResolver {
         column: raw.column,
         filePath: raw.filePath || this.getFilePathFromNodeId(raw.fromNodeId),
         language: raw.language || this.getLanguageFromNodeId(raw.fromNodeId),
+        rowId: raw.rowId,
       };
       const result = this.resolveOne(ref);
       if (result) {
@@ -1162,8 +1279,10 @@ export class ReferenceResolver {
       byMethod: {} as Record<string, number>,
     };
 
-    // Process in batches. We always read from offset 0 because resolved refs
-    // are deleted after each batch, shifting the remaining rows forward.
+    // Process in batches. We always read from offset 0 because every ref the
+    // batch processed leaves the pending set (resolved rows are deleted,
+    // unresolvable ones flip to status='failed'), shifting the remaining
+    // pending rows forward.
     let prevRemaining = Number.POSITIVE_INFINITY;
     while (true) {
       const batch = this.queries.getUnresolvedReferencesBatch(0, batchSize);
@@ -1187,25 +1306,31 @@ export class ReferenceResolver {
         await maybeYield();
       }
 
-      // Clean up resolved refs so they don't appear in the next batch
-      const resolvedKeys = result.resolved.map((r) => ({
-        fromNodeId: r.original.fromNodeId,
-        referenceName: r.original.referenceName,
-        referenceKind: r.original.referenceKind,
-      }));
-      for (let i = 0; i < resolvedKeys.length; i += PERSIST_CHUNK) {
-        this.queries.deleteSpecificResolvedReferences(resolvedKeys.slice(i, i + PERSIST_CHUNK));
+      // Clean up resolved refs so they don't appear in the next batch —
+      // by row id, so a same-key sibling ref in a LATER batch (same caller
+      // calling the same callee at another line) is left pending for its own
+      // attempt instead of being swept out with this batch's rows (#1269).
+      const resolvedCleanup = ReferenceResolver.partitionResolvedCleanup(result.resolved);
+      for (let i = 0; i < resolvedCleanup.rowIds.length; i += PERSIST_CHUNK) {
+        this.queries.deleteReferencesByRowIds(resolvedCleanup.rowIds.slice(i, i + PERSIST_CHUNK));
+        await maybeYield();
+      }
+      for (let i = 0; i < resolvedCleanup.legacyKeys.length; i += PERSIST_CHUNK) {
+        this.queries.deleteSpecificResolvedReferences(resolvedCleanup.legacyKeys.slice(i, i + PERSIST_CHUNK));
         await maybeYield();
       }
 
-      // Delete unresolvable refs from this batch to avoid re-processing them
-      const unresolvedKeys = result.unresolved.map((r) => ({
-        fromNodeId: r.fromNodeId,
-        referenceName: r.referenceName,
-        referenceKind: r.referenceKind,
-      }));
-      for (let i = 0; i < unresolvedKeys.length; i += PERSIST_CHUNK) {
-        this.queries.deleteSpecificResolvedReferences(unresolvedKeys.slice(i, i + PERSIST_CHUNK));
+      // Park unresolvable refs from this batch as status='failed' so they
+      // leave the pending set (the batch reader and non-progress guard below
+      // only see pending rows) but stay retryable when a later sync adds a
+      // symbol that could satisfy them (#1240).
+      const failedCleanup = ReferenceResolver.partitionFailedCleanup(result.unresolved);
+      for (let i = 0; i < failedCleanup.byRowId.length; i += PERSIST_CHUNK) {
+        this.queries.markReferencesFailedByRowIds(failedCleanup.byRowId.slice(i, i + PERSIST_CHUNK));
+        await maybeYield();
+      }
+      for (let i = 0; i < failedCleanup.legacyKeys.length; i += PERSIST_CHUNK) {
+        this.queries.markReferencesFailed(failedCleanup.legacyKeys.slice(i, i + PERSIST_CHUNK));
         await maybeYield();
       }
 
@@ -1232,13 +1357,14 @@ export class ReferenceResolver {
       // The count-based guard below catches the true no-progress case.
 
       // Non-progress guard (defense-in-depth). Because we re-read from offset 0
-      // each pass, the unresolved_refs table MUST shrink every iteration — both
-      // resolved and unresolved refs are deleted above. If it didn't shrink, a
+      // each pass, the PENDING population MUST shrink every iteration — resolved
+      // refs are deleted and unresolvable ones are marked failed above, and both
+      // leave the pending set the batch reader sees. If it didn't shrink, a
       // resolver returned a match whose `original.referenceName` differs from the
-      // stored row, so the keyed delete no-ops, and we'd re-read + re-resolve +
-      // re-insert the same rows forever (the runaway that grew a 99-file repo to
-      // 5M edges / 1.4 GB before the Go-fallback fix). Stop rather than grow the
-      // graph without bound.
+      // stored row, so the keyed delete/update no-ops, and we'd re-read +
+      // re-resolve + re-insert the same rows forever (the runaway that grew a
+      // 99-file repo to 5M edges / 1.4 GB before the Go-fallback fix). Stop
+      // rather than grow the graph without bound.
       const remaining = this.queries.getUnresolvedReferencesCount();
       if (remaining >= prevRemaining) break;
       prevRemaining = remaining;
