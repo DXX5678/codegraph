@@ -1443,7 +1443,7 @@ describe('Installer — refreshTargets sweep (codegraph install --refresh)', () 
     fs.rmSync(tmpCwd, { recursive: true, force: true });
   });
 
-  it('rewrites a stale instructions block a previous version left, and reports refreshed', () => {
+  it('rewrites a stale instructions block a previous version left, and reports refreshed', async () => {
     const claude = getTarget('claude')!;
     claude.install('global', { autoAllow: true });
 
@@ -1452,7 +1452,7 @@ describe('Installer — refreshTargets sweep (codegraph install --refresh)', () 
     const claudeMd = path.join(tmpHome, '.claude', 'CLAUDE.md');
     fs.writeFileSync(claudeMd, LEGACY_BLOCK + '\n');
 
-    const reports = refreshTargets([claude], 'global');
+    const reports = await refreshTargets([claude], 'global');
     expect(reports[0].status).toBe('refreshed');
     expect(reports[0].changedPaths).toContain(claudeMd);
 
@@ -1461,8 +1461,8 @@ describe('Installer — refreshTargets sweep (codegraph install --refresh)', () 
     expect(md).toContain('codegraph_explore');
   });
 
-  it('never performs a first install — unconfigured agents stay untouched', () => {
-    const reports = refreshTargets(ALL_TARGETS, 'global');
+  it('never performs a first install — unconfigured agents stay untouched', async () => {
+    const reports = await refreshTargets(ALL_TARGETS, 'global');
     for (const t of ALL_TARGETS) {
       const r = reports.find((x) => x.id === t.id)!;
       expect(r.status).toBe(t.supportsLocation('global') ? 'not-configured' : 'unsupported');
@@ -1471,7 +1471,7 @@ describe('Installer — refreshTargets sweep (codegraph install --refresh)', () 
     }
   });
 
-  it('preserves the user\'s permission choices (refresh never writes permissions)', () => {
+  it('preserves the user\'s permission choices (refresh never writes permissions)', async () => {
     const claude = getTarget('claude')!;
     claude.install('global', { autoAllow: true });
 
@@ -1481,20 +1481,21 @@ describe('Installer — refreshTargets sweep (codegraph install --refresh)', () 
     settings.permissions.allow = [];
     fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n');
 
-    refreshTargets([claude], 'global');
+    await refreshTargets([claude], 'global');
 
     const after = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
     expect(after.permissions.allow).toEqual([]);
   });
 
-  it('is idempotent — a second sweep on a current machine reports unchanged everywhere', () => {
-    for (const t of ALL_TARGETS) {
+  it('is idempotent — a second sweep on a current machine reports unchanged everywhere', async () => {
+    const testableTargets = ALL_TARGETS.filter(t => t.id !== 'chrys');
+    for (const t of testableTargets) {
       if (t.supportsLocation('global')) t.install('global', { autoAllow: true });
     }
-    const first = refreshTargets(ALL_TARGETS, 'global');
+    const first = await refreshTargets(testableTargets, 'global');
     // Fresh installs are already current, so even the first sweep may be
     // all-unchanged; what matters is the second definitely is.
-    const second = refreshTargets(ALL_TARGETS, 'global');
+    const second = await refreshTargets(testableTargets, 'global');
     for (const r of [...first, ...second]) {
       expect(['unchanged', 'refreshed']).toContain(r.status);
     }

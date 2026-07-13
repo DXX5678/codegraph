@@ -403,28 +403,30 @@ export interface RefreshReport {
  * Exposed (and unit-tested) separately from the CLI wiring, same as
  * `uninstallTargets`.
  */
-export function refreshTargets(
+export async function refreshTargets(
   targets: readonly AgentTarget[],
   location: Location,
-): RefreshReport[] {
-  return targets.map((target) => {
-    const base = { id: target.id, displayName: target.displayName, location };
-    if (!target.supportsLocation(location)) {
-      return { ...base, status: 'unsupported' as const, changedPaths: [] };
-    }
-    if (!target.detect(location).alreadyConfigured) {
-      return { ...base, status: 'not-configured' as const, changedPaths: [] };
-    }
-    const result = target.install(location, { autoAllow: false, promptHook: undefined });
-    const changedPaths = result.files
-      .filter((f) => f.action === 'created' || f.action === 'updated' || f.action === 'removed')
-      .map((f) => f.path);
-    return {
-      ...base,
-      status: changedPaths.length > 0 ? ('refreshed' as const) : ('unchanged' as const),
-      changedPaths,
-    };
-  });
+): Promise<RefreshReport[]> {
+  return Promise.all(
+    targets.map(async (target) => {
+      const base = { id: target.id, displayName: target.displayName, location };
+      if (!target.supportsLocation(location)) {
+        return { ...base, status: 'unsupported' as const, changedPaths: [] };
+      }
+      if (!target.detect(location).alreadyConfigured) {
+        return { ...base, status: 'not-configured' as const, changedPaths: [] };
+      }
+      const result = await target.install(location, { autoAllow: false, promptHook: undefined });
+      const changedPaths = result.files
+        .filter((f) => f.action === 'created' || f.action === 'updated' || f.action === 'removed')
+        .map((f) => f.path);
+      return {
+        ...base,
+        status: changedPaths.length > 0 ? ('refreshed' as const) : ('unchanged' as const),
+        changedPaths,
+      };
+    }),
+  );
 }
 
 /**

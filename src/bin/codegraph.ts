@@ -2233,7 +2233,7 @@ program
         : ['global', 'local'];
       let changed = 0;
       for (const loc of locs) {
-        for (const report of refreshTargets(ALL_TARGETS, loc)) {
+        for (const report of await refreshTargets(ALL_TARGETS, loc)) {
           for (const p of report.changedPaths) {
             changed += 1;
             console.log(`  ${report.displayName}: refreshed ${p}`);
