@@ -48,6 +48,7 @@ Full details in the entries below.
 
 ### Fixes
 
+- Codex installs, upgrades, and uninstalls now preserve TOML array-of-table sections that appear after CodeGraph's MCP configuration instead of accidentally removing them. (#1351)
 - TypeScript, TSX, and JavaScript files now parse with up-to-date grammars — modern syntax such as `using` declarations and import attributes no longer trips parse errors that could drop surrounding symbols. (The previously bundled grammars dated from 2023.)
 - Rust files also parse with an up-to-date grammar now (the previously bundled build dated from 2023), which additionally sharpens method-call attribution: calls through struct fields resolve with receiver context instead of falling back to ambiguous bare-name matching, removing a class of wrong call edges on common names like `len` and `start`.
 - Ruby files also parse with an up-to-date grammar now (the previously bundled build dated from early 2024), which fixes a misparse of safe-navigation operator-method calls (`recv&.!= x`) that had recorded the wrong callee name.
