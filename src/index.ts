@@ -53,8 +53,10 @@ import { FileWatcher, WatchOptions, PendingFile, LockUnavailableError } from './
 import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
+import ignore from 'ignore';
+import { loadDeprioritizePatterns } from './project-config';
 import { CodeGraphPackageVersion } from './mcp/version';
-import { segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
+import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
 import { minRefsForPool } from './resolution/resolver-pool';
 
@@ -186,6 +188,39 @@ export class CodeGraph {
     } catch {
       // Best-effort: ranking still works without it.
     }
+    // Down-weight the peripheral trees the project named in `codegraph.json`
+    // `deprioritize` — indexed and findable, but never outranking real code
+    // (#982). Ranking-only, so a bad pattern costs relevance, never recall.
+    //
+    // Read LAZILY, not once here: `wireLayers` runs from the constructor and
+    // from `reopenIfReplaced`, so a matcher built here would freeze at whatever
+    // the config said when the project opened. The MCP server caches one
+    // CodeGraph per root for its whole lifetime, so editing `codegraph.json`
+    // would appear to do nothing until the process restarted — `exclude` and
+    // `include` do not behave that way. `loadDeprioritizePatterns` is
+    // mtime-cached, so this costs one `stat`; the compiled matcher is memoized
+    // on the pattern array's identity, which the cache keeps stable.
+    let cachedPatterns: string[] | undefined;
+    let cachedMatcher: ReturnType<typeof ignore> | undefined;
+    this.queries.setDeprioritizedPathMatcher((filePath: string): boolean => {
+      try {
+        const patterns = loadDeprioritizePatterns(this.projectRoot);
+        if (patterns.length === 0) return false;
+        if (patterns !== cachedPatterns) {
+          cachedPatterns = patterns;
+          cachedMatcher = ignore().add(patterns);
+        }
+        const rel = path.isAbsolute(filePath)
+          ? path.relative(this.projectRoot, filePath)
+          : filePath;
+        if (!rel || rel.startsWith('..')) return false;
+        return cachedMatcher!.ignores(rel.split(path.sep).join('/'));
+      } catch {
+        // Ranking must never take the search down with it.
+        return false;
+      }
+    });
+
     this.orchestrator = new ExtractionOrchestrator(this.projectRoot, this.queries);
     this.resolver = createResolver(this.projectRoot, this.queries);
     this.graphManager = new GraphQueryManager(this.queries);
@@ -883,6 +918,32 @@ export class CodeGraph {
           }
         }
 
+        // Re-open resolution edges this sync may have invalidated ELSEWHERE in
+        // the repo (CG-33). Everything above re-resolves references in the
+        // changed files; this covers the opposite direction — references in
+        // files the sync never touched whose answer depended on a definition
+        // that just appeared or disappeared. Without it a synced index never
+        // converges to a full rebuild: measured at 4.3% of distinct edges wrong
+        // on codegraph's own index, in both directions, mostly `calls`. The
+        // resurrected refs are pending rows, so the orphan sweep immediately
+        // below is what resolves them — batched, yielding, multi-pass, exactly
+        // as a full index resolves.
+        //
+        // `definitionDelta` is empty for a body-only edit, so the overwhelmingly
+        // common sync pays one branch. CODEGRAPH_NO_REBIND=1 disables it.
+        if (result.definitionDelta && process.env.CODEGRAPH_NO_REBIND !== '1') {
+          const tRebind = Date.now();
+          const rebound = this.orchestrator.resurrectStaleResolutionEdges(
+            result.definitionDelta,
+            result.changedFilePaths ?? []
+          );
+          if (process.env.CODEGRAPH_SYNTH_TIMINGS) {
+            console.error(
+              `[phase-timing] sync-rebind: ${Date.now() - tRebind}ms (${result.definitionDelta.length} changed names, ${rebound} edges re-opened)`
+            );
+          }
+        }
+
         // Orphan sweep (#1187). A resolution pass that dies mid-run — the #850
         // daemon liveness watchdog's SIGKILL (#1122), Ctrl-C, a crash — leaves
         // the refs it never reached in unresolved_refs, and the git-scoped fast
@@ -949,6 +1010,14 @@ export class CodeGraph {
             await this.rebuildNameSegmentVocab();
           }
         } catch { /* vocab is advisory — never fail a sync over it */ }
+
+        // A killed full index leaves this marker at `indexing`. Sync repairs
+        // missing files, pending refs, and (on open) dropped indexes, so a
+        // successful recovery must also close the metadata state (#1556).
+        const fullReconcile = !options.paths || options.paths.length === 0;
+        if (fullReconcile && this.getIndexState() === 'indexing') {
+          try { this.queries.setMetadata('index_state', 'complete'); } catch { /* advisory */ }
+        }
 
         return result;
       } finally {
@@ -1220,6 +1289,7 @@ export class CodeGraph {
   getStats(): GraphStats {
     const stats = this.queries.getStats();
     stats.dbSizeBytes = this.db.getSize();
+    stats.walSizeBytes = this.db.getWalSizeBytes();
     return stats;
   }
 
@@ -1536,6 +1606,37 @@ export class CodeGraph {
     return this.queries.getAllFiles();
   }
 
+  /**
+   * A `(path) => boolean` generated-file test over a BOUNDED candidate list,
+   * unioning the index-time content-banner flag with the filename convention
+   * (#1500). One query up front, O(1) per call after — built for use inside a
+   * ranking comparator, where re-querying per comparison would be quadratic.
+   *
+   * Pass every path you might ask about; a path outside the list falls back to
+   * the filename check alone.
+   */
+  generatedFilePredicate(filePaths: Iterable<string>): (filePath: string) => boolean {
+    return this.queries.generatedPredicateFor(filePaths);
+  }
+
+  /**
+   * A `(path) => boolean` ambient-declaration test over a BOUNDED candidate
+   * list: true for a file that declares nothing but types, originates no call
+   * edge, and that nothing in the index depends on — an ambient `.d.ts` of
+   * global shims, vendored typings, module augmentation (CG-28). Structural
+   * rather than extension-based, and deliberately narrow: see
+   * `QueryBuilder.getAmbientDeclarationPathsAmong` for why each condition is
+   * there, in particular why a `types.ts` the codebase imports is NOT flagged.
+   */
+  ambientDeclarationFilePredicate(filePaths: Iterable<string>): (filePath: string) => boolean {
+    return this.queries.ambientDeclarationPredicateFor(filePaths);
+  }
+
+  /** How many indexed files are flagged tool-generated. Reported by `status`. */
+  getGeneratedFileCount(): number {
+    return this.queries.countGeneratedFiles();
+  }
+
   // ===========================================================================
   // Graph Query Methods
   // ===========================================================================
@@ -1765,7 +1866,23 @@ export class CodeGraph {
     query: string,
     options?: FindRelevantContextOptions
   ): Promise<Subgraph> {
-    return this.contextBuilder.findRelevantContext(query, options);
+    // Segment-vocab supplement: FTS keeps camelCase names as single tokens,
+    // so a word-level query ("auto-scroll to bottom") can never reach
+    // `pinFeedIfNearBottom` through search alone. Resolve the query's words
+    // against name_segment_vocab (same precision rules as the prompt hook:
+    // co-occurrence, else rare singles, verified against live nodes) and hand
+    // the names down as dampened exact-name seeds. Callers that pass their
+    // own seedNames keep them; failures degrade to no supplement.
+    let seedNames = options?.seedNames;
+    if (seedNames === undefined) {
+      try {
+        seedNames = this.getSegmentMatches(extractSegmentSearchWords(query), 8)
+          .map((m) => m.name);
+      } catch {
+        seedNames = [];
+      }
+    }
+    return this.contextBuilder.findRelevantContext(query, { ...options, seedNames });
   }
 
   /**
