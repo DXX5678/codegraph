@@ -1,13 +1,13 @@
 /**
- * Chrys target.
+ * iCode target.
  *
- * Chrys stores agent profiles as individual YAML files (one per profile)
+ * iCode stores agent profiles as individual YAML files (one per profile)
  * under ``~/.chrys/agents/``.  Each profile is a complete agent definition
  * with a ``tools.mcp`` list of MCP server configs.
  *
  * When no user-created profiles exist under ``~/.chrys/agents/`` yet
- * (e.g. a fresh Chrys installation), built-in agent definitions are
- * discovered from the Chrys runtime installation directory on disk.
+ * (e.g. a fresh iCode installation), built-in agent definitions are
+ * discovered from the iCode runtime installation directory on disk.
  * The user can pick one or more built-in agents; for each selection a
  * shadow profile is created under ``~/.chrys/agents/`` with the
  * built-in's full content plus the codegraph MCP server entry injected.
@@ -24,7 +24,7 @@
  * entry, prompts the user to pick which profiles to remove it from,
  * then strips the entry.
  *
- * Chrys has no project-local config concept, so only ``global`` is
+ * iCode has no project-local config concept, so only ``global`` is
  * supported.
  *
  * No instructions file is written (issue #529) — the codegraph usage
@@ -60,14 +60,14 @@ function agentsDir(): string {
 }
 
 // ---------------------------------------------------------------------------
-// Chrys runtime roots — where Chrys's pyapp installation lives
+// iCode runtime roots — where iCode's pyapp installation lives
 // ---------------------------------------------------------------------------
 
-function chrysRuntimeRoots(): string[] {
+function icodeRuntimeRoots(): string[] {
   const roots: string[] = [];
 
-  // Custom override (mirrors PYAPP_INSTALL_DIR_CHRYS)
-  const envOverride: string | undefined = process.env.PYAPP_INSTALL_DIR_CHRYS;
+  // Custom override (mirrors PYAPP_INSTALL_DIR_ICODE)
+  const envOverride: string | undefined = process.env.PYAPP_INSTALL_DIR_ICODE;
   if (envOverride) {
     roots.push(path.resolve(envOverride.replace(/^~/, os.homedir())));
   }
@@ -183,7 +183,7 @@ function discoverBuiltins(): BuiltinProfile[] {
   const results: BuiltinProfile[] = [];
   const userAgentDir = agentsDir();
 
-  for (const root of chrysRuntimeRoots()) {
+  for (const root of icodeRuntimeRoots()) {
     const builtinDirs = findSubdirs(root, BUILTIN_SEARCH);
     if (builtinDirs.length === 0) continue;
 
@@ -589,10 +589,10 @@ function stripLines(lines: string[], start: number, end: number): string {
 // Target implementation
 // ---------------------------------------------------------------------------
 
-class ChrysTarget implements AgentTarget {
-  readonly id = 'chrys' as const;
-  readonly displayName = 'Chrys';
-  readonly docsUrl = 'https://github.com/anthropics/chrys';
+class iCodeTarget implements AgentTarget {
+  readonly id = 'icode' as const;
+  readonly displayName = 'iCode';
+  readonly docsUrl = 'https://xxxxxxxxxxxxxxx';
 
   supportsLocation(loc: Location): boolean {
     return loc === 'global';
@@ -604,12 +604,12 @@ class ChrysTarget implements AgentTarget {
     let alreadyConfigured = false;
     let firstPath: string | undefined;
 
-    // Chrys is "installed" if its config dir exists OR the runtime is present.
+    // iCode is "installed" if its config dir exists OR the runtime is present.
     if (fs.existsSync(configDir())) {
       installed = true;
     }
     if (!installed) {
-      for (const root of chrysRuntimeRoots()) {
+      for (const root of icodeRuntimeRoots()) {
         if (fs.existsSync(root)) {
           installed = true;
           break;
@@ -644,8 +644,8 @@ class ChrysTarget implements AgentTarget {
         files: [],
         notes: [
           fs.existsSync(configDir())
-            ? 'No Chrys agent profiles found. Run `chrys` to initialize them first.'
-            : 'Chrys does not appear to be installed. Install Chrys first, then re-run this command.',
+            ? 'No iCode agent profiles found. Run `chrys` to initialize them first.'
+            : 'iCode does not appear to be installed. Install iCode first, then re-run this command.',
         ],
       };
     }
@@ -664,7 +664,7 @@ class ChrysTarget implements AgentTarget {
     let selected: string[];
     if (isInteractive()) {
       selected = await promptProfileSelect(
-        'Select Chrys profiles to add CodeGraph MCP server to:',
+        'Select iCode profiles to add CodeGraph MCP server to:',
         options,
         allPaths, // pre-select all
       );
@@ -705,10 +705,10 @@ class ChrysTarget implements AgentTarget {
     const skipped = files.filter((f) => f.action === 'unchanged').length;
     const notes: string[] = [];
     if (created > 0) {
-      notes.push(`Created ${created} Chrys agent profile(s) with CodeGraph MCP.`);
+      notes.push(`Created ${created} iCode agent profile(s) with CodeGraph MCP.`);
     }
     if (updated > 0) {
-      notes.push(`Injected CodeGraph MCP server into ${updated} Chrys profile(s).`);
+      notes.push(`Injected CodeGraph MCP server into ${updated} iCode profile(s).`);
     }
     if (skipped > 0) {
       notes.push(`${skipped} profile(s) already had CodeGraph configured.`);
@@ -725,7 +725,7 @@ class ChrysTarget implements AgentTarget {
     // only need to scan the user config dir.
     const dir = agentsDir();
     if (!fs.existsSync(dir)) {
-      return { files: [], notes: ['No Chrys agent profiles found — nothing to uninstall.'] };
+      return { files: [], notes: ['No iCode agent profiles found — nothing to uninstall.'] };
     }
 
     let userFiles: string[];
@@ -735,7 +735,7 @@ class ChrysTarget implements AgentTarget {
         .map((f) => path.join(dir, f))
         .sort();
     } catch {
-      return { files: [], notes: ['No Chrys agent profiles found — nothing to uninstall.'] };
+      return { files: [], notes: ['No iCode agent profiles found — nothing to uninstall.'] };
     }
 
     // Find profiles that have codegraph configured.
@@ -754,7 +754,7 @@ class ChrysTarget implements AgentTarget {
     let selected: string[];
     if (isInteractive()) {
       selected = await promptProfileSelect(
-        `Select Chrys profiles to remove CodeGraph MCP from (${configuredProfiles.length} have it):`,
+        `Select iCode profiles to remove CodeGraph MCP from (${configuredProfiles.length} have it):`,
         options,
         configuredProfiles, // pre-select all configured
       );
@@ -796,7 +796,7 @@ class ChrysTarget implements AgentTarget {
       '',
       ...entryLines,
       '',
-      `# Or install with: codegraph install --target chrys`,
+      `# Or install with: codegraph install --target icode`,
       '',
     ].join('\n');
   }
@@ -806,4 +806,4 @@ class ChrysTarget implements AgentTarget {
   }
 }
 
-export const chrysTarget: AgentTarget = new ChrysTarget();
+export const icodeTarget: AgentTarget = new iCodeTarget();

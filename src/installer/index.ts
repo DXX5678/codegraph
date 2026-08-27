@@ -102,8 +102,11 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
   }
 
   // Step 2: install the codegraph npm package on PATH (always offered;
-  // matches existing behavior). Skipped when --yes (assume present).
-  if (!useDefaults) {
+  // matches existing behavior). Skipped when --yes (assume present),
+  // or when icode is among the selected targets — iCode bundles its
+  // own runtime and does not need a separate CLI on PATH.
+  const hasIcode = targets.some(t => t.id === 'icode');
+  if (!useDefaults && !hasIcode) {
     const shouldInstallGlobally = await clack.confirm({
       message: 'Install the codegraph CLI on your PATH? (Required so agents can launch the MCP server)',
       initialValue: true,

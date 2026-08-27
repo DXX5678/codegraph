@@ -16,10 +16,10 @@ import { hermesTarget } from './hermes';
 import { geminiTarget } from './gemini';
 import { antigravityTarget } from './antigravity';
 import { kiroTarget } from './kiro';
-import { chrysTarget } from './chrys';
+import { icodeTarget } from './icode';
 
 export const ALL_TARGETS: readonly AgentTarget[] = Object.freeze([
-  chrysTarget,
+  icodeTarget,
   claudeTarget,
   cursorTarget,
   codexTarget,

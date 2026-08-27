@@ -91,10 +91,10 @@ describe('Installer targets — contract', () => {
   for (const target of ALL_TARGETS) {
     describe(target.id, () => {
       beforeEach(() => {
-        // Chrys needs existing agent profiles to discover — its
+        // iCode needs existing agent profiles to discover — its
         // install/uninstall operates on user-created profiles, never
-        // creates them from scratch (Chrys ships with built-in agents).
-        if (target.id === 'chrys') {
+        // creates them from scratch (iCode ships with built-in agents).
+        if (target.id === 'icode') {
           const agentsDir = path.join(tmpHome, '.chrys', 'agents');
           fs.mkdirSync(agentsDir, { recursive: true });
           fs.writeFileSync(path.join(agentsDir, 'Test.yaml'), [
@@ -1471,8 +1471,8 @@ describe('Installer — uninstallTargets sweep (codegraph uninstall)', () => {
     process.chdir(tmpCwd);
     homeRestore = setHome(tmpHome);
 
-    // Seed a dummy profile so Chrys's install/uninstall has
-    // something to discover (Chrys only operates on user profiles).
+    // Seed a dummy profile so iCode's install/uninstall has
+    // something to discover (iCode only operates on user profiles).
     const agentsDir = path.join(tmpHome, '.chrys', 'agents');
     fs.mkdirSync(agentsDir, { recursive: true });
     fs.writeFileSync(path.join(agentsDir, 'Test.yaml'), [
@@ -1637,7 +1637,7 @@ describe('Installer — refreshTargets sweep (codegraph install --refresh)', () 
   });
 
   it('is idempotent — a second sweep on a current machine reports unchanged everywhere', async () => {
-    const testableTargets = ALL_TARGETS.filter(t => t.id !== 'chrys');
+    const testableTargets = ALL_TARGETS.filter(t => t.id !== 'icode');
     for (const t of testableTargets) {
       if (t.supportsLocation('global')) t.install('global', { autoAllow: true });
     }
