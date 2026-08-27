@@ -886,10 +886,13 @@ export class ReferenceResolver {
     // indexed under the bare name, so the existence check strips the dot.
     // Nix static path imports (`import ./x.nix`) name a FILE, not a symbol —
     // they bypass the symbol-existence check and resolve via resolveViaImport.
-    const existenceName =
+    let existenceName =
       ref.language === 'arkts' && ref.referenceName.startsWith('.')
         ? ref.referenceName.slice(1)
         : ref.referenceName;
+    // Erlang refs carry the call-site arity (`f/1`, `mod::f/2` — #1610); the
+    // name index stores bare names, so existence is checked arity-less.
+    if (ref.language === 'erlang') existenceName = existenceName.replace(/\/\d{1,3}$/, '');
     const tPre = this.profileStages ? process.hrtime.bigint() : 0n;
     const preFilterPass =
       isNixPathImportRef(ref) ||
@@ -915,7 +918,15 @@ export class ReferenceResolver {
       const viaImport = this.gateLanguage(resolveViaImport(ref, this.context), ref);
       if (viaImport) {
         const target = this.queries.getNodeById(viaImport.targetNodeId);
-        if (target && (target.kind === 'function' || target.kind === 'method')) {
+        if (
+          target &&
+          (target.kind === 'function' ||
+            target.kind === 'method' ||
+            // Python (#1478): an imported class used as a value (`return
+            // OrgSerializerFull`) resolves through its import like any
+            // callback — mirrors matchFunctionRef's bareClassOk.
+            (ref.language === 'python' && target.kind === 'class'))
+        ) {
           return viaImport;
         }
       }
@@ -1071,13 +1082,16 @@ export class ReferenceResolver {
       }
 
       // Promote "calls" to "instantiates" when the resolved target is a
-      // class/struct. Languages without a `new` keyword (Python, Ruby)
+      // class/struct/union. Languages without a `new` keyword (Python, Ruby)
       // express instantiation as `Foo()` — extraction can't tell that
       // apart from a function call without symbol info, but resolution
       // can: if `Foo` resolves to a class, the call IS an instantiation.
       if (kind === 'calls') {
         const targetNode = this.queries.getNodeById(ref.targetNodeId);
-        if (targetNode && (targetNode.kind === 'class' || targetNode.kind === 'struct')) {
+        if (
+          targetNode &&
+          (targetNode.kind === 'class' || targetNode.kind === 'struct' || targetNode.kind === 'union')
+        ) {
           kind = 'instantiates';
         }
       }

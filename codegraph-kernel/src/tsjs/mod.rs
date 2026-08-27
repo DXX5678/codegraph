@@ -550,6 +550,7 @@ impl<'t> Walker<'t> {
 
     /// scanFnRefSubtree: capture-only walk of subtrees the main walkers skip.
     fn scan_fn_ref_subtree(&mut self, node: Node<'t>, depth: u32) {
+        stack_guard!();
         if depth > 12 {
             return;
         }
@@ -607,6 +608,7 @@ impl<'t> Walker<'t> {
     // --- the dispatcher (visitNode) --------------------------------------------
 
     fn visit_node(&mut self, node: Node<'t>) {
+        stack_guard!();
         let kind = node.kind();
         let mut skip_children = false;
 
@@ -686,6 +688,7 @@ impl<'t> Walker<'t> {
     }
 
     fn visit_for_calls_and_structure(&mut self, node: Node<'t>) {
+        stack_guard!();
         let kind = node.kind();
         self.maybe_capture_fn_refs(node);
 

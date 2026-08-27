@@ -22,6 +22,7 @@ import { isGeneratedFile } from './generated-detection';
 import type { LanguageExtractor, ExtractorContext } from './tree-sitter-types';
 import { EXTRACTORS } from './languages';
 import { stripCppTemplateArgs } from './languages/c-cpp';
+import { rustImplTypeName } from './languages/rust';
 import { LiquidExtractor } from './liquid-extractor';
 import { RazorExtractor } from './razor-extractor';
 import { SvelteExtractor } from './svelte-extractor';
@@ -649,6 +650,12 @@ export class TreeSitterExtractor {
     const definedHere = new Set<string>();
     for (const n of this.nodes) {
       if (n.kind === 'function' || n.kind === 'method') definedHere.add(n.name);
+      // Python only (#1478): class-as-value is a first-class idiom (DRF
+      // get_serializer_class, Meta.model, registry dicts), so same-file CLASS
+      // names pass the gate too. Other languages keep the function/method
+      // gate — TS/JS recover class references through type annotations, and
+      // resolution's kind filter would drop their class candidates anyway.
+      else if (this.language === 'python' && n.kind === 'class') definedHere.add(n.name);
     }
 
     // Import-binding names only (all binding emitters push kind 'imports').
@@ -1059,6 +1066,11 @@ export class TreeSitterExtractor {
     else if (this.extractor.structTypes.includes(nodeType)) {
       this.extractStruct(node);
       skipChildren = true; // extractStruct visits body children
+    }
+    // Check for union declarations
+    else if (this.extractor.unionTypes?.includes(nodeType)) {
+      this.extractUnion(node);
+      skipChildren = true; // extractUnion visits body children
     }
     // Check for enum declarations
     else if (this.extractor.enumTypes.includes(nodeType)) {
@@ -1481,7 +1493,7 @@ export class TreeSitterExtractor {
 
   /**
    * Check if the current node stack indicates we are inside a class-like node
-   * (class, struct, interface, trait). File nodes do not count as class-like.
+   * (class, struct, union, interface, trait). File nodes do not count as class-like.
    */
   private isInsideClassLikeNode(): boolean {
     if (this.nodeStack.length === 0) return false;
@@ -1492,6 +1504,7 @@ export class TreeSitterExtractor {
     return (
       parentNode.kind === 'class' ||
       parentNode.kind === 'struct' ||
+      parentNode.kind === 'union' ||
       parentNode.kind === 'interface' ||
       parentNode.kind === 'trait' ||
       parentNode.kind === 'enum' ||
@@ -1801,7 +1814,7 @@ export class TreeSitterExtractor {
         (n) =>
           n.name === receiverType &&
           n.filePath === this.filePath &&
-          (n.kind === 'struct' || n.kind === 'class' || n.kind === 'enum' || n.kind === 'trait')
+          (n.kind === 'struct' || n.kind === 'union' || n.kind === 'class' || n.kind === 'enum' || n.kind === 'trait')
       );
       if (ownerNode) {
         this.edges.push({
@@ -1867,6 +1880,16 @@ export class TreeSitterExtractor {
    * Extract a struct
    */
   private extractStruct(node: SyntaxNode): void {
+    this.extractAggregate(node, 'struct');
+  }
+
+  /** Extract a union while sharing the member-walk behavior of aggregate types. */
+  private extractUnion(node: SyntaxNode): void {
+    this.extractAggregate(node, 'union');
+  }
+
+  /** Extract a struct-like declaration without conflating its semantic kind. */
+  private extractAggregate(node: SyntaxNode, kind: 'struct' | 'union'): void {
     if (!this.extractor) return;
 
     // Skip forward declarations and type references (no body = not a definition)
@@ -1880,24 +1903,24 @@ export class TreeSitterExtractor {
     const visibility = this.extractor.getVisibility?.(node);
     const isExported = this.extractor.isExported?.(node, this.source);
 
-    const structNode = this.createNode('struct', name, node, {
+    const aggregateNode = this.createNode(kind, name, node, {
       docstring,
       visibility,
       isExported,
     });
-    if (!structNode) return;
+    if (!aggregateNode) return;
 
     // Extract inheritance (e.g. Swift: struct HTTPMethod: RawRepresentable)
-    this.extractInheritance(node, structNode.id);
+    this.extractInheritance(node, aggregateNode.id);
 
     // C# primary-constructor parameter dependencies (`struct P(int x)`, and
     // `record struct M(decimal Amount)` which the grammar nests here).
-    this.extractCsharpPrimaryCtorParamRefs(node, structNode.id);
+    this.extractCsharpPrimaryCtorParamRefs(node, aggregateNode.id);
 
     // Push to stack for field extraction (bodiless positional records have
     // no members to visit)
     if (body) {
-      this.nodeStack.push(structNode.id);
+      this.nodeStack.push(aggregateNode.id);
       for (let i = 0; i < body.namedChildCount; i++) {
         const child = body.namedChild(i);
         if (child) {
@@ -2899,17 +2922,20 @@ export class TreeSitterExtractor {
     // (e.g. Go: `type Foo struct { ... }` is a type_spec wrapping struct_type)
     const resolvedKind = this.extractor.resolveTypeAliasKind?.(node, this.source);
 
-    if (resolvedKind === 'struct') {
-      const structNode = this.createNode('struct', name, node, { docstring, isExported });
-      if (!structNode) return true;
+    if (resolvedKind === 'struct' || resolvedKind === 'union') {
+      const aggregateNode = this.createNode(resolvedKind, name, node, { docstring, isExported });
+      if (!aggregateNode) return true;
       // Visit body children for field extraction
-      this.nodeStack.push(structNode.id);
-      // Try Go-style 'type' field first, then find inner struct child (C typedef struct)
+      this.nodeStack.push(aggregateNode.id);
+      // Try Go-style 'type' field first, then find the matching inner aggregate child.
       const typeChild = getChildByField(node, 'type')
-        || this.findChildByTypes(node, this.extractor.structTypes);
+        || this.findChildByTypes(
+          node,
+          resolvedKind === 'union' ? (this.extractor.unionTypes ?? []) : this.extractor.structTypes
+        );
       if (typeChild) {
         // Extract struct embedding (e.g. Go: `type DB struct { *Head; Queryable }`)
-        this.extractInheritance(typeChild, structNode.id);
+        this.extractInheritance(typeChild, aggregateNode.id);
         const body = getChildByField(typeChild, this.extractor.bodyField) || typeChild;
         for (let i = 0; i < body.namedChildCount; i++) {
           const child = body.namedChild(i);
@@ -3734,15 +3760,18 @@ export class TreeSitterExtractor {
 
     // Erlang: a local call is `call(expr: atom, args)`; a remote call nests it
     // under `remote(module: remote_module, fun: call)` — the module qualifier
-    // lives on the PARENT. Remote calls are emitted as `mod::fn`, which is
-    // byte-identical to the qualifiedName the module namespace gives every
-    // function (see packageTypes in languages/erlang.ts), so they resolve via
-    // matchByQualifiedName. A var/macro callee or module (`F(X)`, `?M(X)`,
-    // `Mod:handle(X)`) has no static target — except `?MODULE:fn(X)`, which the
-    // bare name + same-file preference resolves correctly. `fun name/1` /
-    // `fun mod:name/1` values are function REFERENCES (callback registration),
-    // and record construction/update/index/field-access are `references` to the
-    // record's struct node.
+    // lives on the PARENT. Arity is part of a function's identity (#1610), so
+    // refs carry the call-site arity: remote calls are emitted as `mod::fn/2`,
+    // byte-identical to the qualifiedName the module namespace + arity suffix
+    // gives every function (see languages/erlang.ts), so they resolve via
+    // matchByQualifiedName; local calls are emitted `fn/2` and resolved by the
+    // erlang arity step in matchReference (same-file first). A var/macro callee
+    // or module (`F(X)`, `?M(X)`, `Mod:handle(X)`) has no static target —
+    // except `?MODULE:fn(X)`, which the bare-name-with-arity + same-file
+    // preference resolves correctly. `fun name/1` / `fun mod:name/1` values
+    // are function REFERENCES (callback registration) carrying their own
+    // written arity, and record construction/update/index/field-access are
+    // `references` to the record's struct node.
     if (this.language === 'erlang') {
       const line = node.startPosition.row + 1;
       const column = node.startPosition.column;
@@ -3774,9 +3803,13 @@ export class TreeSitterExtractor {
               moduleExpr.type === 'macro_call_expr' ? getChildByField(moduleExpr, 'name') : null;
             if (!macroName || getNodeText(macroName, this.source) !== 'MODULE') return;
           }
+          // Arity from the call site's own argument list — part of the callee's
+          // identity, and what disambiguates `f/1` from `f/2` (#1610).
+          const callArgsNode = getChildByField(node, 'args');
+          const callArity = callArgsNode ? callArgsNode.namedChildCount : 0;
           this.unresolvedReferences.push({
             fromNodeId: callerId,
-            referenceName: calleeName,
+            referenceName: `${calleeName}/${callArity}`,
             referenceKind: 'calls',
             line,
             column,
@@ -3799,9 +3832,10 @@ export class TreeSitterExtractor {
             const target = argsNode?.namedChild(0) ?? null;
             const targetModule = target ? this.resolveErlangGenServerTarget(target) : null;
             if (targetModule) {
+              // OTP fixes the handler arities: handle_call/3, handle_cast/2.
               this.unresolvedReferences.push({
                 fromNodeId: callerId,
-                referenceName: `${targetModule}::${fnBare === 'cast' ? 'handle_cast' : 'handle_call'}`,
+                referenceName: `${targetModule}::${fnBare === 'cast' ? 'handle_cast/2' : 'handle_call/3'}`,
                 referenceKind: 'calls',
                 line,
                 column,
@@ -3832,9 +3866,17 @@ export class TreeSitterExtractor {
                 getChildByField(m, 'name') !== null &&
                 getNodeText(getChildByField(m, 'name')!, this.source) === 'MODULE';
               if (m.type !== 'atom' && !isLocalModule) continue;
+              // Arity of the spawned/applied function = the length of the
+              // static args-list literal directly after the (M, F) pair, when
+              // present (`spawn_link(?MODULE, request_process, [Req, Env])` →
+              // /2). A var/absent list leaves the ref arity-less; the
+              // qualified matcher then resolves it only when the module
+              // defines exactly one arity of that name.
+              const mfaList = argExprs[i + 2];
+              const arityTail = mfaList?.type === 'list' ? `/${mfaList.namedChildCount}` : '';
               this.unresolvedReferences.push({
                 fromNodeId: callerId,
-                referenceName: isLocalModule ? erlAtom(f) : `${erlAtom(m)}::${erlAtom(f)}`,
+                referenceName: (isLocalModule ? erlAtom(f) : `${erlAtom(m)}::${erlAtom(f)}`) + arityTail,
                 referenceKind: 'calls',
                 line: f.startPosition.row + 1,
                 column: f.startPosition.column,
@@ -3855,6 +3897,11 @@ export class TreeSitterExtractor {
           if (moduleAtom?.type !== 'atom') return;
           refName = `${erlAtom(moduleAtom)}::${refName}`;
         }
+        // `fun f/1` writes its arity — carry it so the ref lands on the
+        // matching arity's node (#1610).
+        const funArityNode = getChildByField(node, 'arity');
+        const funArityValue = funArityNode ? getChildByField(funArityNode, 'value') : null;
+        if (funArityValue) refName = `${refName}/${getNodeText(funArityValue, this.source)}`;
         this.unresolvedReferences.push({
           fromNodeId: callerId,
           referenceName: refName,
@@ -4405,6 +4452,26 @@ export class TreeSitterExtractor {
               } else {
                 calleeName = methodName;
               }
+            } else if (
+              this.language === 'rust' &&
+              receiver &&
+              receiver.type === 'field_expression' &&
+              getChildByField(receiver, 'value')?.type === 'self' &&
+              getChildByField(receiver, 'field')?.type === 'field_identifier'
+            ) {
+              // Rust `self.<field>.<method>()` — a call through a field of the
+              // enclosing type (#1585). Keep the `self.` prefix: the resolver
+              // recognizes the shape, reads the field's declared type off the
+              // owner struct's declaration, and resolves the method on THAT
+              // type — or leaves the ref unresolved when the type is external
+              // or unknown. Previously this collapsed to the bare method name,
+              // which exact-matched whichever same-named method was nearest —
+              // often the calling method itself, a self-edge not in the source.
+              // Deeper chains (`self.a.b.m()`), `self.f().m()` and parenthesized
+              // receivers keep the bare name. Mirrored in the kernel's
+              // extract_call (rustlang.rs).
+              const fieldName = getNodeText(getChildByField(receiver, 'field')!, this.source);
+              calleeName = `self.${fieldName}.${methodName}`;
             } else if (
               (this.language === 'cpp' ||
                 this.language === 'c' ||
@@ -5265,6 +5332,10 @@ export class TreeSitterExtractor {
         this.extractStruct(node);
         return;
       }
+      if (this.extractor!.unionTypes?.includes(nodeType)) {
+        this.extractUnion(node);
+        return;
+      }
       if (this.extractor!.enumTypes.includes(nodeType)) {
         this.extractEnum(node);
         return;
@@ -5688,38 +5759,20 @@ export class TreeSitterExtractor {
    * For plain `impl Type { ... }` (no trait), no inheritance edge is needed.
    */
   private extractRustImplItem(node: SyntaxNode): void {
-    // Check if this is `impl Trait for Type` by looking for a `for` keyword
-    const hasFor = node.children.some(
-      (c: SyntaxNode) => c.type === 'for' && !c.isNamed
-    );
-    if (!hasFor) return;
+    // `impl Trait for Type` carries the trait in the grammar's `trait` field;
+    // an inherent `impl Type { … }` has none and needs no inheritance edge.
+    const traitNode = getChildByField(node, 'trait');
+    if (!traitNode) return;
 
-    // In `impl Trait for Type`, the type_identifiers are:
-    // first = Trait name, last = implementing Type name
-    // Also handle generic types like `impl<T> Trait for MyStruct<T>`
-    const typeIdents = node.namedChildren.filter(
-      (c: SyntaxNode) => c.type === 'type_identifier' || c.type === 'generic_type' || c.type === 'scoped_type_identifier'
-    );
-    if (typeIdents.length < 2) return;
+    // Full text, so a scoped path (`std::fmt::Display`) and a generic trait
+    // (`From<u32>`) keep their spelling.
+    const traitName = getNodeText(traitNode, this.source);
 
-    const traitNode = typeIdents[0]!;
-    const typeNode = typeIdents[typeIdents.length - 1]!;
-
-    // Get the trait name (handle scoped paths like std::fmt::Display)
-    const traitName = traitNode.type === 'scoped_type_identifier'
-      ? this.source.substring(traitNode.startIndex, traitNode.endIndex)
-      : getNodeText(traitNode, this.source);
-
-    // Get the implementing type name (extract inner type_identifier for generics)
-    let typeName: string;
-    if (typeNode.type === 'generic_type') {
-      const inner = typeNode.namedChildren.find(
-        (c: SyntaxNode) => c.type === 'type_identifier'
-      );
-      typeName = inner ? getNodeText(inner, this.source) : getNodeText(typeNode, this.source);
-    } else {
-      typeName = getNodeText(typeNode, this.source);
-    }
+    // The implementing type from the `type` field (#1588). The old positional
+    // scan took the LAST type-shaped child, which for a parameterized
+    // implementing type (`BufSource<T>`, `Parents<'a>`, `&Foo`) was the trait.
+    const typeName = rustImplTypeName(getChildByField(node, 'type'), this.source);
+    if (!typeName) return;
 
     // Find the struct/type node for the implementing type
     const typeNodeId = this.findNodeByName(typeName);
@@ -5739,7 +5792,7 @@ export class TreeSitterExtractor {
    */
   private findNodeByName(name: string): string | undefined {
     for (const node of this.nodes) {
-      if (node.name === name && (node.kind === 'struct' || node.kind === 'enum' || node.kind === 'class')) {
+      if (node.name === name && (node.kind === 'struct' || node.kind === 'union' || node.kind === 'enum' || node.kind === 'class')) {
         return node.id;
       }
     }

@@ -12,6 +12,7 @@ import { applyAliases } from './path-aliases';
 import { resolveWorkspaceImport } from './workspace-packages';
 import {
   resolveMethodOnType,
+  resolveObjectLiteralMember,
   localReceiverTypePatterns,
   normalizeInferredTypeName,
 } from './name-matcher';
@@ -26,7 +27,7 @@ const EXTENSION_RESOLUTION: Record<string, string[]> = {
   // module-entry convention, hit when a bare workspace import ("data") is
   // rewritten to the member's directory; lowercase variants for safety.
   arkts: ['.ets', '.ts', '.d.ts', '.js', '/Index.ets', '/index.ets', '/index.ts', '/index.js'],
-  javascript: ['.js', '.jsx', '.mjs', '.cjs', '/index.js', '/index.jsx'],
+  javascript: ['.js', '.jsx', '.mjs', '.cjs', '.xsjs', '.xsjslib', '/index.js', '/index.jsx'],
   tsx: ['.tsx', '.ts', '.d.ts', '.js', '.jsx', '/index.tsx', '/index.ts', '/index.js'],
   jsx: ['.jsx', '.js', '/index.jsx', '/index.js'],
   // SFC consumers import plain TS/JS, sibling components, and barrels
@@ -1545,6 +1546,20 @@ export function resolveViaImport(
                 resolvedBy: 'import',
               };
             }
+            // An imported object literal used as a namespace (#1573):
+            // `api.call()` after `import { api } from './api'` where `api` is
+            // `export const api = { call() {…} }`. Its members have bare
+            // qualified names inside the constant's extent, so the
+            // `Container::member` lookup above can't see them and the edge
+            // landed on the constant — every cross-file caller of the method
+            // went missing. Resolve the member by containment instead.
+            if (targetNode.kind === 'constant' || targetNode.kind === 'variable') {
+              const member = ref.referenceName.slice(imp.localName.length + 1).split('.')[0];
+              if (member) {
+                const literalMember = resolveObjectLiteralMember(targetNode, member, ref, context, 0.9, 'import');
+                if (literalMember) return literalMember;
+              }
+            }
             // An imported VALUE (singleton constant / shared instance) called
             // through a member: `reproStore.notifyJoinGuildStatus()` after
             // `import { reproStore } from './store'`. findExportedSymbol
@@ -1827,6 +1842,7 @@ function resolveRustPathReference(
       n.name === leaf &&
       (n.kind === 'function' ||
         n.kind === 'struct' ||
+        n.kind === 'union' ||
         n.kind === 'enum' ||
         n.kind === 'trait' ||
         n.kind === 'type_alias' ||
@@ -2191,7 +2207,7 @@ function findExportedSymbolWalk(
 
 /** Node kinds that own static members reachable as `Container.member`. */
 const STATIC_MEMBER_CONTAINERS = new Set<Node['kind']>([
-  'class', 'struct', 'interface', 'enum', 'trait', 'protocol',
+  'class', 'struct', 'union', 'interface', 'enum', 'trait', 'protocol',
 ]);
 
 /**

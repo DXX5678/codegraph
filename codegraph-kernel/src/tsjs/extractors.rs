@@ -478,6 +478,7 @@ impl<'t> Walker<'t> {
     }
 
     fn find_initializer_returned_object(&self, call: Node<'t>, depth: u32) -> Option<Node<'t>> {
+        stack_guard!();
         if depth > 4 {
             return None;
         }
@@ -499,6 +500,7 @@ impl<'t> Walker<'t> {
 
     fn function_returned_object(&self, fn_node: Node<'t>) -> Option<Node<'t>> {
         fn as_object<'t>(n: Node<'t>) -> Option<Node<'t>> {
+            stack_guard!();
             match n.kind() {
                 "object" | "object_expression" => Some(n),
                 "parenthesized_expression" => {
@@ -873,6 +875,7 @@ impl<'t> Walker<'t> {
     fn extract_ts_tuple_contract_names(&mut self, value: Node<'t>, alias_row: u32, alias_name: &str) {
         let mut tuples: Vec<Node> = Vec::new();
         fn collect<'t>(n: Node<'t>, depth: u32, out: &mut Vec<Node<'t>>) {
+            stack_guard!();
             if depth > 6 {
                 return;
             }
@@ -1230,6 +1233,7 @@ impl<'t> Walker<'t> {
     // --- extractInheritance (TS/JS clauses) ---------------------------------------------------
 
     pub(super) fn extract_inheritance(&mut self, node: Node<'t>, class_row: u32) {
+        stack_guard!();
         let extends_kind = edge_kind_index("extends").unwrap();
         let implements_kind = edge_kind_index("implements").unwrap();
         for i in 0..node.named_child_count() {
@@ -1298,6 +1302,7 @@ impl<'t> Walker<'t> {
     }
 
     fn extract_type_refs_from_subtree(&mut self, node: Node<'t>, from_row: u32) {
+        stack_guard!();
         if node.kind() == "type_identifier" {
             let type_name = self.text(node).to_string();
             if !type_name.is_empty() && !is_builtin_type(&type_name) {

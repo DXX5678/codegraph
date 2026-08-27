@@ -25,8 +25,9 @@ import { extractFromSource } from './tree-sitter';
 import { ParseWorkerPool, resolveParsePoolSize, resolveParseTimeoutMs } from './parse-pool';
 import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
+import { detectGeneratedFile } from './generated-detection';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes } from './grammars';
-import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns } from '../project-config';
+import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
@@ -115,6 +116,20 @@ export interface SyncResult {
   nodesUpdated: number;
   durationMs: number;
   changedFilePaths?: string[];
+  /**
+   * Symbol names whose set of definitions this sync CHANGED — names the synced
+   * files gained or lost, as the symmetric difference of their `file\0name`
+   * definition pairs before and after the store phase (per file, so a name
+   * moving between two changed files does not cancel itself out).
+   * Resolution picks among all same-named definitions project-wide,
+   * so these are exactly the names whose already-resolved edges — in files this
+   * sync never touched — may now bind elsewhere and must be re-resolved for the
+   * index to stay convergent with a full rebuild (CG-33).
+   *
+   * A body-only edit leaves this empty, which is the common case and costs
+   * nothing downstream.
+   */
+  definitionDelta?: string[];
 }
 
 /**
@@ -1089,7 +1104,7 @@ interface GitChanges {
  * case this cannot see (the child status that would report the deletions is gone
  * with it); a full `codegraph index` reconciles that.
  */
-function getGitChangedFiles(rootDir: string): GitChanges | null {
+export function getGitChangedFiles(rootDir: string): GitChanges | null {
   try {
     const changes: GitChanges = { modified: [], added: [], deleted: [] };
     // Custom extension → language overrides from the project's codegraph.json,
@@ -1105,7 +1120,13 @@ function getGitChangedFiles(rootDir: string): GitChanges | null {
 function collectGitStatus(repoDir: string, prefix: string, out: GitChanges, overrides?: Record<string, Language>, includeIgnored: Ignore | null = null, exclude: Ignore | null = null): void {
   const output = execFileSync(
     'git',
-    ['status', '--porcelain', '--no-renames'],
+    // `-uall` lists individual untracked files instead of collapsing an
+    // entirely-untracked directory into one `?? dir/` entry, which would
+    // otherwise be dropped here (only embedded git repos are recursed into
+    // below). Nested untracked git repos still collapse to `?? repo/` even
+    // with `-uall` — git never crosses a repo boundary — so the recursion
+    // still handles them. (#1213)
+    ['status', '--porcelain', '--no-renames', '-uall'],
     { cwd: repoDir, encoding: 'utf-8', timeout: 10000, maxBuffer: 50 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }
   );
 
@@ -1427,10 +1448,46 @@ export class ExtractionOrchestrator {
    * hasn't run yet so single-file re-index paths can detect on the spot.
    */
   private detectedFrameworkNames: string[] | null = null;
+  /**
+   * Scope matcher for SCOPED syncs, memoized on the mtimes of the two root
+   * files it is derived from (`codegraph.json`, `.gitignore`). See
+   * {@link scopedSyncMatcher}.
+   */
+  private scopedMatcher: { key: string; matcher: ScopeIgnore } | null = null;
 
   constructor(rootDir: string, queries: QueryBuilder) {
     this.rootDir = rootDir;
     this.queries = queries;
+  }
+
+  /**
+   * The scope matcher a scoped sync applies to the paths it was handed — the
+   * same `buildScopeIgnore` the full scan uses, so an explicitly-passed path
+   * that is OUT of scope (a user `exclude` in `codegraph.json`, a `.gitignore`
+   * rule, a built-in default) is treated exactly as the full walk would treat
+   * it: absent, hence removed if tracked, never parsed (#1590).
+   *
+   * Memoized on the root config + root `.gitignore` mtimes: building the
+   * matcher runs embedded-repo discovery (`git ls-files`), which would defeat
+   * the scoped path's whole point (skipping O(repo) work) if paid per sync.
+   * Two `stat`s per sync while nothing changed. An embedded repo created
+   * between config edits joins the scoped matcher on the next full sync, the
+   * same lifecycle the watcher's own matcher already has.
+   */
+  private scopedSyncMatcher(): ScopeIgnore {
+    const key = [PROJECT_CONFIG_FILENAME, '.gitignore']
+      .map((name) => {
+        try {
+          return String(fs.statSync(path.join(this.rootDir, name)).mtimeMs);
+        } catch {
+          return '-';
+        }
+      })
+      .join('|');
+    if (this.scopedMatcher && this.scopedMatcher.key === key) return this.scopedMatcher.matcher;
+    const matcher = buildScopeIgnore(this.rootDir);
+    this.scopedMatcher = { key, matcher };
+    return matcher;
   }
 
   /**
@@ -1561,6 +1618,11 @@ export class ExtractionOrchestrator {
       });
     });
     if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] scan: ${Date.now() - tScan}ms (${files.length} files)`);
+
+    // A re-index over an existing DB skips unchanged-hash files at the store,
+    // which would preserve wiped zero-node rows (#1541) — drop them first so
+    // this run stores their files fresh. No-op on a fresh DB.
+    this.healZeroNodeRows();
 
     // Detect frameworks once per indexAll run using the scanned file list.
     // Names are passed to each parse call so framework-specific extractors
@@ -1694,7 +1756,7 @@ export class ExtractionOrchestrator {
     const inFlight = new Set<Promise<void>>();
     const completed = new Map<number,
       | { ok: true; filePath: string; content: string; stats: fs.Stats; result: ExtractionResult }
-      | { ok: false; filePath: string; err: unknown }>();
+      | { ok: false; filePath: string; content: string; stats: fs.Stats; err: unknown }>();
     let nextSeq = 0;       // file-order sequence assigned at dispatch
     let nextToStore = 0;   // cursor: next sequence to commit
     let aborted = false;
@@ -1722,27 +1784,25 @@ export class ExtractionOrchestrator {
       // Store: on the writer thread when active (fresh DB — bundles applied
       // in the same file order this chain dispatches them), else on the main
       // thread (SQLite connections are per-thread).
-      if (nodeCount > 0 || result.errors.length === 0) {
-        const language = detectLanguage(filePath, content, overrides);
-        if (storeWriter) {
-          if (result.kernelBuffers) {
-            // Buffers go to the writer as-is; the worker decodes + finalizes.
-            // The main thread's only per-file work stays O(1) + the content hash.
-            storeWriter.send({
-              kernel: true,
-              filePath,
-              language,
-              buffers: result.kernelBuffers,
-              file: this.buildFileRecord(filePath, content, language, stats, nodeCount, result.errors),
-            });
-          } else {
-            storeWriter.send(this.buildFreshStoreBundle(filePath, content, language, stats, result));
-          }
-          await storeWriter.waitBelow(STORE_WRITER_WINDOW);
+      const language = detectLanguage(filePath, content, overrides);
+      if (storeWriter) {
+        if (result.kernelBuffers) {
+          // Buffers go to the writer as-is; the worker decodes + finalizes.
+          // The main thread's only per-file work stays O(1) + the content hash.
+          storeWriter.send({
+            kernel: true,
+            filePath,
+            language,
+            buffers: result.kernelBuffers,
+            file: this.buildFileRecord(filePath, content, language, stats, nodeCount, result.errors),
+          });
         } else {
-          const materialized = materializeKernelResult(result, filePath, language);
-          await this.storeExtractionResult(filePath, content, language, stats, materialized, commitYield);
+          storeWriter.send(this.buildFreshStoreBundle(filePath, content, language, stats, result));
         }
+        await storeWriter.waitBelow(STORE_WRITER_WINDOW);
+      } else {
+        const materialized = materializeKernelResult(result, filePath, language);
+        await this.storeExtractionResult(filePath, content, language, stats, materialized, commitYield);
       }
 
       if (result.errors.length > 0) {
@@ -1773,16 +1833,19 @@ export class ExtractionOrchestrator {
       onProgress?.({ phase: 'parsing', current: processed, total, currentFile: filePath });
     };
 
-    const recordParseFailure = (filePath: string, err: unknown): void => {
-      processed++;
-      filesErrored++;
-      errors.push({
-        message: err instanceof Error ? err.message : String(err),
-        filePath,
-        severity: 'error',
-        code: 'parse_error',
+    const recordParseFailure = async (filePath: string, content: string, stats: fs.Stats, err: unknown): Promise<void> => {
+      await storeResult(filePath, content, stats, {
+        nodes: [],
+        edges: [],
+        unresolvedReferences: [],
+        errors: [{
+          message: err instanceof Error ? err.message : String(err),
+          filePath,
+          severity: 'error',
+          code: 'parse_error',
+        }],
+        durationMs: 0,
       });
-      onProgress?.({ phase: 'parsing', current: processed, total });
     };
 
     // Commit buffered parses to the DB in file order, advancing the cursor over
@@ -1805,7 +1868,7 @@ export class ExtractionOrchestrator {
             completed.delete(nextToStore);
             nextToStore++;
             if (item.ok) await storeResult(item.filePath, item.content, item.stats, item.result);
-            else recordParseFailure(item.filePath, item.err);
+            else await recordParseFailure(item.filePath, item.content, item.stats, item.err);
           }
         } catch (err) {
           flushError = err;
@@ -1824,7 +1887,7 @@ export class ExtractionOrchestrator {
           const result = await parseFile(filePath, content);
           completed.set(seq, { ok: true, filePath, content, stats, result });
         } catch (parseErr) {
-          completed.set(seq, { ok: false, filePath, err: parseErr });
+          completed.set(seq, { ok: false, filePath, content, stats, err: parseErr });
         }
         flushOrdered();
       })();
@@ -1895,15 +1958,18 @@ export class ExtractionOrchestrator {
         // useful symbols. The single-file extractFile path already enforces
         // this; the bulk path used to silently skip the check.
         if (stats.size > MAX_FILE_SIZE) {
-          processed++;
-          filesSkipped++;
-          errors.push({
-            message: `File exceeds max size (${stats.size} > ${MAX_FILE_SIZE})`,
-            filePath,
-            severity: 'warning',
-            code: 'size_exceeded',
+          await storeResult(filePath, content, stats, {
+            nodes: [],
+            edges: [],
+            unresolvedReferences: [],
+            errors: [{
+              message: `File exceeds max size (${stats.size} > ${MAX_FILE_SIZE})`,
+              filePath,
+              severity: 'warning',
+              code: 'size_exceeded',
+            }],
+            durationMs: 0,
           });
-          onProgress?.({ phase: 'parsing', current: processed, total });
           continue;
         }
 
@@ -2010,8 +2076,16 @@ export class ExtractionOrchestrator {
           continue;
         }
 
+        // The pool hands kernel results back as an undecoded buffer transport
+        // (`nodes`/`edges` EMPTY, tables in kernelBuffers). The main loop
+        // decodes or forwards to the store worker; this path stores directly,
+        // so decode here — otherwise a kernel-language retry passes the gate
+        // below via `errors.length === 0`, stores nothing, and the file is
+        // permanently recorded as "(0 symbols)" with the error erased (#1541).
+        const language = detectLanguage(filePath, content, overrides);
+        result = materializeKernelResult(result, filePath, language);
+
         if (result.nodes.length > 0 || result.errors.length === 0) {
-          const language = detectLanguage(filePath, content, overrides);
           const stats = await fsp.stat(path.join(this.rootDir, filePath));
           await this.storeExtractionResult(filePath, content, language, stats, result, commitYield);
 
@@ -2060,13 +2134,22 @@ export class ExtractionOrchestrator {
             continue;
           }
 
+          // Same undecoded-transport hazard as the first retry pass (#1541).
+          const language = detectLanguage(filePath, fullContent, overrides);
+          result = materializeKernelResult(result, filePath, language);
+
           if (result.nodes.length > 0 || result.errors.length === 0) {
-            const language = detectLanguage(filePath, fullContent, overrides);
             const stats = await fsp.stat(path.join(this.rootDir, filePath));
             await this.storeExtractionResult(filePath, fullContent, language, stats, result, commitYield);
 
-            const idx = errors.indexOf(errEntry);
-            if (idx >= 0) errors.splice(idx, 1);
+            // Salvaged from comment-stripped source: keep a visible trace in
+            // the summary instead of erasing the failure outright — the
+            // stored result may be missing whatever the failing parse choked
+            // on, and a silently "clean" file here is how an index quietly
+            // disagrees with a later per-file sync of the same bytes (#1565).
+            errEntry.severity = 'warning';
+            errEntry.code = 'salvaged_stripped';
+            errEntry.message = `Indexed from comment-stripped source after repeated parse failures (symbols may be incomplete until the file is re-indexed): ${errEntry.message}`;
             filesErrored--;
             filesIndexed++;
             totalNodes += result.nodes.length;
@@ -2205,9 +2288,11 @@ export class ExtractionOrchestrator {
       };
     }
 
+    const language = detectLanguage(relativePath, content, loadExtensionOverrides(this.rootDir));
+
     // Check file size
     if (stats.size > MAX_FILE_SIZE) {
-      return {
+      const result: ExtractionResult = {
         nodes: [],
         edges: [],
         unresolvedReferences: [],
@@ -2221,10 +2306,11 @@ export class ExtractionOrchestrator {
         ],
         durationMs: 0,
       };
+      await this.storeExtractionResult(relativePath, content, language, stats, result, createYielder());
+      return result;
     }
 
     // Detect language (honoring the project's codegraph.json extension overrides)
-    const language = detectLanguage(relativePath, content, loadExtensionOverrides(this.rootDir));
     if (!isLanguageSupported(language)) {
       return {
         nodes: [],
@@ -2242,9 +2328,7 @@ export class ExtractionOrchestrator {
     const result = extractFromSource(relativePath, content, language, frameworkNames);
 
     // Store in database
-    if (result.nodes.length > 0 || result.errors.length === 0) {
-      await this.storeExtractionResult(relativePath, content, language, stats, result, createYielder());
-    }
+    await this.storeExtractionResult(relativePath, content, language, stats, result, createYielder());
 
     return result;
   }
@@ -2252,6 +2336,34 @@ export class ExtractionOrchestrator {
   /**
    * Store extraction result in database
    */
+  /**
+   * Delete file rows recorded with ZERO nodes so their files re-index.
+   *
+   * No extraction path stores an empty, error-free result for a
+   * symbol-bearing language — even an empty file keeps its file node — so a
+   * zero-node row is a wiped one (#1541: an interrupted parse's retry stored
+   * an undecoded kernel transport). The wiped row's content hash matches the
+   * on-disk bytes, so every hash-based reconcile skips the file forever;
+   * deleting the row lets the normal add path repair it. File-level-only
+   * languages (yaml, twig, properties) are left alone. Deleting a zero-node
+   * row cascades nothing: it has no nodes, so no edges or refs either.
+   */
+  private healZeroNodeRows(): void {
+    for (const f of this.queries.getAllFiles()) {
+      // A zero-node row WITH recorded errors is a deliberate skip marker
+      // (#1557: oversized / repeatedly-unparseable files are persisted with
+      // their reason so syncs stop retrying them) — leave those alone. The
+      // #1541 wipe rows are the error-FREE zero-node rows.
+      if (
+        f.nodeCount === 0 &&
+        !isFileLevelOnlyLanguage(f.language) &&
+        (f.errors === undefined || f.errors.length === 0)
+      ) {
+        this.queries.deleteFile(f.path);
+      }
+    }
+  }
+
   private async storeExtractionResult(
     filePath: string,
     content: string,
@@ -2260,6 +2372,12 @@ export class ExtractionOrchestrator {
     result: ExtractionResult,
     onYield?: MaybeYield
   ): Promise<void> {
+    // A kernel result can arrive as an undecoded buffer transport (empty
+    // node/edge arrays, tables riding in kernelBuffers). Decode it before
+    // storing — persisting the transport as-is records the file as having no
+    // symbols at all (#1541). No-op for already-decoded results.
+    result = materializeKernelResult(result, filePath, language);
+
     // Bulk inserts run in bounded sub-transactions with a yield between, so a
     // giant generated file (tens of thousands of symbols) can't block the
     // event loop — and the #850 watchdog heartbeat — for the whole store.
@@ -2269,11 +2387,26 @@ export class ExtractionOrchestrator {
     const STORE_CHUNK = 2000;
     const contentHash = hashContent(content);
 
-    // Check if file already exists and hasn't changed
+    // Check if file already exists and hasn't changed. A skip/failure MARKER
+    // row (zero nodes + recorded errors, #1557) never blocks a store carrying
+    // real content: markers are written BEFORE the retry pass under the same
+    // content hash, so treating them as "no changes" would silently discard a
+    // successful retry's symbols — a permanent empty file presented as
+    // recovered (the #1541 wipe, reintroduced through the marker path).
     const existingFile = this.queries.getFileByPath(filePath);
     if (existingFile && existingFile.contentHash === contentHash) {
-      return; // No changes
+      const existingIsMarker =
+        existingFile.nodeCount === 0 && (existingFile.errors?.length ?? 0) > 0;
+      const incomingHasContent = result.nodes.length > 0;
+      if (!existingIsMarker || !incomingHasContent) {
+        return; // No changes
+      }
     }
+
+    // Re-decided on every re-index of a changed file, so a banner added (or
+    // removed) by an edit is reflected on the next sync (#1500). Computed after
+    // the unchanged-file early return so untouched files pay nothing.
+    const generated = detectGeneratedFile(filePath, content);
 
     // Snapshot incoming cross-file edges BEFORE deleting this file's nodes.
     // `deleteFile` cascades to delete every edge whose source OR target is a
@@ -2340,6 +2473,7 @@ export class ExtractionOrchestrator {
           indexedAt: Date.now(),
           nodeCount: result.nodes.length,
           errors: result.errors.length > 0 ? result.errors : undefined,
+          generated,
         },
       });
       if (crossFileIncomingEdges.length > 0) {
@@ -2400,6 +2534,7 @@ export class ExtractionOrchestrator {
       indexedAt: Date.now(),
       nodeCount: result.nodes.length,
       errors: result.errors.length > 0 ? result.errors : undefined,
+      generated,
     };
     this.queries.upsertFile(fileRecord);
   }
@@ -2427,6 +2562,10 @@ export class ExtractionOrchestrator {
       indexedAt: Date.now(),
       nodeCount,
       errors: resultErrors.length > 0 ? resultErrors : undefined,
+      // Decided here, once, while the content is already in memory — never at
+      // query time (#1500). The header scan short-circuits on a single
+      // substring test for ~every hand-written file.
+      generated: detectGeneratedFile(filePath, content),
     };
   }
 
@@ -2480,6 +2619,64 @@ export class ExtractionOrchestrator {
   }
 
   /**
+   * Re-open, for re-resolution, every resolution edge whose answer this sync
+   * may have changed — the fix for index drift (CG-33).
+   *
+   * Incremental sync re-resolves only the references IN the changed files, but
+   * resolution's answer is a function of the WHOLE graph: a reference binds to
+   * one of the same-named definitions project-wide, so adding or removing a
+   * definition of `pct` can change which `pct` every other file's `pct(...)`
+   * should bind to. Those other files are never revisited, and their references
+   * resolved successfully once and were deleted from `unresolved_refs`, so
+   * nothing existed to revisit them with — the index kept an answer that was
+   * correct against an older graph. Measured on codegraph's own long-lived
+   * index: 4.3% of distinct edges differed from a clean rebuild, in BOTH
+   * directions, overwhelmingly `calls`. See docs/benchmarks/index-drift-cg33.md.
+   *
+   * This deletes each affected edge and re-inserts it as the reference that
+   * created it (the refName/refKind stamp), status='pending', for the sync's
+   * resolution sweep to bind against the post-sync graph — the same input a
+   * full rebuild resolves from, which is what makes the two converge.
+   *
+   * Deliberately conservative in three ways, because a wrong deletion is a
+   * permanent edge loss while a missed rebind is only residual drift:
+   * - an edge with no refName stamp (synthesized, or built by an engine older
+   *   than the stamp) is left ALONE rather than reconstructed from the target's
+   *   plain name, same rule as `resurrectRefFromDroppedEdge`;
+   * - edges whose source is in a file this sync already re-extracted are
+   *   skipped — their references were re-resolved from scratch moments ago;
+   * - very common names are skipped by the per-name ceiling in
+   *   `getResolutionEdgesByTargetName`.
+   *
+   * Returns the number of references resurrected.
+   */
+  resurrectStaleResolutionEdges(definitionDelta: string[], changedFilePaths: string[]): number {
+    if (definitionDelta.length === 0) return 0;
+    const alreadyFresh = new Set(changedFilePaths);
+    const candidates = this.queries.getResolutionEdgesByTargetName(definitionDelta);
+
+    const edgeIds: number[] = [];
+    const refs: UnresolvedReference[] = [];
+    for (const e of candidates) {
+      if (alreadyFresh.has(e.sourceFilePath)) continue;
+      const ref = resurrectRefFromDroppedEdge(e);
+      if (!ref) continue; // no stamp — never delete what we cannot restore
+      edgeIds.push(e.edgeId);
+      refs.push(ref);
+    }
+    if (refs.length === 0) return 0;
+
+    // Delete first. The sweep re-inserts whichever edge resolution now picks,
+    // and `insertEdges` is INSERT OR IGNORE against idx_edges_identity — so a
+    // rebind to the same target is a clean no-op, but leaving the old row in
+    // place for a rebind ELSEWHERE would keep both, turning drift into
+    // duplication.
+    this.queries.deleteEdgesByIds(edgeIds);
+    this.queries.insertUnresolvedRefsBatch(refs);
+    return refs.length;
+  }
+
+  /**
    * Sync the index with the current file state.
    *
    * Change detection is filesystem-based, never git: a (size, mtime) stat
@@ -2508,6 +2705,10 @@ export class ExtractionOrchestrator {
     let filesRemoved = 0;
     let nodesUpdated = 0;
     const changedFilePaths: string[] = [];
+    // `file\0name` definition pairs for the files this sync touches, sampled
+    // BEFORE their nodes are replaced/deleted. Compared against the post-store
+    // pairs below to derive `definitionDelta` (CG-33).
+    const pairsBefore = new Set<string>();
 
     onProgress?.({
       phase: 'scanning',
@@ -2535,7 +2736,23 @@ export class ExtractionOrchestrator {
       // reads `filesChecked === 0 && durationMs === 0` as the
       // lock-unavailable signature (#449).
       const unique = [...new Set(scopedPaths)];
-      currentFiles = unique.filter((p) => fs.existsSync(path.join(this.rootDir, p)));
+      // A scoped path is "present" only if it exists AND is in scope — the
+      // same two gates the full walk applies (source extension, scope
+      // matcher). Without the scope gate a caller's stale view of scope
+      // leaked straight into the index: the watcher re-parsed a file the
+      // user had just excluded in `codegraph.json` while `codegraph sync`
+      // removed it (#1590). Out-of-scope paths fall out of `currentFiles`,
+      // so a tracked one takes the removal branch below, exactly as a full
+      // sync would treat it. (`include`-forced paths pass: ScopeIgnore
+      // applies the include precedence itself.)
+      const scope = this.scopedSyncMatcher();
+      const overrides = loadExtensionOverrides(this.rootDir);
+      currentFiles = unique.filter(
+        (p) =>
+          isSourceFile(p, overrides) &&
+          !scope.ignores(p) &&
+          fs.existsSync(path.join(this.rootDir, p))
+      );
       trackedFiles = [];
       for (const p of unique) {
         const rec = this.queries.getFileByPath(p);
@@ -2547,6 +2764,10 @@ export class ExtractionOrchestrator {
       currentFiles = await scanDirectoryAsync(this.rootDir);
       if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] sync-scan: ${Date.now() - tSyncScan}ms (${currentFiles.length} files)`);
       filesChecked = currentFiles.length;
+
+      // Full reconcile only (scoped syncs must not touch rows outside their
+      // scope): drop zero-node rows so the wiped files re-index as adds below.
+      this.healZeroNodeRows();
 
       const tTracked = Date.now();
       trackedFiles = this.queries.getAllFiles();
@@ -2573,6 +2794,9 @@ export class ExtractionOrchestrator {
         // failed until the symbol reappears somewhere. (A deleted file whose
         // CALLERS are also being deleted is fine: their nodes cascade later
         // in this loop and take the resurrected rows with them.)
+        // Every name this file defined is about to stop existing here, which
+        // narrows the candidate set for that name repo-wide (CG-33).
+        for (const pair of this.queries.getNodeNamePairsByFiles([tracked.path])) pairsBefore.add(pair);
         const incoming = this.queries.getCrossFileIncomingEdgesWithTarget(tracked.path);
         if (incoming.length > 0) {
           const resurrected = incoming
@@ -2639,6 +2863,14 @@ export class ExtractionOrchestrator {
       }
     }
 
+    // Sampled here — after the add/modify classification, before any file is
+    // re-extracted — because `storeExtractionResult` deletes a file's nodes
+    // before inserting the new ones, so this is the last point the pre-edit
+    // definition set is readable (CG-33).
+    if (filesToIndex.length > 0) {
+      for (const pair of this.queries.getNodeNamePairsByFiles(filesToIndex)) pairsBefore.add(pair);
+    }
+
     // Load only grammars needed for changed files
     if (filesToIndex.length > 0) {
       const overrides = loadExtensionOverrides(this.rootDir);
@@ -2665,6 +2897,25 @@ export class ExtractionOrchestrator {
       nodesUpdated += result.nodes.length;
     }
 
+    // Names whose definition set this sync changed: a `file\0name` pair present
+    // before but not after (removed/renamed away) or after but not before
+    // (added). A pair on both sides is untouched as far as resolution's
+    // candidate set is concerned — only its node id moved, which
+    // reattachCrossFileEdges already follows — so an edit that only changes
+    // bodies yields an empty delta and no downstream rebind work (CG-33).
+    //
+    // Compared per FILE, not as one name set over the whole batch: a commit
+    // that adds `collect` to a new file while an unrelated changed file already
+    // defined `collect` must still flag the name, and a bare name set cancels
+    // exactly that case out. That miss left the largest residual class in the
+    // first measurement of this fix.
+    const pairsAfter = this.queries.getNodeNamePairsByFiles(filesToIndex);
+    const deltaNames = new Set<string>();
+    const nameOf = (pair: string) => pair.slice(pair.indexOf('\0') + 1);
+    for (const pair of pairsBefore) if (!pairsAfter.has(pair)) deltaNames.add(nameOf(pair));
+    for (const pair of pairsAfter) if (!pairsBefore.has(pair)) deltaNames.add(nameOf(pair));
+    const definitionDelta = [...deltaNames];
+
     return {
       filesChecked,
       filesAdded,
@@ -2673,6 +2924,7 @@ export class ExtractionOrchestrator {
       nodesUpdated,
       durationMs: Date.now() - startTime,
       changedFilePaths: changedFilePaths.length > 0 ? changedFilePaths : undefined,
+      definitionDelta: definitionDelta.length > 0 ? definitionDelta : undefined,
     };
   }
 

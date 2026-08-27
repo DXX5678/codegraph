@@ -1061,7 +1061,7 @@ async function interfaceOverrideEdges(queries: QueryBuilder, onYield: MaybeYield
   // Concrete-side kinds vary by language: `class` covers Java / Kotlin /
   // C# / TS / Swift-classes / Scala-classes; `struct` covers Swift value
   // types that conform to protocols. Iterate both.
-  const concreteKinds = ['class', 'struct'] as const;
+  const concreteKinds = ['class', 'struct', 'union'] as const;
   for (const kind of concreteKinds) {
   for (const cls of queries.iterateNodesByKind(kind)) {
     if ((++scanned255 & 63) === 0) await onYield();
@@ -1241,7 +1241,12 @@ async function reactJsxChildEdges(ctx: ResolutionContext, onYield: MaybeYield): 
     if ((++scanned & 255) === 0) await onYield(); // #1091: yield mid-scan on huge graphs
     const content = ctx.readFile(file);
     if (!content || (!content.includes('</') && !content.includes('/>'))) continue; // JSX-file gate
-    const parents = ctx.getNodesInFile(file).filter((n) => PARENT_KINDS.has(n.kind));
+    // File-level language gate, not merely a project-level one: mixed C/JS
+    // monorepos must not interpret `"<Foo/>"` inside C as JSX (#1560).
+    const parents = ctx.getNodesInFile(file).filter(
+      (n) => PARENT_KINDS.has(n.kind) && JS_FAMILY.includes(n.language)
+    );
+    if (parents.length === 0) continue;
     for (const parent of parents) {
       const src = sliceLines(content, parent.startLine, parent.endLine);
       if (!src || (!src.includes('</') && !src.includes('/>'))) continue;
@@ -3003,6 +3008,10 @@ const ERLANG_BEHAVIOUR_FANOUT_CAP = 24;
  */
 function erlangArityAt(src: string, openIdx: number): number {
   let depth = 1;
+  // `<<1,2,3>>` binary literals: commas inside are element separators, not
+  // argument separators. Tracked separately from bracket depth because the
+  // single-char `<`/`>` comparison operators must stay inert (#1358).
+  let binDepth = 0;
   let commas = 0;
   let sawArg = false;
   const limit = Math.min(src.length, openIdx + 4000);
@@ -3023,13 +3032,15 @@ function erlangArityAt(src: string, openIdx: number): number {
       sawArg = true;
       continue;
     }
+    if (ch === '<' && src[i + 1] === '<') { binDepth++; i++; sawArg = true; continue; }
+    if (ch === '>' && src[i + 1] === '>' && binDepth > 0) { binDepth--; i++; continue; }
     if (ch === '(' || ch === '[' || ch === '{') { depth++; sawArg = true; continue; }
     if (ch === ')' || ch === ']' || ch === '}') {
       depth--;
       if (depth === 0) return sawArg ? commas + 1 : 0;
       continue;
     }
-    if (ch === ',' && depth === 1) { commas++; continue; }
+    if (ch === ',' && depth === 1 && binDepth === 0) { commas++; continue; }
     if (!/\s/.test(ch)) sawArg = true;
   }
   return -1;
@@ -3260,12 +3271,18 @@ async function erlangBehaviourDispatchEdges(queries: QueryBuilder, ctx: Resoluti
   }
   if (declaringBehaviours.size === 0) return [];
 
-  // Implementer target lookup, lazy per (behaviour, fn): implementers come
-  // from the `implements` edges extraction resolved, and the target is the
-  // implementer module's own exported `fn` function node.
+  // Implementer target lookup, lazy per (behaviour, fn, arity): implementers
+  // come from the `implements` edges extraction resolved, and the target is
+  // the implementer module's own exported `fn` node OF THE SITE'S ARITY —
+  // function qualifiedNames carry arity (`mod::fn/2`, #1610), so the arity the
+  // dispatch site used selects among same-named definitions.
   const targetCache = new Map<string, Node[]>();
-  const targetsOf = (behaviour: Node, fn: string): Node[] => {
-    const cacheKey = `${behaviour.id}#${fn}`;
+  const qnArity = (qn: string): number => {
+    const m = /\/(\d{1,3})$/.exec(qn);
+    return m ? Number(m[1]) : -1;
+  };
+  const targetsOf = (behaviour: Node, fn: string, arity: number): Node[] => {
+    const cacheKey = `${behaviour.id}#${fn}/${arity}`;
     let targets = targetCache.get(cacheKey);
     if (targets) return targets;
     targets = [];
@@ -3274,7 +3291,13 @@ async function erlangBehaviourDispatchEdges(queries: QueryBuilder, ctx: Resoluti
       if (!impl || impl.language !== 'erlang' || impl.kind !== 'namespace') continue;
       const fnNode = ctx
         .getNodesInFile(impl.filePath)
-        .find((n) => n.kind === 'function' && n.name === fn && n.isExported !== false);
+        .find(
+          (n) =>
+            n.kind === 'function' &&
+            n.name === fn &&
+            qnArity(n.qualifiedName) === arity &&
+            n.isExported !== false,
+        );
       if (fnNode) targets.push(fnNode);
     }
     targetCache.set(cacheKey, targets);
@@ -3303,7 +3326,7 @@ async function erlangBehaviourDispatchEdges(queries: QueryBuilder, ctx: Resoluti
       const behaviours = declaringBehaviours.get(`${fn}/${arity}`);
       if (!behaviours || behaviours.length !== 1) continue; // unknown or ambiguous
       const behaviour = behaviours[0]!;
-      const targets = targetsOf(behaviour, fn);
+      const targets = targetsOf(behaviour, fn, arity);
       if (targets.length === 0 || targets.length > ERLANG_BEHAVIOUR_FANOUT_CAP) continue;
       const line = safe.slice(0, m.index).split('\n').length;
       const disp = enclosingFn(nodesInFile, line);
@@ -3533,7 +3556,7 @@ export const SYNTH_PASSES: SynthPassDef[] = [
   { name: 'closureCollEdges', gate: ALWAYS, run: (q, c, y) => closureCollectionEdges(q, c, y) },
   { name: 'emitterEdges', gate: ALWAYS, run: (_q, c, y) => eventEmitterEdges(c, y) },
   { name: 'renderEdges', gate: ALWAYS, run: (q, c, y) => reactRenderEdges(q, c, y) },
-  { name: 'jsxEdges', gate: ALWAYS, run: (_q, c, y) => reactJsxChildEdges(c, y) },
+  { name: 'jsxEdges', gate: (has) => has(...JS_FAMILY), run: (_q, c, y) => reactJsxChildEdges(c, y) },
   { name: 'vueEdges', gate: (has) => has('vue'), run: (_q, c, y) => vueTemplateEdges(c, y) },
   { name: 'svelteKitEdges', gate: (has) => has('svelte'), run: (_q, c, y) => svelteKitLoadEdges(c, y) },
   { name: 'pascalEdges', gate: ALWAYS, run: (_q, c, y) => pascalFormEdges(c, y) },
