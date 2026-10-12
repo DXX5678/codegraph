@@ -103,8 +103,11 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
   }
 
   // Step 2: install the codegraph npm package on PATH (always offered;
-  // matches existing behavior). Skipped when --yes (assume present).
-  if (!useDefaults) {
+  // matches existing behavior). Skipped when --yes (assume present),
+  // or when icode is among the selected targets — iCode bundles its
+  // own runtime and does not need a separate CLI on PATH.
+  const hasIcode = targets.some(t => t.id === 'icode');
+  if (!useDefaults && !hasIcode) {
     const shouldInstallGlobally = await clack.confirm({
       message: 'Install the codegraph CLI on your PATH? (Required so agents can launch the MCP server)',
       initialValue: true,
@@ -241,7 +244,7 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       );
       continue;
     }
-    const result = target.install(location, { autoAllow, promptHook });
+    const result = await target.install(location, { autoAllow, promptHook });
     installedIds.push(target.id);
     for (const file of result.files) {
       if (file.action === 'created') sawCreated = true;
@@ -351,11 +354,11 @@ export interface UninstallReport {
  * installed (it returns `not-found` actions), so this is safe to run
  * across every target unconditionally.
  */
-export function uninstallTargets(
+export async function uninstallTargets(
   targets: readonly AgentTarget[],
   location: Location,
-): UninstallReport[] {
-  return targets.map((target) => {
+): Promise<UninstallReport[]> {
+  const results = await Promise.all(targets.map(async (target) => {
     if (!target.supportsLocation(location)) {
       const only: Location = location === 'local' ? 'global' : 'local';
       return {
@@ -366,7 +369,7 @@ export function uninstallTargets(
         notes: [`no ${location} config — this agent is ${only}-only`],
       };
     }
-    const result = target.uninstall(location);
+    const result = await target.uninstall(location);
     const removedPaths = result.files
       .filter((f) => f.action === 'removed')
       .map((f) => f.path);
@@ -377,7 +380,8 @@ export function uninstallTargets(
       removedPaths,
       notes: result.notes ?? [],
     };
-  });
+  }));
+  return results;
 }
 
 export type RefreshStatus = 'refreshed' | 'unchanged' | 'not-configured' | 'unsupported';
@@ -416,28 +420,30 @@ export interface RefreshReport {
  * Exposed (and unit-tested) separately from the CLI wiring, same as
  * `uninstallTargets`.
  */
-export function refreshTargets(
+export async function refreshTargets(
   targets: readonly AgentTarget[],
   location: Location,
-): RefreshReport[] {
-  return targets.map((target) => {
-    const base = { id: target.id, displayName: target.displayName, location };
-    if (!target.supportsLocation(location)) {
-      return { ...base, status: 'unsupported' as const, changedPaths: [] };
-    }
-    if (!target.detect(location).alreadyConfigured) {
-      return { ...base, status: 'not-configured' as const, changedPaths: [] };
-    }
-    const result = target.install(location, { autoAllow: false, promptHook: undefined });
-    const changedPaths = result.files
-      .filter((f) => f.action === 'created' || f.action === 'updated' || f.action === 'removed')
-      .map((f) => f.path);
-    return {
-      ...base,
-      status: changedPaths.length > 0 ? ('refreshed' as const) : ('unchanged' as const),
-      changedPaths,
-    };
-  });
+): Promise<RefreshReport[]> {
+  return Promise.all(
+    targets.map(async (target) => {
+      const base = { id: target.id, displayName: target.displayName, location };
+      if (!target.supportsLocation(location)) {
+        return { ...base, status: 'unsupported' as const, changedPaths: [] };
+      }
+      if (!target.detect(location).alreadyConfigured) {
+        return { ...base, status: 'not-configured' as const, changedPaths: [] };
+      }
+      const result = await target.install(location, { autoAllow: false, promptHook: undefined });
+      const changedPaths = result.files
+        .filter((f) => f.action === 'created' || f.action === 'updated' || f.action === 'removed')
+        .map((f) => f.path);
+      return {
+        ...base,
+        status: changedPaths.length > 0 ? ('refreshed' as const) : ('unchanged' as const),
+        changedPaths,
+      };
+    }),
+  );
 }
 
 /**
@@ -469,7 +475,7 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
     const sel = await clack.select({
       message: 'Remove CodeGraph from all your projects, or just this one?',
       options: [
-        { value: 'global' as const, label: 'All projects (global)', hint: '~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro, ~/.copilot, ~/.config/github-copilot' },
+        { value: 'global' as const, label: 'All projects (global)', hint: '~/.chrys, ~/.claude, ~/.cursor, ~/.codex, ~/.config/opencode, ~/.hermes, ~/.gemini, ~/.kiro, ~/.copilot, ~/.config/github-copilot' },
         { value: 'local'  as const, label: 'Just this project (local)', hint: './.claude, ./.cursor, ./.vscode, ./opencode.jsonc, ./.gemini, ./.kiro' },
       ],
       initialValue: 'global' as const,
@@ -497,7 +503,7 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
   }
 
   // Step 3: sweep + per-agent feedback.
-  const reports = uninstallTargets(targets, location);
+  const reports = await uninstallTargets(targets, location);
   const removed = reports.filter((r) => r.status === 'removed');
 
   for (const r of reports) {
