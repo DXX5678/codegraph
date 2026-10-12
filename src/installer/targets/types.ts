@@ -75,6 +75,37 @@ export interface InstallOptions {
    * leaves it untouched. Targets without a prompt-hook concept ignore it.
    */
   promptHook?: boolean;
+  /**
+   * Force a non-interactive install: a target whose install would
+   * otherwise open a prompt (iCode's profile multi-select) must pick
+   * its defaults instead. Set by the `install --refresh` sweep and by
+   * `--yes`, which must never block on stdin. Targets with no prompt
+   * ignore it.
+   */
+  nonInteractive?: boolean;
+  /**
+   * Only touch config that is already present — never add a first-time
+   * install. Set by the `install --refresh` sweep, which heals already
+   * configured targets in place. Only meaningful for targets that fan
+   * out over many config files (iCode's per-profile files): a target
+   * with a single config file ignores it and rewrites that file as
+   * usual.
+   */
+  existingOnly?: boolean;
+}
+
+/**
+ * Options for {@link AgentTarget.uninstall}.
+ */
+export interface UninstallOptions {
+  /**
+   * Force a non-interactive uninstall: a target whose uninstall would
+   * otherwise open a prompt (iCode's profile multi-select) must pick its
+   * defaults instead. Set by `codegraph uninstall --yes` and by the npm
+   * `preuninstall` hook — neither may block on stdin. Targets with no
+   * prompt ignore it.
+   */
+  nonInteractive?: boolean;
 }
 
 export interface AgentTarget {
@@ -106,9 +137,10 @@ export interface AgentTarget {
    * Inverse of install. Removes only what install would have written;
    * preserves sibling MCP servers, sibling permissions, and unrelated
    * markdown sections. Must be safe to call when nothing was ever
-   * installed (returns `not-found` actions).
+   * installed (returns `not-found` actions). `opts.nonInteractive`
+   * suppresses any prompt the target would otherwise open.
    */
-  uninstall(loc: Location): Promise<WriteResult> | WriteResult;
+  uninstall(loc: Location, opts?: UninstallOptions): Promise<WriteResult> | WriteResult;
   /**
    * Print the MCP-server snippet a user would paste manually for this
    * target. Used by `codegraph install --print-config <id>` and by

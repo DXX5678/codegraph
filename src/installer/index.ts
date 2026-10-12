@@ -22,7 +22,7 @@ import {
   getTarget,
   resolveTargetFlag,
 } from './targets/registry';
-import type { AgentTarget, Location, TargetId } from './targets/types';
+import type { AgentTarget, Location, TargetId, UninstallOptions } from './targets/types';
 // Import the lightweight submodules directly (not the ../sync barrel, which
 // re-exports FileWatcher and would transitively pull in ../extraction — the
 // installer must stay importable even when native modules can't load).
@@ -103,11 +103,13 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
   }
 
   // Step 2: install the codegraph npm package on PATH (always offered;
-  // matches existing behavior). Skipped when --yes (assume present),
-  // or when icode is among the selected targets — iCode bundles its
-  // own runtime and does not need a separate CLI on PATH.
-  const hasIcode = targets.some(t => t.id === 'icode');
-  if (!useDefaults && !hasIcode) {
+  // matches existing behavior). Skipped when --yes (assume present), or when
+  // iCode is the SOLE target — the user reached this command through a
+  // codegraph they already have runnable, and iCode is lenient about a
+  // missing CLI elsewhere. It stays offered the moment any other agent is
+  // selected, since those configs hard-depend on `codegraph` being on PATH.
+  const onlyIcode = targets.length === 1 && targets[0]!.id === 'icode';
+  if (!useDefaults && !onlyIcode) {
     const shouldInstallGlobally = await clack.confirm({
       message: 'Install the codegraph CLI on your PATH? (Required so agents can launch the MCP server)',
       initialValue: true,
@@ -244,7 +246,13 @@ export async function runInstallerWithOptions(opts: RunInstallerOptions): Promis
       );
       continue;
     }
-    const result = await target.install(location, { autoAllow, promptHook });
+    const result = await target.install(location, {
+      autoAllow,
+      promptHook,
+      // --yes means "take every default, ask nothing" — including a target's
+      // own profile prompt.
+      nonInteractive: useDefaults,
+    });
     installedIds.push(target.id);
     for (const file of result.files) {
       if (file.action === 'created') sawCreated = true;
@@ -352,11 +360,13 @@ export interface UninstallReport {
  *
  * Each target's `uninstall()` is already safe to call when nothing was
  * installed (it returns `not-found` actions), so this is safe to run
- * across every target unconditionally.
+ * across every target unconditionally. `opts.nonInteractive` is threaded
+ * through to suppress a target's own prompt.
  */
 export async function uninstallTargets(
   targets: readonly AgentTarget[],
   location: Location,
+  opts?: UninstallOptions,
 ): Promise<UninstallReport[]> {
   const results = await Promise.all(targets.map(async (target) => {
     if (!target.supportsLocation(location)) {
@@ -369,7 +379,7 @@ export async function uninstallTargets(
         notes: [`no ${location} config — this agent is ${only}-only`],
       };
     }
-    const result = await target.uninstall(location);
+    const result = await target.uninstall(location, opts);
     const removedPaths = result.files
       .filter((f) => f.action === 'removed')
       .map((f) => f.path);
@@ -433,7 +443,15 @@ export async function refreshTargets(
       if (!target.detect(location).alreadyConfigured) {
         return { ...base, status: 'not-configured' as const, changedPaths: [] };
       }
-      const result = await target.install(location, { autoAllow: false, promptHook: undefined });
+      const result = await target.install(location, {
+        autoAllow: false,
+        promptHook: undefined,
+        // A refresh sweep must never block on stdin ...
+        nonInteractive: true,
+        // ... and must heal only what is already wired up, never add a
+        // first-time install to config the user didn't select.
+        existingOnly: true,
+      });
       const changedPaths = result.files
         .filter((f) => f.action === 'created' || f.action === 'updated' || f.action === 'removed')
         .map((f) => f.path);
@@ -503,7 +521,10 @@ export async function runUninstaller(opts: RunUninstallerOptions): Promise<void>
   }
 
   // Step 3: sweep + per-agent feedback.
-  const reports = await uninstallTargets(targets, location);
+  const reports = await uninstallTargets(targets, location, {
+    // `--yes` means "ask nothing" — including a target's own profile prompt.
+    nonInteractive: useDefaults,
+  });
   const removed = reports.filter((r) => r.status === 'removed');
 
   for (const r of reports) {

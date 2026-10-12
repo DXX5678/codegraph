@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- CodeGraph now supports **iCode**: `codegraph install` adds the codegraph MCP server to your iCode agents — both your own profiles under `~/.chrys/agents/` and iCode's built-in agents — and `codegraph uninstall` removes it again.
+
 ### Fixes
 
 - In VB.NET, every member of a `Structure` is now indexed, including its fields, properties, methods, constructors and nested enums. Before, only the first member was, so the rest could not be found and their callers looked empty.
