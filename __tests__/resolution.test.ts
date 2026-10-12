@@ -11,7 +11,7 @@ import * as os from 'os';
 import { CodeGraph } from '../src';
 import { Node, UnresolvedReference } from '../src/types';
 import { ReferenceResolver, createResolver, ResolutionContext } from '../src/resolution';
-import { matchReference, resolveMethodOnType, matchByQualifiedName, preferCallSiteFile, matchMethodCall } from '../src/resolution/name-matcher';
+import { matchReference, resolveMethodOnType, matchByQualifiedName, matchByExactName, preferCallSiteFile, matchMethodCall } from '../src/resolution/name-matcher';
 import { resolveImportPath, extractImportMappings, resolveJvmImport, loadCppIncludeDirs, clearCppIncludeDirCache, isPhpIncludePathRef } from '../src/resolution/import-resolver';
 import type { UnresolvedRef } from '../src/resolution/types';
 import { detectFrameworks, getAllFrameworkResolvers } from '../src/resolution/frameworks';
@@ -28,11 +28,55 @@ describe('Resolution Module', () => {
   });
 
   afterEach(() => {
-    // Clean up
+    // destroy() is an alias for close(): it releases the database but leaves
+    // the project directory on disk, so removing tempDir cannot be the
+    // alternative to it. Both must run, on every test. maxRetries covers
+    // Windows releasing the SQLite handles slightly after close() returns.
     if (cg) {
       cg.destroy();
-    } else if (fs.existsSync(tempDir)) {
-      fs.rmSync(tempDir, { recursive: true });
+      cg = undefined as unknown as CodeGraph;
+    }
+    fs.rmSync(tempDir, { recursive: true, force: true, maxRetries: 5 });
+  });
+
+  it.each(['c', 'cpp'] as const)('connects single-argument function macros in %s (#1373)', async (language) => {
+    const file = `main.${language}`;
+    fs.writeFileSync(path.join(tempDir, file), [
+      '#define NATIVE_FN(name) int name(void)',
+      'int helper(void) { return 1; }',
+      'NATIVE_FN(get_version) { return helper(); }',
+      'int use_it(void) { return get_version(); }',
+      'int plain_func(void) { return 42; }',
+      '',
+    ].join('\n'));
+    cg = await CodeGraph.init(tempDir, { index: true });
+    const functions = cg.getNodesByKind('function');
+    const recovered = functions.find((n) => n.name === 'get_version');
+    expect(recovered).toBeDefined();
+    expect(cg.getCallers(recovered!.id).map((c) => c.node.name)).toContain('use_it');
+    expect(cg.getCallees(recovered!.id).map((c) => c.node.name)).toContain('helper');
+    const caller = functions.find((n) => n.name === 'use_it')!;
+    expect(cg.getCallees(caller.id).map((c) => c.node.id)).toContain(recovered!.id);
+    expect(functions.map((n) => n.name)).toContain('plain_func');
+    const { ToolHandler } = await import('../src/mcp/tools');
+    const result = await new ToolHandler(cg).execute('codegraph_explore', { query: 'use_it get_version helper' });
+    expect(result.isError).toBeUndefined();
+    const text = result.content[0]!.text!;
+    expect(text).toContain('Flow');
+    expect(text).toMatch(/use_it[^\n]*get_version[^\n]*helper/);
+
+  });
+
+  it('does not turn cross-language name collisions into call or constructor edges (#1986)', async () => {
+    fs.writeFileSync(path.join(tempDir, 'foreign.py'), 'class ForeignThing:\n    pass\ndef mystery():\n    pass\n');
+    fs.writeFileSync(path.join(tempDir, 'caller.ts'), 'export function build() { return new ForeignThing(); }');
+    fs.writeFileSync(path.join(tempDir, 'Caller.swift'), 'func consumer() { mystery() }');
+    cg = await CodeGraph.init(tempDir, { silent: true });
+    await cg.indexAll();
+    for (const name of ['build', 'consumer']) {
+      const caller = cg.getNodesByName(name).find((n) => n.kind === 'function')!;
+      expect(caller).toBeDefined();
+      expect(cg.getOutgoingEdges(caller.id).filter((e) => e.kind === 'calls' || e.kind === 'instantiates')).toEqual([]);
     }
   });
 
@@ -604,6 +648,28 @@ from ..services import auth_service
       expect(mappings.some((m) => m.localName === 'helper')).toBe(true);
       expect(mappings.some((m) => m.localName === 'User')).toBe(true);
     });
+
+    it('should extract parenthesized Python from-imports', () => {
+      const content = `
+from store.base import (
+    Base,
+    helper as h,  # a comment, with a comma and a call()
+)
+"""
+from docstring import NotAnImport
+"""
+from store.rows import (Row, Col)
+`;
+
+      const mappings = extractImportMappings('src/main.py', content, 'python');
+
+      expect(mappings.map((m) => [m.localName, m.exportedName, m.source])).toEqual([
+        ['Base', 'Base', 'store.base'],
+        ['h', 'helper', 'store.base'],
+        ['Row', 'Row', 'store.rows'],
+        ['Col', 'Col', 'store.rows'],
+      ]);
+    });
   });
 
   describe('JVM FQN Import Resolution', () => {
@@ -888,6 +954,8 @@ from ..services import auth_service
       const frameworks = detectFrameworks(context);
       const reactResolver = frameworks.find((f) => f.name === 'react');
 
+      // In a JS/TS module another file's hook comes through an import (the
+      // import resolver's), never by name: App.tsx imports nothing here.
       const ref = {
         fromNodeId: 'component:src/App.tsx:App:1',
         referenceName: 'useAuth',
@@ -897,10 +965,11 @@ from ..services import auth_service
         filePath: 'src/App.tsx',
         language: 'typescript' as const,
       };
+      expect(reactResolver!.resolve(ref, context)).toBeNull();
 
-      const result = reactResolver!.resolve(ref, context);
-      expect(result).not.toBeNull();
-      expect(result?.targetNodeId).toBe('hook:src/hooks/useAuth.ts:useAuth:1');
+      // The file's own hook resolves.
+      const own = reactResolver!.resolve({ ...ref, filePath: 'src/hooks/useAuth.ts', fromNodeId: 'function:src/hooks/useAuth.ts:x:30' }, context);
+      expect(own?.targetNodeId).toBe('hook:src/hooks/useAuth.ts:useAuth:1');
     });
   });
 
@@ -1258,6 +1327,74 @@ impl<T> Source for BufSource<T> {
       expect(callsFrom('Countdown::run').map((c) => c.target)).toEqual(['Countdown::run']);
     });
 
+    // ── Rust `self.<method>()` receivers (#1861) ──────────────────────────
+    it('resolves `self.method()` on the enclosing type, not on whichever same-named method sits nearer (#1861)', async () => {
+      // The issue's repro, one file: `Decoy::reset` sits between the call and
+      // the method it means, so a bare name ranked by file proximity picked
+      // the decoy — and the edge carried no provenance to say it was a guess.
+      writeRustCrate(tempDir, {
+        'lib.rs':
+          'pub struct Target { pub n: i32 }\n\nimpl Target {\n    pub fn reset(&mut self) { self.n = -1; }\n}\n\n' +
+          'pub struct Decoy { pub n: i32 }\n\nimpl Decoy {\n    pub fn reset(&mut self) { self.n = 0; }\n}\n\n' +
+          'impl Target {\n    pub fn run(&mut self) { self.reset(); }\n}\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(callsFrom('Target::run')).toEqual([
+        { target: 'Target::reset', resolvedBy: 'qualified-name', provenance: undefined },
+      ]);
+    });
+
+    it('decides the same way across directories, where proximity decided before (#1861)', async () => {
+      // Same code, only the layout changes. If the answer moved with the file
+      // tree, proximity was still deciding it.
+      writeRustCrate(tempDir, {
+        'lib.rs': 'pub mod near;\npub mod far;\n',
+        'near.rs': 'pub struct Decoy { pub n: i32 }\nimpl Decoy {\n    pub fn reset(&mut self) { self.n = 0; }\n}\n',
+        'far.rs':
+          'pub struct Target { pub n: i32 }\nimpl Target {\n    pub fn reset(&mut self) { self.n = -1; }\n}\n' +
+          'impl Target {\n    pub fn run(&mut self) { self.reset(); }\n}\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(callsFrom('Target::run').map((c) => c.target)).toEqual(['Target::reset']);
+    });
+
+    it('declines when the enclosing type has no such method, and does not change a receiver-less call (#1861)', async () => {
+      // The two ways this could overreach. `self.missing()` names nothing on
+      // the owner, so it must not fall back to some other type's `missing`.
+      //
+      // And a bare `reset()` is a free-function call: Rust reaches a method
+      // only through `self.` or `Type::`, so it is the free `reset`, never
+      // `Target::reset` (it used to be — the mirror image of #1861).
+      writeRustCrate(tempDir, {
+        'lib.rs':
+          'pub fn reset() {}\n\n' +
+          'pub struct Other { pub n: i32 }\nimpl Other {\n    pub fn missing(&mut self) {}\n}\n\n' +
+          'pub struct Target { pub n: i32 }\nimpl Target {\n    pub fn reset(&mut self) { self.n = -1; }\n' +
+          '    pub fn free(&mut self) { reset(); }\n' +
+          '    pub fn absent(&mut self) { self.missing(); }\n}\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(callsFrom('Target::free').map((c) => c.target)).toEqual(['reset']);
+      // Nothing on the owner is named `missing`, so no edge at all.
+      expect(callsFrom('Target::absent')).toEqual([]);
+    });
+
+    it('resolves `self.method()` inside a trait impl to that impl (#1861)', async () => {
+      writeRustCrate(tempDir, {
+        'lib.rs':
+          'pub trait Run {\n    fn go(&mut self);\n}\n\n' +
+          'pub struct Decoy { pub n: i32 }\nimpl Decoy {\n    pub fn step(&mut self) { self.n = 0; }\n}\n\n' +
+          'pub struct Doer { pub n: i32 }\nimpl Doer {\n    pub fn step(&mut self) { self.n = 1; }\n}\n' +
+          'impl Run for Doer {\n    fn go(&mut self) { self.step(); }\n}\n',
+      });
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      expect(callsFrom('Doer::go').map((c) => c.target)).toEqual(['Doer::step']);
+    });
+
     it('resolves a trait-object field to the trait method and typed fields to the right implementation (#1585, #1588)', async () => {
       // The #1588 repro's second half: `UsesFile::go` / `UsesBuf::go` each
       // forward through a typed field, and a `Box<dyn Source>` field lands on
@@ -1502,6 +1639,119 @@ def external_caller():
       expect(externalCaller).toBeDefined();
       const externalCalls = cg.getOutgoingEdges(externalCaller!.id).filter((e) => e.kind === 'calls');
       expect(externalCalls).toHaveLength(0);
+    });
+
+    it('resolves a module-qualified call to a function whose name collides with a builtin collection method, and does not fabricate one from an unrelated chained receiver (#1681)', async () => {
+      // `ledger.append(row)` (module imported, method name `append`) previously
+      // never reached resolution: isBuiltInOrExternal's Python built-in-method
+      // filter treated ANY `x.append(...)` as `list.append` unless `X` matched a
+      // known CLASS, so a real MODULE export named `append` was dropped before
+      // resolveViaImport ever ran. Separately, `d.setdefault(k, []).append(x)` —
+      // a non-identifier (call-chain) receiver — used to degrade at extraction
+      // to a BARE `append` ref and exact-match ledger.append (#1683/#1748 fixed
+      // that half; assert both directions here).
+      fs.writeFileSync(
+        path.join(tempDir, 'ledger.py'),
+        'def append(row):\n    return True\n\n\ndef path():\n    return "ledger.jsonl"\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'record.py'),
+        `from . import ledger
+
+
+def add_outcome(row):
+    if not ledger.append(row):
+        return None
+    return ledger.path()
+`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'unrelated.py'),
+        `def build_map():
+    rows_by_file = {}
+    rows_by_file.setdefault("f", []).append({"x": 1})
+    return rows_by_file
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const ledgerAppend = cg
+        .getNodesByKind('function')
+        .find((n) => n.name === 'append' && n.filePath.replace(/\\/g, '/') === 'ledger.py');
+      expect(ledgerAppend).toBeDefined();
+
+      // The real, import-qualified call must resolve.
+      const addOutcome = cg.getNodesByKind('function').find((n) => n.name === 'add_outcome');
+      expect(addOutcome).toBeDefined();
+      const addOutcomeCalls = cg.getOutgoingEdges(addOutcome!.id).filter((e) => e.kind === 'calls');
+      expect(addOutcomeCalls.map((e) => e.target)).toContain(ledgerAppend!.id);
+
+      // The unrelated dict/list `.append()` on a chained receiver must NOT
+      // fabricate an edge to ledger.py's append.
+      const buildMap = cg.getNodesByKind('function').find((n) => n.name === 'build_map');
+      expect(buildMap).toBeDefined();
+      const buildMapCalls = cg.getOutgoingEdges(buildMap!.id).filter((e) => e.kind === 'calls');
+      expect(buildMapCalls.map((e) => e.target)).not.toContain(ledgerAppend!.id);
+    });
+
+    it('resolves Python module-attribute calls and file imports through an alias (#1626)', async () => {
+      // #715 taught resolvePythonModuleMember to fall back to a dotted-module
+      // file lookup, which fixed `from pkg import module` (#578). The aliased
+      // form still missed: the module path was rebuilt from the LOCAL name, so
+      // `from pkg import module as alias` looked for `pkg.alias` — a file that
+      // does not exist — and the call landed in unresolved_refs. The plain
+      // `import top as alias` form is a namespace import and binds at `source`,
+      // so it was already correct; it is pinned here so the fix can't regress it.
+      fs.mkdirSync(path.join(tempDir, 'pkg'));
+      fs.writeFileSync(path.join(tempDir, 'pkg', '__init__.py'), '');
+      fs.writeFileSync(
+        path.join(tempDir, 'pkg', 'module.py'),
+        'def func():\n    return 1\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'top_level.py'),
+        'def top_func():\n    return 2\n'
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'main.py'),
+        `from pkg import module as mod_alias
+import top_level as tl
+
+
+def from_import_caller():
+    return mod_alias.func()
+
+
+def plain_import_caller():
+    return tl.top_func()
+`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+
+      const fromImportCaller = cg.getNodesByKind('function').filter((n) => n.name === 'from_import_caller')[0];
+      expect(fromImportCaller).toBeDefined();
+      const aliasCalls = cg.getOutgoingEdges(fromImportCaller!.id).filter((e) => e.kind === 'calls');
+      expect(aliasCalls).toHaveLength(1);
+      const aliasTarget = cg.getNode(aliasCalls[0]!.target);
+      expect(aliasTarget?.name).toBe('func');
+      expect(aliasTarget?.filePath.replace(/\\/g, '/')).toBe('pkg/module.py');
+
+      const plainCaller = cg.getNodesByKind('function').filter((n) => n.name === 'plain_import_caller')[0];
+      expect(plainCaller).toBeDefined();
+      const plainCalls = cg.getOutgoingEdges(plainCaller!.id).filter((e) => e.kind === 'calls');
+      expect(plainCalls).toHaveLength(1);
+      expect(cg.getNode(plainCalls[0]!.target)?.name).toBe('top_func');
+
+      // The file dependency must resolve too: fixing only the member lookup
+      // restores calls but leaves the aliased module's imports edge missing.
+      const mainFile = cg.getNodesByKind('file').find((n) => n.filePath === 'main.py');
+      const moduleFile = cg.getNodesByKind('file').find((n) => n.filePath.replace(/\\/g, '/') === 'pkg/module.py');
+      expect(mainFile).toBeDefined();
+      expect(moduleFile).toBeDefined();
+      const fileImports = cg.getOutgoingEdges(mainFile!.id).filter((e) => e.kind === 'imports');
+      expect(fileImports.map((e) => e.target)).toContain(moduleFile!.id);
     });
 
     it('attaches Go methods to their receiver type across files (#583, cross-file half)', async () => {
@@ -2001,6 +2251,32 @@ func main() {
     });
   });
 
+  describe('Lua function-expression resolution (#1616)', () => {
+    it('attributes helper calls to each assigned callable instead of the file node', async () => {
+      fs.writeFileSync(
+        path.join(tempDir, 'util.lua'),
+        `util = {}\nfunction util.helper() return 1 end\nreturn util\n`
+      );
+      fs.writeFileSync(
+        path.join(tempDir, 'handlers.lua'),
+        `local M = {}\nfunction M.namedFn() return util.helper() end\nM.assignedFn = function() return util.helper() end\nM.callbacks = { onStart = function() return util.helper() end }\nreturn M\n`
+      );
+
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const helper = cg
+        .getNodesByKind('method')
+        .find((n) => n.qualifiedName === 'util::helper');
+      expect(helper).toBeDefined();
+      const callers = cg.getCallers(helper!.id).map((c) => c.node);
+      expect(callers.some((n) => n.qualifiedName === 'M::namedFn')).toBe(true);
+      expect(callers.some((n) => n.qualifiedName === 'M::assignedFn')).toBe(true);
+      expect(callers.some((n) => n.qualifiedName === 'M.callbacks::onStart')).toBe(true);
+      expect(callers.some((n) => n.kind === 'file' && n.filePath === 'handlers.lua')).toBe(false);
+    });
+  });
+
   describe('Watchdog-safe resolution on collision-heavy repos (#1122)', () => {
     // On a large Java-style repo, per-ref resolution cost is unbounded in the
     // worst case (a colliding method name whose candidate set misses the LRU
@@ -2177,6 +2453,140 @@ func main() {
   });
 
   describe('Local-variable receiver-type inference (#1108)', () => {
+    it.each(['ts', 'tsx', 'js', 'jsx'])('keeps built-in Map calls off project methods — %s (#1566)', async (ext) => {
+      const typed = ext === 'ts' || ext === 'tsx';
+      fs.writeFileSync(path.join(tempDir, `cache.${ext}`), `
+export class LRUCache {
+  get(key) { return key; }
+  set(key, value) { return value; }
+  has(key) { return true; }
+}
+export function useLocalMap() {
+  const values = new Map${typed ? '<string, string>' : ''}();
+  values.set('answer', '42');
+  values.get('answer');
+  return values.has('answer');
+}
+export function useNestedMap(holder${typed ? ': { values: Map<string, string> }' : ''}) {
+  return holder.values.get('answer');
+}
+export function useProjectCache() {
+  const cache = new LRUCache();
+  cache.set('answer', '42');
+  cache.get('answer');
+  return cache.has('answer');
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      for (const name of ['useLocalMap', 'useNestedMap', 'useProjectCache']) {
+        const caller = cg.getNodesByName(name).find((n) => n.kind === 'function');
+        expect(caller, name).toBeDefined();
+        const calls = cg.getOutgoingEdges(caller!.id).filter((e) => e.kind === 'calls');
+        if (name === 'useProjectCache') {
+          const methods = cg.getNodesByKind('method').filter((n) => n.qualifiedName.startsWith('LRUCache::'));
+          expect(methods).toHaveLength(3);
+          expect(calls.map((e) => e.target).sort()).toEqual(methods.map((n) => n.id).sort());
+          expect(calls.every((e) => e.metadata?.confidence === 0.9)).toBe(true);
+        } else {
+          expect.soft(calls, `${ext}: ${name} must not call a project method`).toEqual([]);
+        }
+      }
+    });
+
+    it('keeps a built-in string method off an unrelated project method (#1840)', async () => {
+      fs.writeFileSync(path.join(tempDir, 'strings.ts'), `
+export async function listPaths(): Promise<string> { return "a\0b"; }
+export async function snapshot(): Promise<string[]> {
+  const listed = await listPaths();
+  return listed.split('\0');
+}
+`);
+      fs.writeFileSync(path.join(tempDir, 'pane.ts'), `
+export class PaneManager {
+  split(): string { return "new pane"; }
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const caller = cg.getNodesByName('snapshot').find((n) => n.kind === 'function');
+      expect(caller).toBeDefined();
+      expect(
+        cg.getCallees(caller!.id)
+          .filter(({ edge }) => edge.kind === 'calls')
+          .map(({ node }) => node.qualifiedName)
+          .sort(),
+      ).toEqual(['listPaths']);
+    });
+
+    it('types an awaited receiver from the callee\'s declared return (#1840)', async () => {
+      fs.writeFileSync(path.join(tempDir, 'engine.ts'), `
+export class Engine {
+  run(): string { return "ran"; }
+}
+export class Decoy {
+  run(): string { return "decoy"; }
+}
+export async function makeEngine(): Promise<Engine> { return new Engine(); }
+export async function drive(): Promise<string> {
+  const handle = await makeEngine();
+  return handle.run();
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+
+      const caller = cg.getNodesByName('drive').find((n) => n.kind === 'function');
+      expect(caller).toBeDefined();
+      expect(
+        cg.getCallees(caller!.id)
+          .filter(({ edge }) => edge.kind === 'calls')
+          .map(({ node }) => node.qualifiedName)
+          .sort(),
+      ).toEqual(['Engine::run', 'makeEngine']);
+    });
+
+    it('keeps a validated project class that shadows Map (#1566)', async () => {
+      fs.writeFileSync(path.join(tempDir, 'shadow.ts'), `
+export class Map { get() { return 1; } }
+export class Other { get() { return 2; } }
+export function useShadow() {
+  const values = new Map();
+  return values.get();
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const caller = cg.getNodesByName('useShadow').find((n) => n.kind === 'function');
+      expect(caller).toBeDefined();
+      expect(cg.getCallees(caller!.id).filter(({ edge }) => edge.kind === 'calls').map(({ node }) => node.qualifiedName))
+        .toEqual(['Map::get']);
+    });
+
+    it.each([
+      ['Set', 'has'], ['WeakMap', 'get'], ['WeakSet', 'has'], ['Array', 'map'], ['Promise', 'then'],
+    ])('declines same-name guesses for an inferred %s receiver (#1566)', async (type, method) => {
+      fs.writeFileSync(path.join(tempDir, 'builtin.ts'), `
+export class Collision { ${method}() { return 1; } }
+export function constructed() {
+  const values = new ${type}();
+  return values.${method}();
+}
+export function annotated(values: ${type}<string>) {
+  return values.${method}();
+}
+`);
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      expect(cg.getNodesByKind('method').some((n) => n.name === method)).toBe(true);
+      for (const name of ['constructed', 'annotated']) {
+        const caller = cg.getNodesByName(name).find((n) => n.kind === 'function');
+        expect(caller, name).toBeDefined();
+        expect.soft(cg.getOutgoingEdges(caller!.id).filter((e) => e.kind === 'calls'), name).toEqual([]);
+      }
+    });
+
     // `lg.log()` where `lg` is a local whose type is inferred from its
     // declaration/initializer. Before this, only C++ resolved these; every
     // other language produced no method edge. Each case is one file with a
@@ -3200,6 +3610,119 @@ export function remoteUse() { return obj.m(); }
     }, 30000);
   });
 
+  describe('Object-literal members that alias an outer function (#1932)', () => {
+    // `export const api = { getUser }` / `{ getUser: getUser }` — the API-module
+    // shape. The member's function is declared OUTSIDE the literal, so the
+    // containment lookup of #1573 found nothing and `api.getUser()` in the
+    // literal's own file resolved to no function at all.
+    const callersOf = (cg: CodeGraph, name: string, filePath: string): string[] => {
+      const target = cg
+        .getNodesInFile(filePath)
+        .find((n) => n.name === name && (n.kind === 'function' || n.kind === 'method'));
+      expect(target).toBeDefined();
+      return cg
+        .getIncomingEdges(target!.id)
+        .filter((e) => e.kind === 'calls')
+        .map((e) => cg.getNode(e.source)!.name)
+        .sort();
+    };
+
+    it('resolves same-file and imported calls through shorthand and identifier-valued members', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1932-'));
+      fs.writeFileSync(
+        path.join(tmpDir, 'a.ts'),
+        `import { imported } from './d';
+const viaArrow = async () => 1;
+function viaDecl() { return 2; }
+const longForm = async () => 3;
+function renamed() { return 4; }
+
+export const api = {
+  inline() { return 0; },
+  viaArrow,
+  viaDecl,
+  longForm: longForm,
+  alias: renamed,
+  imported,
+};
+
+export function sameFileCaller() {
+  return [api.inline(), api.viaArrow(), api.viaDecl(), api.longForm(), api.alias(), api.imported()];
+}
+`
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'b.ts'),
+        `import { api } from './a';
+export function crossFileCaller() {
+  return [api.viaArrow(), api.viaDecl(), api.longForm(), api.alias()];
+}
+`
+      );
+      fs.writeFileSync(path.join(tmpDir, 'd.ts'), `export function imported() { return 5; }\n`);
+      fs.writeFileSync(
+        path.join(tmpDir, 'e.ts'),
+        `function frozenFn() { return 6; }
+export const frozen = Object.freeze({ frozenFn });
+`
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'f.ts'),
+        `import { frozen } from './e';
+export function frozenCaller() { return frozen.frozenFn(); }
+`
+      );
+      try {
+        const cg = CodeGraph.initSync(tmpDir);
+        await cg.indexAll();
+        // A literal handed straight to a wrapper still names its members.
+        expect(callersOf(cg, 'frozenFn', 'e.ts')).toEqual(['frozenCaller']);
+
+        expect(callersOf(cg, 'inline', 'a.ts')).toEqual(['sameFileCaller']);
+        for (const fn of ['viaArrow', 'viaDecl', 'longForm', 'renamed']) {
+          expect(callersOf(cg, fn, 'a.ts')).toEqual(['crossFileCaller', 'sameFileCaller']);
+        }
+        expect(callersOf(cg, 'imported', 'd.ts')).toEqual(['sameFileCaller']);
+        cg.close();
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+
+    it('never follows a property key, a nested object, or a shadowed binding', async () => {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1932-'));
+      fs.writeFileSync(
+        path.join(tmpDir, 'c.ts'),
+        `function keyOnly() { return 1; }
+function nested() { return 2; }
+function shadowed() { return 3; }
+
+export const other = { keyOnly: 1, box: { nested } };
+
+export function useOther() {
+  return [other.keyOnly(), other.nested()];
+}
+
+export function makeApi(shadowed: () => number) {
+  const local = { shadowed };
+  return local.shadowed();
+}
+`
+      );
+      try {
+        const cg = CodeGraph.initSync(tmpDir);
+        await cg.indexAll();
+
+        expect(callersOf(cg, 'keyOnly', 'c.ts')).toEqual([]);
+        expect(callersOf(cg, 'nested', 'c.ts')).toEqual([]);
+        expect(callersOf(cg, 'shadowed', 'c.ts')).toEqual([]);
+        cg.close();
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }, 30000);
+  });
+
   describe('C++ namespace-qualified static method calls to out-of-line definitions (#1291)', () => {
     // The issue's exact shape: nested types + out-of-line static method
     // definition inside `namespace simulator { }` in the .cpp, called via the
@@ -3602,6 +4125,7 @@ int run() {
             and src.kind = 'file'
             and src.file_path = 'src/main.cpp'
         `).all() as Array<{ dstKind: string; dstPath: string }>;
+        db.close();
         const resolvedToHeader = rows.find(
           (r) => r.dstKind === 'file' && r.dstPath === 'include/utils.h'
         );
@@ -3612,6 +4136,13 @@ int run() {
         );
         expect(stdlibFile).toBeUndefined();
       } finally {
+        // The graph opened on tempProject has to be closed here: the outer
+        // afterEach runs after this finally, so on Windows the still-open
+        // database makes the removal fail with EPERM.
+        if (cg) {
+          cg.close();
+          cg = undefined as unknown as CodeGraph;
+        }
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
     });
@@ -3649,6 +4180,7 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
             where e.kind = 'extends'`
         )
         .all() as Array<{ fromName: string; toName: string }>;
+      db.close();
       const has = (from: string, to: string) =>
         edges.some((r) => r.fromName === from && r.toName === to);
 
@@ -3711,11 +4243,19 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
             and src.kind = 'file'
             and src.file_path = 'src/page.php'
         `).all() as Array<{ dstKind: string; dstPath: string }>;
+        db.close();
         const resolved = rows.find(
           (r) => r.dstKind === 'file' && r.dstPath === 'src/lib.php'
         );
         expect(resolved, 'page.php → src/lib.php imports edge missing').toBeDefined();
       } finally {
+        // The graph opened on tempProject has to be closed here: the outer
+        // afterEach runs after this finally, so on Windows the still-open
+        // database makes the removal fail with EPERM.
+        if (cg) {
+          cg.close();
+          cg = undefined as unknown as CodeGraph;
+        }
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
     });
@@ -3745,11 +4285,19 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
             and src.kind = 'file'
             and src.file_path = 'index.php'
         `).all() as Array<{ dstKind: string; dstPath: string }>;
+        db.close();
         expect(
           rows.find((r) => r.dstKind === 'file' && r.dstPath === 'inc/db.php'),
           'index.php → inc/db.php imports edge missing'
         ).toBeDefined();
       } finally {
+        // The graph opened on tempProject has to be closed here: the outer
+        // afterEach runs after this finally, so on Windows the still-open
+        // database makes the removal fail with EPERM.
+        if (cg) {
+          cg.close();
+          cg = undefined as unknown as CodeGraph;
+        }
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
     });
@@ -3784,11 +4332,19 @@ class Both : public Base<char>, public Plain {}; // templated + plain in one cla
             and src.kind = 'file'
             and src.file_path = 'app/page.php'
         `).all() as Array<{ dstKind: string; dstPath: string }>;
+        db.close();
         expect(
           rows.find((r) => r.dstKind === 'file' && r.dstPath === 'lib/inc/db.php'),
           'app/page.php must NOT mis-connect to unrelated lib/inc/db.php'
         ).toBeUndefined();
       } finally {
+        // The graph opened on tempProject has to be closed here: the outer
+        // afterEach runs after this finally, so on Windows the still-open
+        // database makes the removal fail with EPERM.
+        if (cg) {
+          cg.close();
+          cg = undefined as unknown as CodeGraph;
+        }
         fs.rmSync(tempProject, { recursive: true, force: true });
       }
     });
@@ -4640,6 +5196,110 @@ object Main {
     });
   });
 
+  describe('Scala companion object vs extends resolution', () => {
+    for (const parentKind of ['trait', 'class'] as const) {
+      for (const objectFirst of [true, false]) {
+        it.each([false, true])(
+          `resolves ${parentKind} companions (objectFirst=${objectFirst}, imported=%s) through every impact depth`,
+          async (imported) => {
+            const typeDef = `${parentKind} ExtAgreement {
+  def extId: String = "x"
+}
+`;
+            const objectDef = `object ExtAgreement {
+  val Kind = "agreement"
+}
+`;
+            fs.writeFileSync(path.join(tempDir, 'ExtAgreement.scala'),
+              'package contracts\n' + (objectFirst ? objectDef + typeDef : typeDef + objectDef));
+            fs.writeFileSync(path.join(tempDir, 'Audit.scala'),
+              'package contracts\nobject Audit {}\ntrait Audit { def audit(): String = "ok" }\n');
+            fs.writeFileSync(path.join(tempDir, 'MExtAgreement.scala'),
+              (imported ? 'package model\nimport contracts.ExtAgreement\nimport contracts.Audit\n' : 'package contracts\n') +
+              'class MExtAgreement extends ExtAgreement with Audit {\n  def render(): String = extId\n}\n');
+            fs.writeFileSync(path.join(tempDir, 'LeafAgreement.scala'),
+              (imported ? 'package model\n' : 'package contracts\n') +
+              'class LeafAgreement extends MExtAgreement {\n  def leaf(): String = render()\n}\n');
+            cg = await CodeGraph.init(tempDir, { index: true });
+
+            const parent = cg.getNodesByKind(parentKind).find((n) => n.name === 'ExtAgreement');
+            const companion = cg.getNodesByKind('module').find((n) => n.name === 'ExtAgreement');
+            expect(parent).toBeDefined();
+            expect(companion).toBeDefined();
+            expect(cg.getIncomingEdges(parent!.id).filter((e) => e.kind === 'extends')).toHaveLength(1);
+            for (const name of ['ExtAgreement', 'Audit']) {
+              const obj = cg.getNodesByKind('module').find((n) => n.name === name)!;
+              expect(cg.getIncomingEdges(obj.id).filter((e) => e.kind === 'extends')).toEqual([]);
+            }
+            const audit = cg.getNodesByKind('trait').find((n) => n.name === 'Audit')!;
+            expect(cg.getIncomingEdges(audit.id).filter((e) => e.kind === 'extends')).toHaveLength(1);
+
+            // Impact must traverse THROUGH the type to descendants and their methods.
+            const impactNames = [...cg.getImpactRadius(parent!.id, 5).nodes.values()].map((n) => n.name);
+            expect(impactNames).toEqual(expect.arrayContaining(['MExtAgreement', 'render', 'LeafAgreement', 'leaf']));
+          }
+        );
+      }
+    }
+
+    it.each([false, true])('rejects a sole singleton parent (imported=%s)', async (imported) => {
+      fs.writeFileSync(path.join(tempDir, 'OnlyObject.scala'),
+        'package contracts\nobject OnlyObject { def value(): Int = 1 }\n');
+      fs.writeFileSync(path.join(tempDir, 'Invalid.scala'),
+        (imported ? 'package model\nimport contracts.OnlyObject\n' : 'package contracts\n') +
+        'class Invalid extends OnlyObject {}\ntrait AlsoInvalid extends OnlyObject {}\n');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const obj = cg.getNodesByKind('module').find((n) => n.name === 'OnlyObject')!;
+      expect(obj).toBeDefined();
+      expect(cg.getIncomingEdges(obj.id).filter((e) => e.kind === 'extends' || e.kind === 'implements')).toEqual([]);
+    });
+
+    it('keeps singleton objects as inheritance sources and owners of methods', async () => {
+      fs.writeFileSync(path.join(tempDir, 'Service.scala'),
+        'trait Service { def inherited(): Int = 1 }\nobject LiveService extends Service { def run(): Int = this.inherited() }\n');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const service = cg.getNodesByKind('trait').find((n) => n.name === 'Service')!;
+      const obj = cg.getNodesByKind('module').find((n) => n.name === 'LiveService')!;
+      expect(cg.getIncomingEdges(service.id).some((e) => e.kind === 'extends' && e.source === obj.id)).toBe(true);
+      const run = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'LiveService::run')!;
+      expect(cg.getOutgoingEdges(obj.id).some((e) => e.kind === 'contains' && e.target === run.id)).toBe(true);
+      const inherited = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Service::inherited')!;
+      expect(cg.getIncomingEdges(inherited.id).some((e) => e.kind === 'calls' && e.source === run.id)).toBe(true);
+    });
+
+    it('resolves inherited methods through a singleton receiver', async () => {
+      fs.writeFileSync(path.join(tempDir, 'Service.scala'),
+        'trait Service { def inherited(): Int = 1 }\n' +
+        'object LiveService extends Service {}\n' +
+        'object Unrelated { def inherited(): Int = 2 }\n' +
+        'object Client { def use(): Int = { val receiver = LiveService; receiver.inherited() } }\n');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const inherited = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Service::inherited')!;
+      const use = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Client::use')!;
+      expect(cg.getIncomingEdges(inherited.id).some((e) => e.kind === 'calls' && e.source === use.id)).toBe(true);
+    });
+
+    it('keeps object method calls anchored to their receiver', async () => {
+      fs.writeFileSync(path.join(tempDir, 'Api.scala'),
+        'class API { def send(): Int = 2 }\n' +
+        'object Api { def send(): Int = 1 }\n' +
+        'object Client { def run(): Int = Api.send() }\n');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const send = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Api::send')!;
+      const run = cg.getNodesByKind('method').find((n) => n.qualifiedName === 'Client::run')!;
+      expect(cg.getIncomingEdges(send.id).some((e) => e.kind === 'calls' && e.source === run.id)).toBe(true);
+    });
+
+    it('preserves Ruby module inclusion', async () => {
+      fs.writeFileSync(path.join(tempDir, 'trackable.rb'),
+        'module Trackable\n  def track; end\nend\nclass Record\n  include Trackable\nend\n');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      const mod = cg.getNodesByKind('module').find((n) => n.name === 'Trackable')!;
+      expect(cg.getIncomingEdges(mod.id).some((e) =>
+        (e.kind === 'extends' || e.kind === 'implements') && cg.getNode(e.source)?.name === 'Record')).toBe(true);
+    });
+  });
+
   describe('Dart chained static-factory / factory-constructor call resolution (#645/#608 mechanism)', () => {
     function callerNamesOf(qualifiedName: string): string[] {
       const target = cg.getNodesByKind('method').find((n) => n.qualifiedName === qualifiedName);
@@ -5385,5 +6045,270 @@ in
 
       expect(importedFilePaths('main.nix')).toEqual([]);
     });
+  });
+
+  describe('Bindings in a module that exports nothing (#1719)', () => {
+    it('does not treat documentation headings as package imports', () => {
+      // Inject the planned Markdown node shape without depending on its extractor.
+      const heading: Node = {
+        id: 'heading:vite', name: 'vite', qualifiedName: 'guide.md#vite',
+        kind: 'module', language: 'markdown' as Node['language'], filePath: 'guide.md',
+        startLine: 1, endLine: 1, startColumn: 0, endColumn: 0, updatedAt: 0,
+      };
+      const context = {
+        getNodesByName: () => [heading], getNodesInFile: () => [],
+        getNodesByQualifiedName: () => [], getNodesByKind: () => [],
+        fileExists: () => false, readFile: () => null,
+        getProjectRoot: () => tempDir, getAllFiles: () => [],
+      } as ResolutionContext;
+      const ref: UnresolvedRef = {
+        fromNodeId: 'file:consumer.ts', referenceName: 'vite', referenceKind: 'imports',
+        filePath: 'consumer.ts', language: 'typescript', line: 1, column: 0,
+      };
+      expect(matchByExactName(ref, context)).toBeNull();
+      expect(matchByExactName({ ...ref, language: 'markdown' as Node['language'] }, context)?.targetNodeId).toBe(heading.id);
+      context.getNodesByName = () => [{ ...heading, id: 'fn:vite', kind: 'function', language: 'typescript', filePath: 'vite.ts' }];
+      expect(matchByExactName(ref, context)?.targetNodeId).toBe('fn:vite');
+    });
+
+    it('ignores export examples in strings and comments when checking module visibility', async () => {
+      fs.mkdirSync(path.join(tempDir, 'src'));
+      fs.writeFileSync(path.join(tempDir, 'src/private.js'), [
+        "import fs from 'node:fs'",
+        'const example = `',
+        'export const example = 1',
+        '`',
+        '/*',
+        'export { hidden }',
+        '*/',
+        'function hidden() { return fs }',
+        'hidden()',
+      ].join('\n'));
+      fs.writeFileSync(path.join(tempDir, 'src/consumer.js'), 'hidden()');
+      fs.mkdirSync(path.join(tempDir, 'legacy'));
+      fs.writeFileSync(path.join(tempDir, 'legacy/global.js'), 'function hidden() { return 1 }');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      const hidden = cg.getNodesByKind('function').find((n) => n.name === 'hidden' && n.filePath === 'src/private.js');
+      expect(hidden).toBeDefined();
+      const callers = cg.getIncomingEdges(hidden!.id).filter((e) => e.kind === 'calls');
+      expect(callers.some((e) => cg.getNode(e.source)?.filePath === 'src/consumer.js')).toBe(false);
+      expect(callers.some((e) => cg.getNode(e.source)?.filePath === 'src/private.js')).toBe(true);
+      const consumer = cg.getNodesByKind('file').find((n) => n.filePath === 'src/consumer.js');
+      expect(cg.getOutgoingEdges(consumer!.id).filter((e) => e.kind === 'calls')).toEqual([]);
+    });
+
+    it('does not name-match a method call to another file\'s JSON value', async () => {
+      fs.writeFileSync(path.join(tempDir, 'data.json'), '{"content": "hello"}');
+      fs.writeFileSync(path.join(tempDir, 'data.js'), "const content = require('./data.json')\nmodule.exports = { content }\n");
+      fs.writeFileSync(path.join(tempDir, 'consumer.js'), 'export async function read(page) { return page.frame("main").content() }');
+      fs.writeFileSync(path.join(tempDir, 'use-data.js'), "import { content } from './data'\nconsole.log(content)\n");
+      fs.writeFileSync(path.join(tempDir, 'callback.js'), "const callback = require('./handler.js')\nmodule.exports = { callback }\n");
+      fs.writeFileSync(path.join(tempDir, 'call.js'), 'callback()');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      const content = cg.getNodesByKind('constant').find((n) => n.name === 'content');
+      expect(content).toBeDefined();
+      expect(cg.getIncomingEdges(content!.id).filter((e) => e.kind === 'calls')).toEqual([]);
+      expect(cg.getIncomingEdges(content!.id).some((e) => e.kind === 'imports')).toBe(true);
+      const callback = cg.getNodesByKind('constant').find((n) => n.name === 'callback');
+      expect(callback).toBeDefined();
+      expect(cg.getIncomingEdges(callback!.id).some((e) => e.kind === 'calls')).toBe(true);
+    });
+
+    it('keeps a local file dependency import when a closer private name collides', async () => {
+      fs.writeFileSync(path.join(tempDir, 'package.json'), JSON.stringify({ dependencies: { 'local-dep': 'file:./dep' } }));
+      fs.mkdirSync(path.join(tempDir, 'dep'));
+      fs.mkdirSync(path.join(tempDir, 'src'));
+      fs.writeFileSync(path.join(tempDir, 'dep/package.json'), JSON.stringify({ name: 'local-dep', main: 'index.js' }));
+      fs.writeFileSync(path.join(tempDir, 'dep/index.js'), "export const msg = 'local'\n");
+      fs.writeFileSync(path.join(tempDir, 'src/private.js'), "import fs from 'node:fs'\nconst msg = 'private'\n");
+      fs.writeFileSync(path.join(tempDir, 'src/consumer.js'), "import { msg } from 'local-dep'\nconsole.log(msg)\n");
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      const msg = cg.getNodesByKind('constant').find((n) => n.name === 'msg' && n.filePath === 'dep/index.js');
+      expect(msg).toBeDefined();
+      expect(cg.getIncomingEdges(msg!.id).some((e) => e.kind === 'imports')).toBe(true);
+    });
+
+    it('preserves executable CommonJS exports inside nested template interpolations', async () => {
+      fs.writeFileSync(path.join(tempDir, 'cjs.js'), [
+        "import fs from 'node:fs'",
+        'function helper() { return fs }',
+        'const text = `outer ${`inner ${module.exports = { helper }}`}`',
+      ].join('\n'));
+      fs.writeFileSync(path.join(tempDir, 'consumer.js'), 'helper()');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      const helper = cg.getNodesByKind('function').find((n) => n.name === 'helper');
+      expect(helper).toBeDefined();
+      expect(cg.getIncomingEdges(helper!.id).some((e) =>
+        e.kind === 'calls' && cg.getNode(e.source)?.filePath === 'consumer.js')).toBe(true);
+    });
+
+    it.each(['export function visible() { return fs }', 'function visible() { return fs }\nexport { visible }'])('preserves real exports after a regex containing a backtick: %s', async (declaration) => {
+      fs.writeFileSync(path.join(tempDir, 'exported.js'), "import fs from 'node:fs'\nconst re = /`/\nif (fs) /`/.test('text')\nelse /`/.test('other')\nconst make = () => /`/\n" + declaration + '\n');
+      fs.writeFileSync(path.join(tempDir, 'consumer.js'), 'visible()');
+      cg = await CodeGraph.init(tempDir, { index: true });
+      cg.resolveReferences();
+      const visible = cg.getNodesByKind('function').find((n) => n.name === 'visible');
+      expect(visible).toBeDefined();
+      expect(cg.getIncomingEdges(visible!.id).some((e) => e.kind === 'calls')).toBe(true);
+    });
+
+    // On vitejs/vite, every `import { defineConfig } from 'vite'` across the
+    // playground resolved onto `playground/ssr-html/test-stacktrace.js::vite`
+    // — `const vite = await createServer(…)` at module scope in a file with
+    // zero exports — because exact-match commits whenever one candidate
+    // survives, and nothing asked whether an import could reach it. Only
+    // `sealed.js` may be filtered; every other file here is a class that must
+    // NOT be — a classic script (a top-level binding really is a reachable
+    // global), a CommonJS module, one exporting through `exports["x"]`, an ESM
+    // file whose export is a later `export { … }` statement (which leaves
+    // `isExported` false on the declaration's node), and one contributing a
+    // name through `declare global` while exporting nothing of its own.
+    let tmpDir: string;
+    let cg: CodeGraph;
+
+    afterEach(() => {
+      cg?.close();
+      if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('drops them as cross-file candidates, and keeps scripts, CJS and later exports', async () => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codegraph-1719-'));
+      fs.writeFileSync(
+        path.join(tmpDir, 'sealed.js'),
+        `import fsp from 'node:fs/promises'
+
+function widget() {
+  return fsp
+}
+
+widget()
+`
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'script.js'),
+        `function gadget() {
+  return 1
+}
+`
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'cjs.js'),
+        `import osp from 'node:os'
+
+function helper() {
+  return osp
+}
+
+module.exports = { helper }
+`
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'later.js'),
+        `import pathp from 'node:path'
+
+function parser() {
+  return pathp
+}
+
+export { parser }
+`
+      );
+      // `exports["x"]` is a CommonJS export too, and a file declaring globals
+      // offers them to every other file whether or not it exports anything of
+      // its own. Both would read as sealed on a test that looked only for
+      // `export …`, `module.exports` and `exports.x`.
+      fs.writeFileSync(
+        path.join(tmpDir, 'bracket.js'),
+        `import urlp from 'node:url'
+
+function bracketed() {
+  return urlp
+}
+
+exports["bracketed"] = bracketed
+`
+      );
+      // A module with imports and no export of its own still contributes every
+      // name in `declare global` to every other file. `plain.ts` is the control
+      // that makes the assertion mean something: it is the same "import, no
+      // export" shape holding the same kind of declaration, so the pair differs
+      // only by the `declare global`, and an assertion on StrayFace alone would
+      // pass whatever the guard did.
+      fs.writeFileSync(
+        path.join(tmpDir, 'ambient.ts'),
+        `import './later'
+
+declare global {
+  interface StrayFace {
+    a: number
+  }
+}
+`
+      );
+      fs.writeFileSync(
+        path.join(tmpDir, 'plain.ts'),
+        `import './later'
+
+interface HiddenFace {
+  a: number
+}
+
+const unused: HiddenFace = { a: 1 }
+`
+      );
+      // A type annotation is the reference here, so this consumer must be .ts.
+      fs.writeFileSync(
+        path.join(tmpDir, 'consumer.ts'),
+        `const face: StrayFace = { a: 1 }
+const hidden: HiddenFace = { a: 2 }
+
+export function use(): number {
+  return face.a + hidden.a
+}
+`
+      );
+      // Nothing here is bound by an import, so every name is a free reference
+      // that falls through to exact name matching — the path this rule sits on.
+      // A bare import would reach that path too, but a bare specifier names a
+      // package outside the graph, so no project node is the right target for
+      // it and such a fixture would assert a resolution nothing should make.
+      fs.writeFileSync(
+        path.join(tmpDir, 'consumer.js'),
+        `widget()
+gadget()
+helper()
+parser()
+bracketed()
+`
+      );
+
+      cg = await CodeGraph.init(tmpDir, { index: true });
+      cg.resolveReferences();
+
+      // Incoming edges rather than callers, so the interfaces are asked the
+      // same question as the functions: a type annotation is a reference, not
+      // a call.
+      const reachedFrom = (consumer: string, name: string): boolean => {
+        const target = cg
+          .searchNodes(name, { limit: 10 })
+          .find((r) => r.node.name === name && r.node.filePath !== consumer);
+        expect(target, `no node named ${name}`).toBeDefined();
+        return cg
+          .getIncomingEdges(target!.node.id)
+          .some((e) => cg.getNode(e.source)?.filePath === consumer);
+      };
+
+      expect(reachedFrom('consumer.js', 'widget')).toBe(false);
+      expect(reachedFrom('consumer.js', 'gadget')).toBe(true);
+      expect(reachedFrom('consumer.js', 'helper')).toBe(true);
+      expect(reachedFrom('consumer.js', 'parser')).toBe(true);
+      expect(reachedFrom('consumer.js', 'bracketed')).toBe(true);
+      expect(reachedFrom('consumer.ts', 'StrayFace')).toBe(true);
+      expect(reachedFrom('consumer.ts', 'HiddenFace')).toBe(false);
+    }, 30000);
   });
 });

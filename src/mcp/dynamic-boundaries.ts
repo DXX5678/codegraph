@@ -21,7 +21,8 @@
  * inside a string is a false positive, so {@link blankStringContents} blanks
  * them too, quotes preserved.)
  */
-import { stripCommentsForRegex, type CommentLang } from '../resolution/strip-comments';
+import { blankStringContents, stripCommentsForRegex, type CommentLang } from '../resolution/strip-comments';
+export { blankStringContents } from '../resolution/strip-comments';
 
 export interface BoundaryMatch {
   /** Stable form id, e.g. 'computed-call' — used for per-form dedupe. */
@@ -63,6 +64,12 @@ interface FormSpec {
    * must leave this unset (the anchor relies on the slice ending at the match).
    */
   keyWindow?: number;
+  /**
+   * Final say on a regex match, for forms whose argument decides it: given the
+   * stripped and original text and the offset just past the match, return
+   * false to drop it.
+   */
+  accept?: (stripped: string, original: string, end: number) => boolean;
 }
 
 const JS_FAMILY = new Set(['typescript', 'javascript', 'tsx', 'jsx', 'vue', 'svelte', 'astro', 'arkts']);
@@ -71,6 +78,36 @@ const RB = new Set(['ruby']);
 const PHP = new Set(['php']);
 const JVM_CS_GO = new Set(['java', 'kotlin', 'scala', 'csharp', 'go']);
 const SWIFT_OBJC = new Set(['swift', 'objc', 'objcpp', 'objective-c']);
+
+/**
+ * Whether the call argument starting at `start` is anything but ONE complete
+ * string literal: `import('./a')` or a backtick string without a substitution
+ * is an ordinary import, while a template with a `${}` substitution, a
+ * concatenation or a bare expression picks the module at runtime. String
+ * contents are blank in `stripped` (quotes kept), so the substitution check
+ * reads `original` at the same offsets.
+ */
+function isRuntimeImportArgument(stripped: string, original: string, start: number): boolean {
+  let i = start;
+  while (/\s/.test(stripped[i] ?? '')) i++;
+  const quote = stripped[i];
+  if (quote === ')') return false; // `import()` — nothing to resolve
+  if (quote !== '"' && quote !== "'" && quote !== '`') return true;
+  const close = stripped.indexOf(quote, i + 1);
+  if (close === -1) return false;
+  if (quote === '`') {
+    for (let k = i + 1; k < close; k++) {
+      // Skip escape pairs: \${ is literal text, but \\${ interpolates.
+      if (original[k] === '\\') { k++; continue; }
+      if (original[k] === '$' && original[k + 1] === '{') return true;
+    }
+  }
+  let j = close + 1;
+  while (/\s/.test(stripped[j] ?? '')) j++;
+  // `)` ends the call; `,` starts import()'s options argument. Anything else
+  // (`+`, `.concat(`, …) builds the specifier at runtime.
+  return stripped[j] !== ')' && stripped[j] !== ',';
+}
 
 /** Exactly one quoted literal and no concatenation → that literal is the key. */
 function singleStringLiteral(text: string): string | undefined {
@@ -98,7 +135,8 @@ const FORMS: FormSpec[] = [
     form: 'dynamic-import',
     label: 'dynamic import',
     langs: JS_FAMILY,
-    re: /\b(?:import|require)\s*\(\s*(?![\s'"`)])/g,
+    re: /\b(?:import|require)\s*\(/g,
+    accept: isRuntimeImportArgument,
   },
   {
     form: 'dynamic-import',
@@ -222,42 +260,6 @@ function commentLang(language: string): CommentLang | null {
 const MAX_MATCHES_PER_BODY = 3;
 const MAX_BODY_CHARS = 60_000; // a god-function tail is still scannable; beyond this, truncate
 
-/**
- * Blank the CONTENTS of string literals (quotes preserved, offsets preserved)
- * so dispatch-shaped prose — docs, error messages, template text — can't fire
- * a matcher. Run AFTER comment stripping (comments are already spaces).
- * Backslash escapes are honored; `'`/`"` strings end at a newline (treated as
- * unterminated, matching the comment stripper); backticks span lines, and
- * `${...}` interpolations inside them are blanked too — missing a dispatch
- * inside a template literal is acceptable, false-firing on prose is not.
- */
-export function blankStringContents(text: string): string {
-  const out = text.split('');
-  let i = 0;
-  const n = text.length;
-  while (i < n) {
-    const c = text[i]!;
-    if (c === '"' || c === "'" || c === '`') {
-      const quote = c;
-      i++;
-      while (i < n && text[i] !== quote) {
-        if (text[i] === '\\' && i + 1 < n) {
-          out[i] = ' ';
-          out[i + 1] = ' ';
-          i += 2;
-          continue;
-        }
-        if (quote !== '`' && text[i] === '\n') break; // unterminated — stop blanking
-        if (text[i] !== '\n') out[i] = ' ';           // keep newlines for line math
-        i++;
-      }
-      if (i < n && text[i] === quote) i++;
-      continue;
-    }
-    i++;
-  }
-  return out.join('');
-}
 
 /**
  * Scan one symbol's body for dynamic-dispatch sites.
@@ -283,6 +285,7 @@ export function scanDynamicDispatch(body: string, language: string, fileStartLin
     spec.re.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = spec.re.exec(stripped)) !== null) {
+      if (spec.accept && !spec.accept(stripped, original, m.index + m[0].length)) continue;
       let sliceEnd = m.index + m[0].length;
       if (spec.keyWindow) {
         const windowEnd = Math.min(original.length, sliceEnd + spec.keyWindow);

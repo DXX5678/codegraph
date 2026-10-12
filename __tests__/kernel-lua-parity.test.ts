@@ -13,7 +13,7 @@
  * `calls "require"`, table fn-ref registries with dedupe and the
  * `M.cb = cb` param-storage skip, the raw-text callee zoo with colon/
  * bracket/call-result callees and the `(handler)` conversion, LuaDoc
- * `- `-keeping docstrings, `<const>` attributes, one-line duplicate-id
+ * `- `-keeping docstrings, `<const>` attributes, one-line disambiguated
  * declarations; torture.luau: `--!strict` docstring joining, `export type`
  * isExported, verbatim `Generic<T>` alias names, the typeof(require(...))
  * alias+import pair, typed signatures with return suffixes, interpolation/
@@ -127,6 +127,22 @@ describe.skipIf(!kernelBuilt)('kernel Lua/Luau extraction parity', () => {
     // lua functions carry NO isExported (undefined — not false).
     const fn = result.nodes.find((n) => n.kind === 'function' && n.name === 'topFn');
     expect(fn?.isExported).toBeUndefined();
+    expect(result.nodes.some((n) => n.kind === 'function' && n.name === 'anonAssigned')).toBe(true);
+    expect(result.nodes.some((n) => n.kind === 'method' && n.qualifiedName === 'M::assigned')).toBe(true);
+    expect(
+      result.nodes.some((n) => n.kind === 'method' && n.qualifiedName === 'M.callbacks::on_start')
+    ).toBe(true);
+    expect(
+      result.nodes.some((n) => n.kind === 'method' && n.qualifiedName === 'M.callbacks::on_stop')
+    ).toBe(true);
+    for (const qualifiedName of ['M::assigned', 'M.callbacks::on_start', 'M.callbacks::on_stop']) {
+      const callable = result.nodes.find((n) => n.qualifiedName === qualifiedName)!;
+      expect(
+        refs.some(
+          (r) => r.fromNodeId === callable.id && r.referenceKind === 'calls' && r.referenceName === 'topFn'
+        )
+      ).toBe(true);
+    }
     // variables DO carry isExported === false.
     const v = result.nodes.find((n) => n.kind === 'variable' && n.name === 'core');
     expect(v?.isExported).toBe(false);
@@ -178,12 +194,12 @@ describe.skipIf(!kernelBuilt)('kernel Lua/Luau extraction parity', () => {
     expect(names).toContain('obj:foo');
   });
 
-  it('one-line duplicate declarations emit duplicate-id rows verbatim', () => {
+  it('one-line duplicate declarations retain distinct IDs (#1349)', () => {
     const src = 'local x = 1; local x = 2\n';
     const result = assertParity('fixtures/dup.lua', src, 'lua', 2);
     const xs = result.nodes.filter((n) => n.kind === 'variable' && n.name === 'x');
     expect(xs).toHaveLength(2);
-    expect(xs[0]!.id).toBe(xs[1]!.id);
+    expect(xs[1]!.id).toBe(`${xs[0]!.id}:${xs[1]!.startColumn}`);
   });
 
   it('cross-dialect syntax defers to the wasm extractor', () => {

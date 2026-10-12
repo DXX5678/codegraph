@@ -140,7 +140,7 @@ undefined; **no isConst means `const_item`/`static_item` extract as kind
 |---|---|---|
 | `function_item` (top level) | functionTypes, tree-sitter.ts:994 → extractFunction:1517 | not inside class-like at file scope → extractFunction; **first line of extractFunction (1522): if getReceiverType returns a value → extractMethod instead** (this is how impl-block fns become methods — impl_item does NOT push a scope) |
 | `function_signature_item` | same | in a trait body (trait pushed, class-like) → extractMethod; no `body` field → no body walk |
-| `struct_item` | structTypes:1059 → extractStruct:1869 | `body` field required: **unit structs `struct Unit;` have no body → NO node minted** (1876, `record_declaration` exemption is C#-only). Tuple structs have body `ordered_field_declaration_list` → extracted. `field_declaration` children make NO nodes (rust has no fieldTypes) — visitNode recurses into them and finds nothing |
+| `struct_item` | structTypes:1059 → extractStruct:1869 | ~~`body` field required: unit structs `struct Unit;` have no body → NO node minted~~ — **superseded: Rust now sets `allowBodilessStruct`, so `struct Unit;` mints a node with no members.** Rust has no forward declarations, so the bodiless skip (meant for C/C++) never applied here; the `record_declaration` exemption is the C# form of the same carve-out. Tuple structs have body `ordered_field_declaration_list` → extracted. `field_declaration` children make NO nodes (rust has no fieldTypes) — visitNode recurses into them and finds nothing |
 | `enum_item` | enumTypes:1064 → extractEnum:1914 | body `enum_variant_list`; `enum_variant` children → extractEnumMembers:1958 — **`name` field path: one `enum_member` node from `getChildByField(node,'name')`, then return** (variant payload bodies `B(u32)` / `C { x }` are never walked). Non-variant children (e.g. `attribute_item`) → visitNode (no-op) |
 | `trait_item` | interfaceTypes:1054 → extractInterface:1834 | kind `'trait'` (interfaceKind); extractInheritance sees the `trait_bounds` child (see below); body `declaration_list` children visited with the trait pushed → fn items become methods with QN `Trait::name` via nodeStack |
 | `impl_item` | dedicated branch:1273-1276 → extractRustImplItem:5690 | emits the implements back-reference (below); **skipChildren stays false** → the `declaration_list` is then visited normally by the loop at 1295 (that's how impl members are reached; impl pushes NOTHING on the nodeStack) |
@@ -317,10 +317,10 @@ trait_item — supertraits `trait Sub: Super + Display`). Per bound child:
 
 Each yields an `extends` ref from the trait node at the bound's position.
 Struct/enum extraction also calls extractInheritance; rust struct_item children
-include `field_declaration_list` → the 5652 recursion descends, but rust
-`field_declaration` always carries a `field_identifier` name so the Go
-struct-embedding branch (5496) never fires. Verify with the torture fixture
-anyway.
+include `field_declaration_list` → the 5652 recursion descends and finds
+nothing: the Go struct-embedding branch (5496) runs for Go only (it was inert
+here anyway — rust `field_declaration` always carries a `field_identifier`
+name), so rustlang.rs has no `field_declaration` arm.
 
 ### impl Trait for Type — extractRustImplItem (5690)
 
@@ -370,12 +370,19 @@ while `Vec`/`Option`/`Box`/`Self` are NOT. QUIRKS, PRESERVE:
 - property_signature/method_signature branch (1283) — TS-only node types,
   never rust.
 
-### Static-member refs, cpp-isms — NOT rust
+### Static-member refs (rust since #2328); cpp-isms — NOT rust
 
-`rust` ∉ STATIC_MEMBER_LANGS (345) → extractStaticMemberRef no-ops (its call
-in the body walker at 5218 must be a no-op in the walker too — cheap early
-return). namespacePrefix, cppLocalFnPtrs, stack-construction, operator calls,
-template strip: all c/cpp-gated, none apply.
+`rust` ∈ STATIC_MEMBER_LANGS since #2328, with its own branch in
+extractStaticMemberRef (body walker only; the kernel's
+`extract_static_member_ref`, called at the same point of the walk): a
+`scoped_identifier` whose member is capitalized — unless it is a call's
+callee, the prefix of a longer path or part of a `use` tree — and a
+`struct_pattern`'s `scoped_type_identifier` emit one `references` ref named by
+the receiver (the segment before the member; `Self` → the impl's type via
+getReceiverType, nothing inside a trait), positioned at the receiver. The
+resolver keeps it only on an enum that declares the member as a variant.
+namespacePrefix, cppLocalFnPtrs, stack-construction, operator calls, template
+strip: all c/cpp-gated, none apply.
 
 ### Docstrings (tree-sitter-helpers.ts:95)
 
@@ -490,7 +497,7 @@ inner `array_expression`, but `const CB: fn() = handler;` captures nothing
 ## Gates (per plan §5, no exceptions)
 
 - **Torture fixture `torture.rs`** (+ CRLF variant, derived in-memory), pinning
-  at minimum: unit struct (NO node) / tuple struct / field struct; enum with
+  at minimum: unit struct (node, no members) / tuple struct / field struct; enum with
   unit+tuple+struct variants; trait with supertraits incl. a SCOPED one
   (`fmt::Debug` — dropped) + `function_signature_item` + default method +
   associated type/const (no node; const value call attributes to trait);

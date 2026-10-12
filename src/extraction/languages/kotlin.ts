@@ -1,5 +1,5 @@
 import type { Node as SyntaxNode } from 'web-tree-sitter';
-import { getNodeText, getChildByField } from '../tree-sitter-helpers';
+import { getNodeText } from '../tree-sitter-helpers';
 import type { LanguageExtractor } from '../tree-sitter-types';
 
 /** Kotlin return types that can't be a chained-call receiver (no class to chain on). */
@@ -42,6 +42,99 @@ function extractKotlinReturnType(node: SyntaxNode, source: string): string | und
   return undefined;
 }
 
+/**
+ * A property's CODE children: the named child right after the `=` token, a
+ * `property_delegate` (`by lazy { … }`), and an accessor the grammar nested
+ * under the declaration (`val x: Int get() = compute()` — written on ONE line;
+ * an accessor on its own line parses as a SIBLING of the property and is not
+ * reachable from here). What stays unwalked is the declaration itself —
+ * modifiers, the `val`/`var` keyword, the name+type, and an extension
+ * receiver's type and type parameters. (Go's #693 fix walks the `value` field
+ * for the same reason; tree-sitter-kotlin exposes no fields at all, hence the
+ * `=` anchor.)
+ */
+function kotlinPropertyInitializers(node: SyntaxNode): SyntaxNode[] {
+  const out: SyntaxNode[] = [];
+  let afterEq = false;
+  for (let i = 0; i < node.childCount; i++) {
+    const c = node.child(i);
+    if (!c) continue;
+    if (!c.isNamed) {
+      if (c.type === '=') afterEq = true;
+      continue;
+    }
+    if (afterEq) {
+      out.push(c);
+      afterEq = false;
+    } else if (c.type === 'property_delegate' || c.type === 'getter' || c.type === 'setter') {
+      out.push(c);
+    }
+  }
+  return out;
+}
+
+
+/**
+ * A property's node kind, or null when the declaration mints no node at all:
+ * destructuring (`val (a, b) = …`), an unreadable name, or a local (one inside
+ * a function body / `init` block / lambda / accessor). Kind by enclosing scope:
+ * a singleton `object` / `companion object` — and a top-level property — holds
+ * *shared* values, so `val`→`constant` and `var`→`variable` (the Scala-object
+ * rule; a `const val` is just a val). A `class`/`interface`/`enum` instance
+ * `val`/`var` is per-instance state → `field` (never a value-ref target, like a
+ * Java instance `final`).
+ */
+function kotlinPropertyKind(
+  node: SyntaxNode,
+  source: string
+): 'field' | 'constant' | 'variable' | null {
+  const varDecl = node.namedChildren.find((c) => c.type === 'variable_declaration');
+  const nameNode = varDecl?.namedChildren.find((c) => c.type === 'simple_identifier');
+  if (!nameNode || !getNodeText(nameNode, source)) return null;
+
+  let scope: 'local' | 'const' | 'instance' = 'const';
+  for (let p = node.parent; p; p = p.parent) {
+    const pt = p.type;
+    if (
+      pt === 'function_body' || pt === 'function_declaration' ||
+      pt === 'lambda_literal' || pt === 'anonymous_initializer' ||
+      pt === 'control_structure_body' || pt === 'getter' || pt === 'setter'
+    ) { scope = 'local'; break; }
+    if (pt === 'companion_object' || pt === 'object_declaration') { scope = 'const'; break; }
+    if (pt === 'class_declaration') { scope = 'instance'; break; }
+  }
+  if (scope === 'local') return null;
+
+  const binding = node.namedChildren.find((c) => c.type === 'binding_pattern_kind');
+  const isVal = binding != null && getNodeText(binding, source) === 'val';
+  return scope === 'instance' ? 'field' : isVal ? 'constant' : 'variable';
+}
+
+/**
+ * Accessors written on their OWN line parse as SIBLINGS of the property, not as
+ * children of it (same-line ones nest — see kotlinPropertyInitializers). Walking
+ * back over any accessors between us and the declaration finds the property an
+ * accessor belongs to; null when this accessor stands alone (a grammar
+ * accident, or an accessor on a destructured/local declaration).
+ */
+function kotlinAccessorOwner(node: SyntaxNode): SyntaxNode | null {
+  for (let p = node.previousNamedSibling; p; p = p.previousNamedSibling) {
+    if (p.type === 'getter' || p.type === 'setter') continue;
+    return p.type === 'property_declaration' ? p : null;
+  }
+  return null;
+}
+
+/** The sibling accessors that follow a property declaration, in source order. */
+function kotlinFollowingAccessors(node: SyntaxNode): SyntaxNode[] {
+  const out: SyntaxNode[] = [];
+  for (let n = node.nextNamedSibling; n; n = n.nextNamedSibling) {
+    if (n.type !== 'getter' && n.type !== 'setter') break;
+    out.push(n);
+  }
+  return out;
+}
+
 /** Check if a node matches the `fun interface` misparse pattern */
 function isFunInterfaceNode(node: SyntaxNode): boolean {
   let hasFun = false;
@@ -68,7 +161,75 @@ function isFunInterfaceNode(node: SyntaxNode): boolean {
   return hasFun && hasInterfaceType;
 }
 
+/**
+ * The qualifier of a function type's receiver — `DatabaseConfig.` in
+ * `configure: (DatabaseConfig.Builder.() -> Unit)?`. The grammar reads a
+ * single-segment receiver (`Builder.() -> Unit`) but not a qualified one, and
+ * its error recovery then drops the enclosing class: Exposed's
+ * `DatabaseTestsBase` came out as a file of loose functions. `X.(` is not an
+ * expression, so the shape only occurs in a type.
+ */
+const QUALIFIED_RECEIVER = /\b(?:[A-Za-z_]\w*(?:<[^<>()\n]*>)?\.)+(?=[A-Za-z_]\w*(?:<[^<>()\n]*>)?\.\()/g;
+
+/** Blank a function type's receiver qualifier to spaces (offsets survive), leaving its simple type name. */
+export function blankKotlinQualifiedReceivers(source: string): string {
+  if (!source.includes('.(')) return source;
+  return source.replace(QUALIFIED_RECEIVER, (m) => ' '.repeat(m.length));
+}
+
+/**
+ * A primary constructor written on the line after its class name —
+ * `expect open class ByteString` / `internal constructor(data: ByteArray) :
+ * Comparable<ByteString> {` (okio, and Kotlin Multiplatform code generally) —
+ * with a supertype list after it: the grammar reads it as two statements and
+ * drops the class, its members coming out as loose functions. Blanking the
+ * constructor's modifiers and keyword (`(data: ByteArray) : …` parses) keeps
+ * the class, its supertypes and every offset; only the visibility is lost.
+ */
+const SPLIT_PRIMARY_CONSTRUCTOR =
+  /(\bclass\s+[A-Za-z_]\w*(?:\s*<[^<>{}]*(?:<[^<>{}]*>[^<>{}]*)*>)?[ \t]*\r?\n(?:[ \t]*\/\/[^\n]*\n)*[ \t]*)((?:(?:public|private|protected|internal|actual|expect)\s+|@[\w.]+(?:\([^)]*\))?\s+)*constructor)(?=\s*\()/g;
+
+export function joinKotlinSplitConstructors(source: string): string {
+  if (!source.includes('constructor')) return source;
+  return source.replace(SPLIT_PRIMARY_CONSTRUCTOR, (_m, head: string, ctor: string) => head + ' '.repeat(ctor.length));
+}
+
+/**
+ * Kotlin syntax newer than the grammar (tree-sitter-kotlin 0.3.8), rewritten
+ * to an older equivalent of the same length so every offset survives — each
+ * one otherwise made error recovery drop the class around it (Exposed: 158 of
+ * 1,004 files):
+ *
+ * - a `when` guard (Kotlin 2.1), `is H2Dialect if dialect.mode == X ->`,
+ *   becomes a second condition, `is H2Dialect,   dialect.mode == X ->`, so
+ *   the guard's references are kept;
+ * - an open-ended range (1.9), `1..<n`, becomes `1.. n`;
+ * - a multi-dollar string (2.1), `$$"?(@.a == $x)"`, loses its prefix;
+ * - a nullable receiver in a function type, `Op<Boolean>?.() -> Op<Boolean>`,
+ *   becomes `Op<Boolean>.( ) -> …`.
+ */
+const WHEN_GUARD = /^([ \t]*!?(?:is|in)[ \t]+(?:(?!->)[^\n])*?[\w>?)\]'"])([ \t]+)if(?=[ \t(])/gm;
+const MULTI_DOLLAR_STRING = /(?<![\w$"])\$\$+(?=")/g;
+const NULLABLE_RECEIVER_FN = /([\w>])\?\.\(\)(?=\s*->)/g;
+
+export function rewriteNewerKotlinSyntax(source: string): string {
+  let out = source;
+  if (out.includes(' if')) {
+    // (the condition stops short of `->`: `is X -> if (…)` is a branch whose body is an if)
+    out = out.replace(WHEN_GUARD, (_m, cond: string, gap: string) => `${cond},${' '.repeat(gap.length + 1)}`);
+  }
+  if (out.includes('..<')) out = out.replace(/\.\.</g, '.. ');
+  if (out.includes('$$')) out = out.replace(MULTI_DOLLAR_STRING, (m) => ' '.repeat(m.length));
+  if (out.includes('?.()')) out = out.replace(NULLABLE_RECEIVER_FN, '$1.( )');
+  return out;
+}
+
+function preParseKotlin(source: string): string {
+  return rewriteNewerKotlinSyntax(joinKotlinSplitConstructors(blankKotlinQualifiedReceivers(source)));
+}
+
 export const kotlinExtractor: LanguageExtractor = {
+  preParse: preParseKotlin,
   functionTypes: ['function_declaration'],
   classTypes: ['class_declaration'],
   methodTypes: ['function_declaration'], // Methods are functions inside classes
@@ -88,46 +249,68 @@ export const kotlinExtractor: LanguageExtractor = {
     // Kotlin properties (`val` / `var` / `const val`). The name nests as
     // property_declaration → variable_declaration → simple_identifier, which the
     // generic variable/field path can't read — so nothing was extracted before.
-    // Kind by enclosing scope: a singleton `object` / `companion object` (and a
-    // top-level property) holds *shared* values — `val`→`constant`,
-    // `var`→`variable` (the Scala-object rule; a `const val` is a `val`). A
-    // `class`/`interface`/`enum` instance `val`/`var` is per-instance state →
-    // `field` (never a value-ref target, like a Java instance `final`). A
-    // property inside a function body / `init` block / lambda is a local and is
-    // skipped entirely.
+    // Kind comes from kotlinPropertyKind.
     if (node.type === 'property_declaration') {
       const varDecl = node.namedChildren.find((c) => c.type === 'variable_declaration');
       const nameNode = varDecl?.namedChildren.find((c) => c.type === 'simple_identifier');
-      if (!nameNode) return false; // destructuring `val (a,b)` etc. — leave to default
+      // Destructuring (`val (a, b) = makePair()`): no symbol is minted for the
+      // destructured names either way — declining just routes the node to
+      // extractField/extractVariable, which both find nothing for Kotlin and
+      // end in the same fn-ref scan. But the RHS is CODE, and it was vanishing
+      // whole. Consume the node here and walk it at the ENCLOSING scope (there
+      // is no symbol of its own to attribute it to).
+      if (!nameNode) {
+        for (const init of kotlinPropertyInitializers(node)) ctx.visitFunctionBody(init, '');
+        return true;
+      }
       const name = getNodeText(nameNode, ctx.source);
       if (!name) return false;
 
-      // Walk to the nearest enclosing definition: a function body / init / lambda
-      // means it's a local; `object`/`companion object` is a constant scope; a
-      // `class_declaration` (covers class/interface/enum) is an instance scope.
-      let scope: 'local' | 'const' | 'instance' = 'const';
-      for (let p = node.parent; p; p = p.parent) {
-        const pt = p.type;
-        if (
-          pt === 'function_body' || pt === 'function_declaration' ||
-          pt === 'lambda_literal' || pt === 'anonymous_initializer' ||
-          pt === 'control_structure_body' || pt === 'getter' || pt === 'setter'
-        ) { scope = 'local'; break; }
-        if (pt === 'companion_object' || pt === 'object_declaration') { scope = 'const'; break; }
-        if (pt === 'class_declaration') { scope = 'instance'; break; }
+      const kind = kotlinPropertyKind(node, ctx.source);
+      if (kind == null) {
+        // A local — no node is minted, but the initializer is still code. Walk
+        // it at the ENCLOSING scope: an `init { }` block's `val q = load()` is
+        // the CLASS calling load, and it used to disappear entirely (only the
+        // block's bare statements survived).
+        for (const init of kotlinPropertyInitializers(node)) ctx.visitFunctionBody(init, '');
+        return true;
       }
-      if (scope === 'local') return true; // a local — don't extract
 
       const binding = node.namedChildren.find((c) => c.type === 'binding_pattern_kind');
       const isVal = binding != null && getNodeText(binding, ctx.source) === 'val';
-      const kind = scope === 'instance' ? 'field' : isVal ? 'constant' : 'variable';
-
       const typeNode = node.childForFieldName('type');
       const sig = typeNode
         ? `${isVal ? 'val' : 'var'} ${name}: ${getNodeText(typeNode, ctx.source)}`
         : undefined;
-      ctx.createNode(kind, name, node, { signature: sig });
+      const created = ctx.createNode(kind, name, node, { signature: sig });
+      // Walk the initializer ATTRIBUTED to the declared symbol (#693, the Go
+      // fix, ported to Kotlin): the hook consumes this subtree, so without an
+      // explicit walk a lambda / SAM / object initializer
+      // (`private val cb = Runnable { target() }` — the idiomatic Android
+      // callback field) contributed NO call edge at all, and everything reached
+      // only through such a callback looked like it had no callers.
+      // The property also OWNS any accessor written on its own line, which the
+      // grammar makes a following SIBLING rather than a child; those bodies used
+      // to attribute to the enclosing class. Consumed here so the accessor
+      // branch below can skip them without any cross-node state.
+      const inits = created
+        ? [...kotlinPropertyInitializers(node), ...kotlinFollowingAccessors(node)]
+        : [];
+      if (created && inits.length > 0) {
+        ctx.pushScope(created.id);
+        for (const init of inits) ctx.visitFunctionBody(init, created.id);
+        ctx.popScope();
+      }
       return true;
+    }
+
+    // An own-line accessor already walked by its owning property above. The
+    // ownership test re-derives the property's kind rather than remembering it:
+    // a destructured or local declaration mints no node, so its accessors were
+    // NOT consumed and must keep falling through to the normal recursion.
+    if (node.type === 'getter' || node.type === 'setter') {
+      const owner = kotlinAccessorOwner(node);
+      return owner != null && kotlinPropertyKind(owner, ctx.source) != null;
     }
 
     // Handle Kotlin `fun interface` declarations.
@@ -275,9 +458,26 @@ export const kotlinExtractor: LanguageExtractor = {
     return undefined;
   },
   getSignature: (node, source) => {
-    // Kotlin function signature: fun name(params): ReturnType
-    const params = getChildByField(node, 'function_value_parameters');
-    const returnType = getChildByField(node, 'type');
+    // Kotlin function signature: fun name(params): ReturnType. tree-sitter-kotlin
+    // exposes no field names, so both parts are found positionally, the way
+    // extractKotlinReturnType does (#1495): the `function_value_parameters`
+    // child, then the type node that follows it before the body.
+    let params: SyntaxNode | null = null;
+    let returnType: SyntaxNode | null = null;
+    for (let i = 0; i < node.namedChildCount; i++) {
+      const child = node.namedChild(i);
+      if (!child) continue;
+      if (child.type === 'function_value_parameters') {
+        params = child;
+        continue;
+      }
+      if (!params) continue;
+      if (child.type === 'function_body' || child.type === 'type_constraints') break;
+      if (child.type === 'user_type' || child.type === 'nullable_type' || child.type === 'function_type') {
+        returnType = child;
+        break;
+      }
+    }
     if (!params) return undefined;
     let sig = getNodeText(params, source);
     if (returnType) {

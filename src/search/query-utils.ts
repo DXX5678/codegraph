@@ -286,8 +286,29 @@ export function scorePathRelevance(
 
 /**
  * Check if a file path looks like a test file
+ *
+ * "Test" here is the wide reading: anything that is not production code,
+ * including examples, samples, benchmarks and fixtures. That is the right
+ * default for ranking — none of them are what a search is looking for — but it
+ * is the wrong set to put under a heading that says "Tests". A caller that
+ * means literally a test suite wants {@link isTestPath}.
  */
 export function isTestFile(filePath: string): boolean {
+  // Non-production directories: examples, samples, benchmarks, fixtures, demos.
+  // Check both mid-path (/integration/) and start-of-path (integration/) since
+  // file paths may be stored as relative paths without a leading slash.
+  return isTestPath(filePath) || matchesNonProductionDir(filePath.toLowerCase());
+}
+
+/**
+ * Check if a file path names a TEST — a suite that exercises other code.
+ *
+ * The narrow half of {@link isTestFile}: the filename and directory
+ * conventions every ecosystem uses for its test suites, and nothing else. An
+ * example, a benchmark or a fixture is not a test, and a list headed "Tests"
+ * that contains them is telling the reader something untrue.
+ */
+export function isTestPath(filePath: string): boolean {
   const lower = filePath.toLowerCase();
   const fileName = path.basename(filePath);   // original case — needed for camelCase boundaries
   const lowerName = fileName.toLowerCase();
@@ -296,8 +317,10 @@ export function isTestFile(filePath: string): boolean {
   if (
     lowerName.startsWith('test_') ||                              // python: test_foo.py
     lowerName.startsWith('test.') ||
-    // separator-delimited: foo_test.go, foo.test.ts, foo-spec.rb, bar_spec.py
-    /[._-](test|tests|spec|specs)\.[a-z0-9]+$/.test(lowerName) ||
+    // separator-delimited: foo_test.go, foo.test.ts, foo-spec.rb, bar_spec.py,
+    // and Google's C++ foo_unittest.cc (protobuf, Chromium). A bare
+    // `unittest.go` is no test: promtool's is the code that runs rule tests.
+    /[._-](test|tests|unittest|unittests|spec|specs)\.[a-z0-9]+$/.test(lowerName) ||
     // CamelCase suffix (Java/Kotlin/Swift/C#/Scala): FooTest.kt, BarTests.swift,
     // BazSpec.scala, QuxTestCase.java. Capital-led so "latest.kt"/"manifest.kt"
     // (lowercase "test") are NOT matched.
@@ -311,21 +334,27 @@ export function isTestFile(filePath: string): boolean {
     lower.includes('/tests/') || lower.includes('/test/') ||
     lower.includes('/__tests__/') || lower.includes('/spec/') ||
     lower.includes('/specs/') || lower.includes('/testlib/') ||
-    lower.includes('/testing/') ||
+    lower.includes('/testing/') || lower.includes('/e2e/') ||
     lower.startsWith('test/') || lower.startsWith('tests/') ||
     lower.startsWith('spec/') || lower.startsWith('specs/') ||
+    lower.startsWith('e2e/') ||
     // CamelCase test source-set dirs (Kotlin Multiplatform / Gradle / Xcode):
     // jvmTest/, commonTest/, androidTest/, iosTest/, integrationTest/. Capital-led
     // so "latest/" / "manifest/" are not matched.
-    /(?:^|\/)[A-Za-z0-9]*(?:Test|Tests|Spec)\//.test(filePath)
+    /(?:^|\/)[A-Za-z0-9]*(?:Test|Tests|Spec)\//.test(filePath) ||
+    // Test-support modules and doubles by directory name: Gradle's
+    // `core/data-test/`, `core/datastore-test/`, `:testing`; Go's `testdata/`;
+    // `testutil(s)/`, `test-utils/`, `fakes/`, `mocks/`, `__mocks__/`.
+    /(?:^|\/)(?:[\w.]+[-_]test(?:s|ing)?|testdata|testutils?|test[-_]utils?|fakes?|mocks?|__mocks__|stubs)\//.test(lower) ||
+    // Unit-test trees: LLVM's and Breakpad's `unittests/`, glog's
+    // `dcheck_unittest/`. Not a bare `unittest/`: CPython's `Lib/unittest/` is
+    // the framework itself.
+    /(?:^|\/)(?:unittests|[\w.]+[-_]unittests?)\//.test(lower)
   ) {
     return true;
   }
 
-  // Non-production directories: examples, samples, benchmarks, fixtures, demos.
-  // Check both mid-path (/integration/) and start-of-path (integration/) since
-  // file paths may be stored as relative paths without a leading slash.
-  return matchesNonProductionDir(lower);
+  return false;
 }
 
 /**
@@ -337,8 +366,13 @@ function matchesNonProductionDir(lowerPath: string): boolean {
     'integration', 'sample', 'samples', 'example', 'examples',
     'fixture', 'fixtures', 'benchmark', 'benchmarks', 'demo', 'demos',
   ];
+  // Only the project layout above a `src/` counts, never the package path
+  // below it: `core/data/src/main/kotlin/com/google/samples/apps/…` is a
+  // Google sample by name and production code by layout.
+  const src = lowerPath.indexOf('/src/');
+  const scope = src >= 0 ? lowerPath.slice(0, src + 1) : lowerPath.startsWith('src/') ? '' : lowerPath;
   for (const dir of dirs) {
-    if (lowerPath.includes('/' + dir + '/') || lowerPath.startsWith(dir + '/')) {
+    if (scope.includes('/' + dir + '/') || scope.startsWith(dir + '/')) {
       return true;
     }
   }

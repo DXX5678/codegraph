@@ -25,9 +25,10 @@
  *
  * Deliberately NOT covered (resolving the *dispatch* — `o->cb(x)` → the
  * registered function — needs data-flow through struct fields; a wrong edge
- * is worse than none): indirect-call resolution and `obj.method` member
- * values where `obj` isn't `this`/`self` (the receiver's type is statically
- * unknowable without local data-flow).
+ * is worse than none): indirect-call resolution. Member values where the
+ * receiver isn't `this`/`self` (`pool.submit(obj.method)`, `Submit(c.store.Fetch)`)
+ * retain their receiver (#1820), so resolution can use type/import scope
+ * before considering a unique method name.
  */
 
 import type { Node as SyntaxNode } from 'web-tree-sitter';
@@ -51,7 +52,8 @@ export interface FnRefCandidate {
    * referenced cross-file WITHOUT imports (global namespace), so the gate
    * can't see them — the strong positional prior (a string argument to
    * `usort`/`array_map`/…) plus resolution's unique-or-drop rule carry the
-   * precision instead.
+   * precision instead. Python/Go member values also skip the name gate,
+   * retaining their receiver for scoped resolution.
    */
   skipGate?: boolean;
 }
@@ -175,13 +177,26 @@ function cFamilySpec(extra?: { special?: string[]; addressOfOnly?: boolean }): F
 // resolve precisely. Bare identifiers stay function-kind-only (a bare id can
 // never be a method value in JS).
 const TS_JS_SPEC: FnRefSpec = {
-  idTypes: new Set(['identifier']),
+  // `shorthand_property_identifier`: `{ handleSubmit }` — the object a hook
+  // returns its handlers in, and a namespace object's members.
+  idTypes: new Set(['identifier', 'shorthand_property_identifier']),
   dispatch: new Map<string, CaptureRule>([
     ['arguments', { mode: 'args' }],
     ['assignment_expression', { mode: 'rhs', field: 'right' }],
     ['variable_declarator', { mode: 'varinit', field: 'value' }],
     ['pair', { mode: 'value', field: 'value' }],
     ['array', { mode: 'list' }],
+    // A JSX attribute value or child: `onPress={handleSubmit}`, `renderItem={renderRow}`,
+    // `<Route component={Home}/>`. The expression's one named child is the value; a
+    // spread or a call normalizes to nothing. This is THE handler-binding idiom of
+    // React, and without it a tap's handler had no edge from the component that
+    // renders it — the Screens and Steps views could not see what a tap does.
+    ['jsx_expression', { mode: 'list' }],
+    // An object literal's shorthand members — `return { handleApprove,
+    // handleRetake }` from a hook, `const Api = { upload, createFolder }`.
+    // Every named child is offered; only a shorthand identifier normalizes
+    // (a `pair` is its own container above, a spread or a method is nothing).
+    ['object', { mode: 'list' }],
   ]),
   special: new Set(['member_expression']),
 };
@@ -218,6 +233,7 @@ const GO_SPEC: FnRefSpec = {
     ['literal_element', null],
     ['expression_list', null],
   ]),
+  special: new Set(['selector_expression']),
 };
 
 const RUST_SPEC: FnRefSpec = {
@@ -686,16 +702,23 @@ function normalizeSpecial(
       return [];
     }
 
-    // Swift `#selector(Holder.fire)` → fire. ObjC `@selector(storeImage:)` →
-    // `storeImage:` verbatim (ObjC method nodes keep their selector colons).
+    // Go `c.store.Fetch` (has a `field` child) vs Swift `#selector(...)` /
+    // ObjC `@selector(...)` (no `field` — inner identifier / selector text).
     case 'selector_expression': {
+      const field = getChildByField(node, 'field');
+      if (field) {
+        const name = getNodeText(field, source);
+        const receiver = getChildByField(node, 'operand');
+        const value = receiver ? `${getNodeText(receiver, source)}.${name}` : '';
+        return /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$/.test(value)
+          ? [{ name: value, node: field, skipGate: true }] : [];
+      }
       const inner = node.namedChild(0);
       if (!inner) return [];
       if (inner.type === 'identifier' || inner.type === 'simple_identifier') {
         return [{ name: getNodeText(inner, source), node: inner }];
       }
-      // Swift dotted form: rightmost simple_identifier. ObjC keyword selector:
-      // text as-is.
+      // Swift dotted form: rightmost simple_identifier; ObjC keeps selector text.
       const last = lastNamedOfType(node, new Set(['simple_identifier']));
       if (last) return [{ name: getNodeText(last, source), node: last }];
       return [{ name: getNodeText(inner, source).trim(), node: inner }];
@@ -726,14 +749,13 @@ function normalizeSpecial(
       return [];
     }
 
-    // `self.handle_click` (Python) — object must be EXACTLY `self`.
+    // Keep the receiver on Python member values; calls/subscripts are not
+    // statically named receivers and must not collapse to a bare method.
     case 'attribute': {
-      const obj = getChildByField(node, 'object');
       const attr = getChildByField(node, 'attribute');
-      if (obj && attr && obj.type === 'identifier' && getNodeText(obj, source) === 'self') {
-        return [{ name: getNodeText(attr, source), node: attr }];
-      }
-      return [];
+      const name = getNodeText(node, source);
+      return attr && /^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$/.test(name)
+        ? [{ name, node: attr, skipGate: true }] : [];
     }
 
     // `this.Run0` (C#) — receiver must be EXACTLY `this`. Two grammar shapes:

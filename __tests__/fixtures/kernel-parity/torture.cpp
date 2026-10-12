@@ -39,6 +39,8 @@ class Session {
 public:
   void open();
   virtual ~Session() {}
+  // #1727 — pure virtual must mint a method node (parity between wasm + kernel).
+  virtual int read(int key) = 0;
 };
 void Session::open() {}
 }  // namespace app::net
@@ -105,6 +107,21 @@ void Widget::Tick(float Delta) { Health += Delta; }
 
 Config GlobalConfig;
 int build_number = 7;
+
+// class/struct/union/enum definitions in a declaration's type — nodes beside
+// the variables; an unnamed one takes its first variable's name
+void on_open() {}
+void on_close() {}
+namespace decl_types {
+/** The handler registry. */
+struct Registry {
+  int size() const { return 2; }
+  void (*handlers[2])() = {&on_open, &on_close};
+} registry;
+class Bar { void g() {} } bar, *pbar;
+static struct { int retries; } settings;
+enum { kIdle, kBusy } state;
+}  // namespace decl_types
 
 template <typename T>
 T compute_seed(T v) {

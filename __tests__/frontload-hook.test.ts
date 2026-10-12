@@ -5,19 +5,27 @@
  * for the RIGHT project — including the monorepo case where the agent's cwd is
  * an un-indexed workspace root and the index lives in a sub-project. These test
  * `planFrontload` / `findIndexedSubprojectRoots` directly (the hook's decision
- * logic), since the end-to-end hook is validated by a live agent run, not a
- * unit test.
+ * logic), plus the built CLI's confidence tiers against a real index.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { planFrontload, findIndexedSubprojectRoots, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens } from '../src/directory';
+import { spawnSync } from 'node:child_process';
+import { CodeGraph } from '../src';
+import { planFrontload, isTaskNotification, isAgentMessage, findIndexedSubprojectRoots, unsafeIndexRootReason, isStructuralPrompt, hasStructuralKeyword, extractCodeTokens, PROMPT_HOOK_INJECTION_MAX, CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT, capPromptHookInjection } from '../src/directory';
 
-/** Make `dir` look indexed (isInitialized needs `.codegraph/codegraph.db`). */
+// Make the built-in exports configurable so HOME can point at a real temp
+// fixture without changing the process environment or the user's home files.
+vi.mock('os', async (importOriginal) => ({ ...await importOriginal<typeof import('os')>() }));
+
+/**
+ * Make `dir` indexed. isInitialized needs `.codegraph/codegraph.db` WITH the
+ * codegraph schema — an empty file no longer counts (#1895).
+ */
 function mkIndexed(dir: string): string {
-  fs.mkdirSync(path.join(dir, '.codegraph'), { recursive: true });
-  fs.writeFileSync(path.join(dir, '.codegraph', 'codegraph.db'), '');
+  fs.mkdirSync(dir, { recursive: true });
+  CodeGraph.initSync(dir).close();
   return dir;
 }
 /** A workspace-root manifest so the down-scan gate (looksLikeProjectRoot) passes. */
@@ -30,7 +38,10 @@ function mkWorkspaceRoot(dir: string): string {
 describe('planFrontload — front-load hook project resolution (#964)', () => {
   let tmp: string;
   beforeEach(() => { tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-frontload-'))); });
-  afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
 
   it('cwd is itself indexed → front-load cwd (the common single-project case)', () => {
     mkIndexed(tmp);
@@ -90,6 +101,29 @@ describe('planFrontload — front-load hook project resolution (#964)', () => {
     const plan = planFrontload(tmp, 'how does it work');
     expect(plan.exploreRoot).toBeNull();
     expect(plan.nudgeProjects).toEqual([]);
+  });
+
+  it.each([
+    { root: 'home', manifest: 'package.json', children: 1 },
+    { root: 'home', manifest: 'package.json', children: 2 },
+    { root: 'home', manifest: 'WORKSPACE', children: 1 },
+    { root: 'parent of home', manifest: 'package.json', children: 1 },
+  ])('$root with stray $manifest and $children indexed children → no-op (#1454)', ({ root, manifest, children }) => {
+    const homeDir = root === 'home' ? tmp : path.join(tmp, 'user');
+    fs.mkdirSync(homeDir, { recursive: true });
+    vi.spyOn(os, 'homedir').mockReturnValue(homeDir);
+    if (manifest === 'package.json') mkWorkspaceRoot(tmp);
+    else fs.mkdirSync(path.join(tmp, manifest)); // Even a WORKSPACE directory opens the manifest gate.
+    mkIndexed(path.join(tmp, 'packages', 'api'));
+    if (children === 2) mkIndexed(path.join(tmp, 'packages', 'web'));
+    expect(unsafeIndexRootReason(tmp)).toBe(root === 'home' ? 'your home directory' : 'a parent of your home directory');
+
+    expect(planFrontload(tmp, 'how does authentication work end to end?')).toEqual({
+      exploreRoot: null,
+      nudgeProjects: [],
+      viaSubScan: false,
+    });
+    expect(findIndexedSubprojectRoots(tmp)).toEqual([]);
   });
 
   it('nothing indexed anywhere → no-op', () => {
@@ -272,6 +306,90 @@ describe('hasStructuralKeyword — Latin-script languages, Cyrillic, JA/KO (#112
   });
 });
 
+describe('prompt-hook ambiguous words need corroboration (#1654)', () => {
+  let tmp: string;
+
+  beforeEach(async () => {
+    tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cg-hook-ambiguous-')));
+    fs.writeFileSync(path.join(tmp, 'orders.ts'), `
+export class OrderStateMachine {
+  submitOrder() { return true; }
+}
+`);
+    const cg = await CodeGraph.init(tmp, { silent: true });
+    try { await cg.indexAll(); } finally { cg.destroy(); }
+  });
+  afterEach(() => { fs.rmSync(tmp, { recursive: true, force: true }); });
+
+  function hook(prompt: string): string {
+    const result = spawnSync(process.execPath, [path.resolve(__dirname, '../dist/bin/codegraph.js'), 'prompt-hook'], {
+      cwd: tmp,
+      input: JSON.stringify({ cwd: tmp, prompt }),
+      encoding: 'utf8',
+      timeout: 15_000,
+      env: {
+        ...process.env,
+        CODEGRAPH_TELEMETRY: '0', DO_NOT_TRACK: '1', CODEGRAPH_NO_DAEMON: '1',
+        CODEGRAPH_NO_RELAUNCH: '1', CODEGRAPH_WASM_RELAUNCHED: '1',
+        // Enable only the hook subprocess under test.
+        CODEGRAPH_NO_PROMPT_HOOK: '0', CODEGRAPH_PROMPT_HOOK: '1',
+      },
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    return result.stdout;
+  }
+
+  it('stays silent for everyday Portuguese, Spanish and German without indexed evidence', () => {
+    for (const prompt of [
+      'eu como pizza toda sexta',
+      'faz como a gente combinou ontem',
+      'roda os testes como esta e me diz o resultado',
+      'commita isso como fix, nao como feat',
+      'hazlo como ayer',
+      'mach es wie gestern',
+      'COMO combinado ontem',
+      'Wie gestern bitte',
+      'como JavaScript?',
+      'wie MissingService?',
+      'run the tests and report back',
+    ]) {
+      expect.soft(hasStructuralKeyword(prompt), prompt).toBe(false);
+      expect.soft(hook(prompt), prompt).toBe('');
+    }
+  });
+
+  it('keeps HIGH for verified identifiers or another structural keyword', () => {
+    for (const prompt of [
+      'como OrderStateMachine?',
+      'como submitOrder()?',
+      'wie OrderStateMachine?',
+      'como funciona a máquina de estados?',
+      'wie funktioniert die Zustandsmaschine?',
+      'onde fica a lógica dos pedidos?',
+      '¿cómo se procesan los pedidos?',
+      'how does OrderStateMachine work?',
+    ]) {
+      expect.soft(hook(prompt), prompt).toContain('Structural context from CodeGraph');
+    }
+  });
+
+  it('stays silent on a subagent hand-back envelope, even one that names indexed symbols (#2184)', () => {
+    const report = 'how does OrderStateMachine work? submitOrder() calls into the state machine.';
+    expect(hook(report)).toContain('Structural context from CodeGraph');
+    expect(hook(`<agent-message from="agent-7f3e">\n[Subagent hand-back] ${report}\n</agent-message>`)).toBe('');
+  });
+
+  it('uses MEDIUM for indexed prose segments without a strong keyword or verified token', () => {
+    for (const prompt of ['como state machine?', 'wie state machine?']) {
+      const output = hook(prompt);
+      expect(output, prompt).toContain('CodeGraph found indexed symbols matching this prompt');
+      expect(output).toContain('OrderStateMachine');
+      expect(output).not.toContain('Structural context from CodeGraph');
+    }
+  });
+});
+
 describe('extractCodeTokens — candidate symbols the hook verifies against the graph', () => {
   it('pulls camelCase / PascalCase / snake_case / call / member tokens', () => {
     expect(extractCodeTokens('prepareArticlePublish 的调用链')).toContain('prepareArticlePublish');
@@ -319,5 +437,60 @@ describe('isStructuralPrompt — cheap candidate gate (keyword OR code-token)', 
     expect(isStructuralPrompt('修复这个拼写错误')).toBe(false);
     expect(isStructuralPrompt('water the flower')).toBe(false);
     expect(isStructuralPrompt('')).toBe(false);
+  });
+});
+
+describe('prompt-hook injection cap (#1694)', () => {
+  it('PROMPT_HOOK_INJECTION_MAX stays under Claude Code\'s 10k inline hook-output limit', () => {
+    expect(PROMPT_HOOK_INJECTION_MAX).toBe(9000);
+    expect(CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT).toBe(10_000);
+    expect(PROMPT_HOOK_INJECTION_MAX).toBeLessThan(CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT);
+    // Leave headroom for the <codegraph_context> wrapper + projectPath nudge lines.
+    expect(CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT - PROMPT_HOOK_INJECTION_MAX).toBeGreaterThanOrEqual(500);
+  });
+
+  it('capPromptHookInjection leaves short payloads intact', () => {
+    expect(capPromptHookInjection('hello')).toBe('hello');
+    expect(capPromptHookInjection('x'.repeat(PROMPT_HOOK_INJECTION_MAX))).toBe('x'.repeat(PROMPT_HOOK_INJECTION_MAX));
+  });
+
+  it('capPromptHookInjection truncates oversize payloads with the explore notice', () => {
+    const over = 'a'.repeat(PROMPT_HOOK_INJECTION_MAX + 500);
+    const out = capPromptHookInjection(over);
+    expect(out.length).toBeLessThan(over.length);
+    expect(out.startsWith('a'.repeat(PROMPT_HOOK_INJECTION_MAX))).toBe(true);
+    expect(out).toContain('…(truncated; call codegraph_explore for the rest)');
+    // Capped body alone must still fit under the host inline limit.
+    expect(out.length).toBeLessThan(CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT);
+  });
+});
+
+describe('system task notifications (#1832)', () => {
+  it('skips the complete system envelope', () => {
+    expect(isTaskNotification('<task-notification>trace AuthService login flow</task-notification>')).toBe(true);
+    expect(isTaskNotification(' <task-notification>\n<task-id>abc</task-id>\n<summary>done</summary>\n</task-notification>\n')).toBe(true);
+  });
+  it('does not suppress a user question that mentions the marker', () => {
+    expect(isTaskNotification('Why does <task-notification>trace</task-notification> trigger the hook?')).toBe(false);
+    expect(isTaskNotification('<task-notification>trace</task-notification> Explain this.')).toBe(false);
+    expect(isTaskNotification('<other-tag>trace AuthService</other-tag>')).toBe(false);
+    expect(isTaskNotification('trace AuthService login')).toBe(false);
+  });
+});
+
+describe('subagent hand-backs (#2184)', () => {
+  const handBack = '<agent-message from="a1b2c3">\n[Subagent hand-back] Traced how AuthService.login calls TokenStore.save and which callers are affected.\n</agent-message>';
+
+  it('skips the complete hand-back envelope', () => {
+    expect(isAgentMessage(handBack)).toBe(true);
+    expect(isAgentMessage(` \n${handBack}\n`)).toBe(true);
+    expect(isAgentMessage('<agent-message>trace AuthService login flow</agent-message>')).toBe(true);
+  });
+  it('does not suppress a user question that mentions the marker', () => {
+    expect(isAgentMessage(`Why does ${handBack} trigger the hook?`)).toBe(false);
+    expect(isAgentMessage(`${handBack} Explain this.`)).toBe(false);
+    expect(isAgentMessage('<agent-messages>trace AuthService</agent-messages>')).toBe(false);
+    expect(isAgentMessage('<agent-message from="x">trace AuthService')).toBe(false);
+    expect(isAgentMessage('trace AuthService login')).toBe(false);
   });
 });

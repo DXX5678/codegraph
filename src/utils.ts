@@ -81,6 +81,24 @@ function isWithinDir(child: string, parent: string): boolean {
 }
 
 /**
+ * The lexical half of {@link validatePathWithinRoot}, on its own.
+ *
+ * Returns the resolved absolute path when `filePath` stays inside
+ * `projectRoot` after `../` segments are applied, or null when it escapes.
+ * No filesystem access — for callers on a hot path that only need to refuse a
+ * lexical escape, and for which the realpath half would be both unnecessary
+ * and far too expensive (the existence probe in resolution's `fileExists`,
+ * #1631: two `realpathSync` calls per probe made it ~70x slower).
+ *
+ * This is NOT a substitute for `validatePathWithinRoot` on any path whose
+ * contents get served — those must keep the symlink-aware check (#527).
+ */
+export function lexicalPathWithinRoot(projectRoot: string, filePath: string): string | null {
+  const resolved = path.resolve(projectRoot, filePath);
+  return isWithinDir(resolved, path.resolve(projectRoot)) ? resolved : null;
+}
+
+/**
  * Validate that a file path stays within the project root, resolving symlinks.
  *
  * Two layers: a cheap lexical check that catches `../` traversal, then a
@@ -112,14 +130,13 @@ export function validatePathWithinRoot(
   filePath: string,
   options?: { allowSymlinkEscape?: boolean }
 ): string | null {
-  const resolved = path.resolve(projectRoot, filePath);
-  const normalizedRoot = path.resolve(projectRoot);
-
   // 1. Lexical containment — cheap, catches `../` traversal. Applies even on
   //    the indexing read path: a crafted `../` escape is still rejected.
-  if (!isWithinDir(resolved, normalizedRoot)) {
+  const resolved = lexicalPathWithinRoot(projectRoot, filePath);
+  if (resolved === null) {
     return null;
   }
+  const normalizedRoot = path.resolve(projectRoot);
 
   // 2. Symlink-aware containment — resolve symlinks on both sides and re-check,
   //    so an in-repo symlink whose real target escapes the root is rejected.
@@ -224,9 +241,6 @@ export class FileLock {
   private lockPath: string;
   private held = false;
 
-  /** Locks older than this are considered stale regardless of PID status */
-  private static readonly STALE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
-
   constructor(lockPath: string) {
     this.lockPath = lockPath;
   }
@@ -240,18 +254,16 @@ export class FileLock {
       try {
         const content = fs.readFileSync(this.lockPath, 'utf-8').trim();
         const pid = parseInt(content, 10);
-        const stat = fs.statSync(this.lockPath);
-        const lockAge = Date.now() - stat.mtimeMs;
-
-        // Treat locks older than the timeout as stale, regardless of PID
-        if (lockAge < FileLock.STALE_TIMEOUT_MS && !isNaN(pid) && this.isProcessAlive(pid)) {
+        // A long sync can hold the lock for hours. Its age says nothing about
+        // whether the writer is still alive; only a dead PID is stale.
+        if (!isNaN(pid) && this.isProcessAlive(pid)) {
           throw new Error(
             `CodeGraph database is locked by another process (PID ${pid}). ` +
             `If this is stale, run 'codegraph unlock' or delete ${this.lockPath}`
           );
         }
 
-        // Stale lock (dead process or timed out) - remove it
+        // Stale lock (dead process or malformed PID) - remove it
         fs.unlinkSync(this.lockPath);
       } catch (err) {
         if (err instanceof Error && err.message.includes('locked by another')) {
