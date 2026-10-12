@@ -24,6 +24,15 @@
  * entry, prompts the user to pick which profiles to remove it from,
  * then strips the entry.
  *
+ * A shadow profile is deliberately durable: a built-in the user selected
+ * is materialized as a full user profile under ``~/.chrys/agents/`` and
+ * uninstall never deletes it — only the codegraph MCP entry is stripped.
+ * iCode loads a user profile over the same-named built-in, so after
+ * uninstall the shadow keeps overriding (and no longer updating from)
+ * the built-in. That is the intended behavior: the user opted into
+ * owning a copy of that agent, and uninstall must not silently discard
+ * their customized profile.
+ *
  * iCode has no project-local config concept, so only ``global`` is
  * supported.
  *
@@ -39,6 +48,7 @@ import {
   DetectionResult,
   InstallOptions,
   Location,
+  UninstallOptions,
   WriteResult,
 } from './types';
 import { atomicWriteFileSync, getMcpServerConfig } from './shared';
@@ -63,25 +73,50 @@ function agentsDir(): string {
 // iCode runtime roots — where iCode's pyapp installation lives
 // ---------------------------------------------------------------------------
 
-function icodeRuntimeRoots(): string[] {
-  const roots: string[] = [];
+// PyApp's project directory name for iCode. The offline binaries are built
+// with PYAPP_PROJECT_NAME=chrys; the pip/uv flavors embed the wheel and PyApp
+// names the project from that wheel's metadata instead (iCode-TUI →
+// icode-tui). Both ship iCode's built-in agent profiles inside the embedded
+// runtime's site-packages, so both must be searched. Mirrors the set iCode
+// itself recognizes in chrys/app/installer.py (_PYAPP_PROJECT_NAMES).
+const PYAPP_PROJECT_NAMES = ['chrys', 'icode-tui'];
 
-  // Custom override (mirrors PYAPP_INSTALL_DIR_ICODE)
-  const envOverride: string | undefined = process.env.PYAPP_INSTALL_DIR_ICODE;
-  if (envOverride) {
-    roots.push(path.resolve(envOverride.replace(/^~/, os.homedir())));
-  }
-
-  // Platform default
+// PyApp's platform data dir for the project folder:
+//   <data_local_dir>/pyapp/<project>/...  (Windows adds a `data` segment)
+//   Windows: %LOCALAPPDATA%\pyapp\data
+//   macOS:   ~/Library/Application Support/pyapp
+//   Linux:   $XDG_DATA_HOME/pyapp or ~/.local/share/pyapp
+function pyappBaseDir(): string {
   const home = os.homedir();
   if (process.platform === 'win32') {
     const localAppData = process.env.LOCALAPPDATA ?? path.join(home, 'AppData', 'Local');
-    roots.push(path.join(localAppData, 'pyapp', 'data', 'chrys'));
-  } else if (process.platform === 'darwin') {
-    roots.push(path.join(home, 'Library', 'Application Support', 'pyapp', 'chrys'));
-  } else {
-    const xdgData = process.env.XDG_DATA_HOME ?? path.join(home, '.local', 'share');
-    roots.push(path.join(xdgData, 'pyapp', 'chrys'));
+    return path.join(localAppData, 'pyapp', 'data');
+  }
+  if (process.platform === 'darwin') {
+    return path.join(home, 'Library', 'Application Support', 'pyapp');
+  }
+  const xdgData = process.env.XDG_DATA_HOME ?? path.join(home, '.local', 'share');
+  return path.join(xdgData, 'pyapp');
+}
+
+function icodeRuntimeRoots(): string[] {
+  const roots: string[] = [];
+
+  // Custom overrides — iCode honors PyApp's per-project install-dir variables
+  // (PYAPP_INSTALL_DIR_<PROJECT>, project name upper-cased): the offline
+  // flavor's PYAPP_INSTALL_DIR_CHRYS and the pip/uv flavor's
+  // PYAPP_INSTALL_DIR_ICODE-TUI.
+  for (const name of PYAPP_PROJECT_NAMES) {
+    const override: string | undefined = process.env[`PYAPP_INSTALL_DIR_${name.toUpperCase()}`];
+    if (override) {
+      roots.push(path.resolve(override.replace(/^~/, os.homedir())));
+    }
+  }
+
+  // Platform default, one project dir per PyApp project name.
+  const base = pyappBaseDir();
+  for (const name of PYAPP_PROJECT_NAMES) {
+    roots.push(path.join(base, name));
   }
 
   return roots;
@@ -371,9 +406,10 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/** Find a top-level YAML key (zero indent). */
+/** Find a top-level YAML key (zero indent). Tolerates a trailing comment. */
 function topLevelRange(lines: string[], key: string): LineRange | null {
-  const start = lines.findIndex((line) => line.trim() === `${key}:`);
+  const startPattern = new RegExp(`^${escapeRegExp(key)}:\\s*(?:#.*)?$`);
+  const start = lines.findIndex((line) => startPattern.test(line));
   if (start === -1) return null;
 
   let end = lines.length;
@@ -436,6 +472,10 @@ function renderCodeGraphMcpEntry(): string[] {
   for (const arg of mcp.args) {
     lines.push(`    - ${arg}`);
   }
+  // iCode accepts `timeout` as an alias for `request_timeout` (seconds); a
+  // generous cap keeps a cold first explore (index warm-up) from tripping the
+  // client's per-request timeout (chrys/service/profiles/agents/loader.py).
+  lines.push('    timeout: 50');
   lines.push('    enabled: true');
   return lines;
 }
@@ -444,6 +484,12 @@ function renderCodeGraphMcpEntry(): string[] {
 // Detection
 // ---------------------------------------------------------------------------
 
+// Matches the `- name:` list-item line that opens an MCP server entry. The
+// trailing guard rejects a longer name that merely starts with `codegraph`
+// (`codegraph-extra`, `codegraph2`), so detection/removal can't mistake a
+// sibling server for ours.
+const CODEGRAPH_NAME_LINE = /^ {2,4}- name:\s*codegraph(?![\w-])/;
+
 function hasCodeGraphMcp(content: string): boolean {
   const lines = splitLines(content);
   const tools = topLevelRange(lines, 'tools');
@@ -451,7 +497,7 @@ function hasCodeGraphMcp(content: string): boolean {
   const mcp = childRange(lines, tools, 'mcp');
   if (!mcp) return false;
   for (let i = mcp.start + 1; i < mcp.end; i++) {
-    if (/^ {2,4}- name:\s*codegraph\b/.test(lines[i] ?? '')) return true;
+    if (CODEGRAPH_NAME_LINE.test(lines[i] ?? '')) return true;
   }
   return false;
 }
@@ -470,14 +516,26 @@ function findMCPInsertPoint(lines: string[], mcpRange: LineRange): number {
   return mcpRange.start;
 }
 
-function addCodeGraphMcp(content: string): string {
-  const lines = splitLines(content);
-  const tools = topLevelRange(lines, 'tools');
-  if (tools) {
-    const mcp = childRange(lines, tools, 'mcp');
-    if (mcp && hasCodeGraphMcp(content)) return content;
+/** Rewrite a flow-style empty `mcp:` value (`mcp: []` / `mcp: {}`) to a bare
+ *  `mcp:` so a block list can be appended under it. A no-op otherwise. */
+function normalizeEmptyMcpList(lines: string[]): void {
+  for (let i = 0; i < lines.length; i++) {
+    if (/^  mcp:\s*(?:\[\s*\]|\{\s*\})\s*(?:#.*)?$/.test(lines[i] ?? '')) {
+      lines[i] = '  mcp:';
+    }
   }
+}
 
+function addCodeGraphMcp(content: string): string {
+  // Already configured → byte-identical no-op (keeps re-runs idempotent).
+  if (hasCodeGraphMcp(content)) return content;
+
+  const lines = splitLines(content);
+  // A hand-edited `mcp: []` is invisible to childRange and would otherwise
+  // invite a duplicate `mcp:` key; normalize it to a bare `mcp:` first.
+  normalizeEmptyMcpList(lines);
+
+  const tools = topLevelRange(lines, 'tools');
   if (!tools) {
     const entry = renderCodeGraphMcpEntry();
     return joinLines([
@@ -527,7 +585,7 @@ function findCodeGraphEntryRange(
 ): LineRange | null {
   let entryStart = -1;
   for (let i = mcpRange.start + 1; i < mcpRange.end; i++) {
-    if (/^ {2,4}- name:\s*codegraph\b/.test(lines[i] ?? '')) {
+    if (CODEGRAPH_NAME_LINE.test(lines[i] ?? '')) {
       entryStart = i;
       break;
     }
@@ -592,7 +650,7 @@ function stripLines(lines: string[], start: number, end: number): string {
 class iCodeTarget implements AgentTarget {
   readonly id = 'icode' as const;
   readonly displayName = 'iCode';
-  readonly docsUrl = 'https://xxxxxxxxxxxxxxx';
+  readonly docsUrl = 'https://github.com/openJiuwen-ai/iCode';
 
   supportsLocation(loc: Location): boolean {
     return loc === 'global';
@@ -636,18 +694,30 @@ class iCodeTarget implements AgentTarget {
     };
   }
 
-  async install(_loc: Location, _opts: InstallOptions): Promise<WriteResult> {
-    const profiles = discoverProfiles();
+  async install(_loc: Location, opts: InstallOptions): Promise<WriteResult> {
+    let profiles = discoverProfiles();
 
     if (profiles.length === 0) {
       return {
         files: [],
         notes: [
           fs.existsSync(configDir())
-            ? 'No iCode agent profiles found. Run `chrys` to initialize them first.'
+            ? 'No iCode agent profiles found. Run `icode` to initialize them first.'
             : 'iCode does not appear to be installed. Install iCode first, then re-run this command.',
         ],
       };
+    }
+
+    // A refresh sweep heals only what is already wired up — it must never add
+    // codegraph to a profile the user never selected.
+    if (opts.existingOnly) {
+      profiles = profiles.filter((p) => hasCodeGraphMcp(p.content || readText(p.userPath)));
+      if (profiles.length === 0) {
+        return {
+          files: [],
+          notes: ['No iCode profile has CodeGraph configured — nothing to refresh.'],
+        };
+      }
     }
 
     // Build options for the multi-select prompt.
@@ -662,7 +732,7 @@ class iCodeTarget implements AgentTarget {
     const allPaths = options.map((o) => o.value);
 
     let selected: string[];
-    if (isInteractive()) {
+    if (isInteractive() && !opts.nonInteractive) {
       selected = await promptProfileSelect(
         'Select iCode profiles to add CodeGraph MCP server to:',
         options,
@@ -719,7 +789,7 @@ class iCodeTarget implements AgentTarget {
     return { files, notes };
   }
 
-  async uninstall(_loc: Location): Promise<WriteResult> {
+  async uninstall(_loc: Location, opts: UninstallOptions = {}): Promise<WriteResult> {
     // Uninstall only operates on user-created files under ~/.chrys/agents/.
     // Built-in profiles are never modified in their runtime location, so we
     // only need to scan the user config dir.
@@ -752,7 +822,7 @@ class iCodeTarget implements AgentTarget {
     }));
 
     let selected: string[];
-    if (isInteractive()) {
+    if (isInteractive() && !opts.nonInteractive) {
       selected = await promptProfileSelect(
         `Select iCode profiles to remove CodeGraph MCP from (${configuredProfiles.length} have it):`,
         options,

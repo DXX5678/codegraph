@@ -1857,14 +1857,14 @@ describe('Installer — detection never writes (#1870)', () => {
     fs.rmSync(tmpCwd, { recursive: true, force: true });
   });
 
-  it('a refresh leaves an unconfigured agent\'s unparseable config alone — no backup, no warning', () => {
+  it('a refresh leaves an unconfigured agent\'s unparseable config alone — no backup, no warning', async () => {
     const file = plantUnparseableAntigravityConfig('');
 
     // Asserted inside the spy: `mockRestore` also clears the recorded
     // calls, so a `not.toHaveBeenCalled()` after it always passes.
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
-      const reports = refreshTargets(ALL_TARGETS, 'global');
+      const reports = await refreshTargets(ALL_TARGETS, 'global');
       expect(reports.find((r) => r.id === 'antigravity')!.status).toBe('not-configured');
       expect(fs.readdirSync(path.dirname(file))).toEqual(['mcp_config.json']);
       expect(fs.readFileSync(file, 'utf-8')).toBe('');
@@ -3090,5 +3090,288 @@ describe('Antigravity macOS command persistence (#1443)', () => {
   it.runIf(process.platform === 'darwin')('falls back to the bare command when lookup fails', () => {
     vi.stubEnv('PATH', tmpHome);
     expect(installCommand()).toBe('codegraph');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// iCode (/Users/.../iCode) adapter.
+//
+// iCode keeps agent profiles as one YAML file per agent under `~/.chrys/agents/`
+// and reads each profile's `tools.mcp` list (chrys/service/profiles/agents/
+// loader.py::_parse_mcp_servers). These tests pin the injected entry against
+// that schema, the built-in discovery from a PyApp runtime, and uninstall's
+// narrow scope.
+// ---------------------------------------------------------------------------
+describe('Installer targets — iCode', () => {
+  let tmpHome: string;
+  let homeRestore: { restore: () => void };
+  const savedEnv: Record<string, string | undefined> = {};
+  // iCode recognizes both PyApp project names: the offline flavor's `chrys`
+  // and the pip/uv flavor's `icode-tui` (chrys/app/installer.py
+  // _PYAPP_PROJECT_NAMES).
+  const PYAPP_KEYS = ['PYAPP_INSTALL_DIR_CHRYS', 'PYAPP_INSTALL_DIR_ICODE-TUI'];
+  // The platform-default runtime roots are derived from HOME, but on Linux
+  // PyApp prefers XDG_DATA_HOME — clear it so a developer's real runtime can
+  // never leak into (or rescue) these assertions.
+  const ISOLATED_KEYS = [...PYAPP_KEYS, 'XDG_DATA_HOME'];
+
+  beforeEach(() => {
+    tmpHome = mkTmpDir('icode-home');
+    homeRestore = setHome(tmpHome);
+    for (const k of ISOLATED_KEYS) {
+      savedEnv[k] = process.env[k];
+      delete process.env[k];
+    }
+    // iCode's config dir must exist for `detect` to consider it installed.
+    fs.mkdirSync(path.join(tmpHome, '.chrys', 'agents'), { recursive: true });
+  });
+
+  afterEach(() => {
+    homeRestore.restore();
+    for (const k of ISOLATED_KEYS) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    }
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  /** Fabricate an embedded PyApp runtime carrying iCode's built-in profiles. */
+  function writeBuiltinRuntime(root: string, profiles: Record<string, string>): void {
+    const dir = path.join(
+      root, 'site-packages', 'chrys', 'service', 'profiles', 'agents', 'builtins',
+    );
+    fs.mkdirSync(dir, { recursive: true });
+    for (const [name, content] of Object.entries(profiles)) {
+      fs.writeFileSync(path.join(dir, `${name}.yaml`), content);
+    }
+  }
+
+  it('injects a schema-valid stdio entry and preserves a sibling MCP server', async () => {
+    const profile = path.join(tmpHome, '.chrys', 'agents', 'Test.yaml');
+    fs.writeFileSync(profile, [
+      'name: Test',
+      'id: test-001',
+      'tools:',
+      '  mcp:',
+      '  - name: other',
+      '    transport: stdio',
+      '    command: other',
+      'skills:',
+      '  script_extensions:',
+      '  - .py',
+      '',
+    ].join('\n'));
+
+    const icode = getTarget('icode')!;
+    const result = await icode.install('global', { autoAllow: false, nonInteractive: true });
+    expect(result.files.some((f) => f.path === profile && f.action === 'updated')).toBe(true);
+
+    const body = fs.readFileSync(profile, 'utf-8');
+    // The sibling server is untouched, mapping intact.
+    expect(body).toContain('- name: other\n    transport: stdio\n    command: other');
+    // codegraph entry — exactly the fields _parse_mcp_servers reads.
+    expect(body).toContain('- name: codegraph');
+    expect(body).toMatch(/- name: codegraph\n    transport: stdio\n    command: codegraph\n    args:\n    - serve\n    - --mcp\n/);
+    expect(body).toContain('    timeout: 50');
+    expect(body).toContain('    enabled: true');
+
+    expect(icode.detect('global').alreadyConfigured).toBe(true);
+
+    // Byte-identical re-run.
+    const second = await icode.install('global', { autoAllow: false, nonInteractive: true });
+    expect(second.files.every((f) => f.action === 'unchanged')).toBe(true);
+  });
+
+  it('creates a profile from scratch when tools: is missing entirely', async () => {
+    const profile = path.join(tmpHome, '.chrys', 'agents', 'Bare.yaml');
+    fs.writeFileSync(profile, ['name: Bare', 'id: bare-1', 'instructions: "hi."', ''].join('\n'));
+
+    const icode = getTarget('icode')!;
+    await icode.install('global', { autoAllow: false, nonInteractive: true });
+
+    const body = fs.readFileSync(profile, 'utf-8');
+    expect(body).toContain('tools:');
+    expect(body).toContain('  mcp:');
+    expect(body).toContain('- name: codegraph');
+  });
+
+  it('discovers the offline runtime built-ins (PYAPP_INSTALL_DIR_CHRYS)', async () => {
+    const root = mkTmpDir('icode-pyapp-chrys');
+    writeBuiltinRuntime(root, {
+      QA: ['name: QA', 'id: b0119a000005', 'instructions: "QA."', ''].join('\n'),
+    });
+    process.env.PYAPP_INSTALL_DIR_CHRYS = root;
+
+    const icode = getTarget('icode')!;
+    expect(icode.detect('global').installed).toBe(true);
+
+    const result = await icode.install('global', { autoAllow: false, nonInteractive: true });
+    const shadow = path.join(tmpHome, '.chrys', 'agents', 'QA.yaml');
+    expect(result.files.some((f) => f.path === shadow && f.action === 'created')).toBe(true);
+
+    const body = fs.readFileSync(shadow, 'utf-8');
+    expect(body).toContain('id: b0119a000005'); // built-in's full content copied
+    expect(body).toContain('- name: codegraph');
+
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('discovers the pip/uv runtime built-ins (PYAPP_INSTALL_DIR_ICODE-TUI)', async () => {
+    const root = mkTmpDir('icode-pyapp-tui');
+    writeBuiltinRuntime(root, {
+      Explore: ['name: Explore', 'id: b011e80e0002', 'sub_agent_only: true', 'instructions: "x."', ''].join('\n'),
+    });
+    process.env['PYAPP_INSTALL_DIR_ICODE-TUI'] = root;
+
+    const icode = getTarget('icode')!;
+    const result = await icode.install('global', { autoAllow: false, nonInteractive: true });
+    const shadow = path.join(tmpHome, '.chrys', 'agents', 'Explore.yaml');
+    expect(result.files.some((f) => f.path === shadow && f.action === 'created')).toBe(true);
+    expect(fs.readFileSync(shadow, 'utf-8')).toContain('- name: codegraph');
+
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  it('names the `icode` command when no profiles are discoverable', async () => {
+    const icode = getTarget('icode')!;
+    const result = await icode.install('global', { autoAllow: false, nonInteractive: true });
+    expect(result.files).toEqual([]);
+    expect((result.notes ?? []).join(' ')).toContain('`icode`');
+  });
+
+  it('uninstall strips only the codegraph entry, leaving the sibling intact', async () => {
+    const profile = path.join(tmpHome, '.chrys', 'agents', 'Test.yaml');
+    fs.writeFileSync(profile, [
+      'name: Test',
+      'id: test-001',
+      'tools:',
+      '  mcp:',
+      '  - name: other',
+      '    transport: stdio',
+      '    command: other',
+      '',
+    ].join('\n'));
+
+    const icode = getTarget('icode')!;
+    await icode.install('global', { autoAllow: false, nonInteractive: true });
+    expect(icode.detect('global').alreadyConfigured).toBe(true);
+
+    await icode.uninstall('global');
+    expect(icode.detect('global').alreadyConfigured).toBe(false);
+
+    const body = fs.readFileSync(profile, 'utf-8');
+    expect(body).toContain('- name: other');
+    expect(body).not.toContain('- name: codegraph');
+  });
+
+  it('does not mistake a `codegraph-extra` sibling for ours, and injects past it', async () => {
+    const profile = path.join(tmpHome, '.chrys', 'agents', 'Test.yaml');
+    fs.writeFileSync(profile, [
+      'name: Test',
+      'id: test-001',
+      'tools:',
+      '  mcp:',
+      '  - name: codegraph-extra',
+      '    transport: stdio',
+      '    command: other',
+      '',
+    ].join('\n'));
+
+    const icode = getTarget('icode')!;
+    // The prefix must NOT read as "already configured".
+    expect(icode.detect('global').alreadyConfigured).toBe(false);
+
+    await icode.install('global', { autoAllow: false, nonInteractive: true });
+
+    const body = fs.readFileSync(profile, 'utf-8');
+    expect(body).toContain('- name: codegraph-extra');
+    expect(body).toMatch(/- name: codegraph\n/); // our own entry, not the prefix
+    expect(icode.detect('global').alreadyConfigured).toBe(true);
+  });
+
+  it('tolerates a trailing comment on `tools:`, without a duplicate key', async () => {
+    const profile = path.join(tmpHome, '.chrys', 'agents', 'Commented.yaml');
+    fs.writeFileSync(profile, [
+      'name: Commented',
+      'id: c-1',
+      'tools:  # tools for this agent',
+      '  builtins:',
+      '  - shell',
+      '',
+    ].join('\n'));
+
+    const icode = getTarget('icode')!;
+    await icode.install('global', { autoAllow: false, nonInteractive: true });
+
+    const body = fs.readFileSync(profile, 'utf-8');
+    const toolsKeys = body.split('\n').filter((l) => /^tools:\s*(?:#.*)?$/.test(l));
+    expect(toolsKeys).toHaveLength(1);
+    expect(body).toContain('- name: codegraph');
+  });
+
+  it('normalizes a flow-style empty `mcp: []` into a block list', async () => {
+    const profile = path.join(tmpHome, '.chrys', 'agents', 'Flow.yaml');
+    fs.writeFileSync(profile, [
+      'name: Flow',
+      'id: f-1',
+      'tools:',
+      '  mcp: []',
+      '',
+    ].join('\n'));
+
+    const icode = getTarget('icode')!;
+    await icode.install('global', { autoAllow: false, nonInteractive: true });
+
+    const body = fs.readFileSync(profile, 'utf-8');
+    expect(body).not.toContain('[]');
+    const mcpKeys = body.split('\n').filter((l) => /^  mcp:/.test(l));
+    expect(mcpKeys).toHaveLength(1);
+    expect(body).toContain('- name: codegraph');
+  });
+
+  it('existingOnly leaves an unconfigured profile untouched (refresh semantics)', async () => {
+    const configured = path.join(tmpHome, '.chrys', 'agents', 'A.yaml');
+    fs.writeFileSync(configured, ['name: A', 'id: a-1', 'instructions: "A."', ''].join('\n'));
+
+    const icode = getTarget('icode')!;
+    await icode.install('global', { autoAllow: false, nonInteractive: true }); // configures A only
+    expect(fs.readFileSync(configured, 'utf-8')).toContain('- name: codegraph');
+
+    const untouched = path.join(tmpHome, '.chrys', 'agents', 'B.yaml');
+    const bBody = ['name: B', 'id: b-1', 'instructions: "B."', ''].join('\n');
+    fs.writeFileSync(untouched, bBody);
+
+    await icode.install('global', { autoAllow: false, nonInteractive: true, existingOnly: true });
+
+    expect(fs.readFileSync(untouched, 'utf-8')).toBe(bBody); // byte-identical
+    expect(fs.readFileSync(configured, 'utf-8')).toContain('- name: codegraph');
+  });
+
+  it('refreshTargets heals only the already-configured profile', async () => {
+    const configured = path.join(tmpHome, '.chrys', 'agents', 'A.yaml');
+    fs.writeFileSync(configured, ['name: A', 'id: a-1', 'instructions: "A."', ''].join('\n'));
+
+    const icode = getTarget('icode')!;
+    await icode.install('global', { autoAllow: false, nonInteractive: true });
+
+    const untouched = path.join(tmpHome, '.chrys', 'agents', 'B.yaml');
+    const bBody = ['name: B', 'id: b-1', 'instructions: "B."', ''].join('\n');
+    fs.writeFileSync(untouched, bBody);
+
+    const reports = await refreshTargets([icode], 'global');
+    expect(reports[0].status).toBe('unchanged'); // A was already current
+    expect(fs.readFileSync(untouched, 'utf-8')).toBe(bBody);
+  });
+
+  it('uninstallTargets honors nonInteractive and still removes the entry', async () => {
+    const profile = path.join(tmpHome, '.chrys', 'agents', 'Test.yaml');
+    fs.writeFileSync(profile, ['name: Test', 'id: test-001', 'instructions: "t."', ''].join('\n'));
+
+    const icode = getTarget('icode')!;
+    await icode.install('global', { autoAllow: false, nonInteractive: true });
+
+    const reports = await uninstallTargets([icode], 'global', { nonInteractive: true });
+    expect(reports[0].status).toBe('removed');
+    expect(fs.readFileSync(profile, 'utf-8')).not.toContain('- name: codegraph');
   });
 });
